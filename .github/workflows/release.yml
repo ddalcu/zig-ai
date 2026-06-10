@@ -119,7 +119,8 @@ jobs:
             libxfixes-dev libxtst-dev libxss-dev libwayland-dev libxkbcommon-dev \
             libegl1-mesa-dev libgl1-mesa-dev libdrm-dev libgbm-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev \
-            libdbus-1-dev libudev-dev libusb-1.0-0-dev
+            libdbus-1-dev libudev-dev libusb-1.0-0-dev \
+            libvulkan-dev glslc
 
       - name: Cache SDL3
         id: cache-sdl3
@@ -153,8 +154,11 @@ jobs:
         run: |
           mkdir dist
           cp zig-out/bin/zig-ai dist/
-          # Bundle the shared lib; the binary's rpath is $ORIGIN.
+          # Bundle the shared libs; the binary's rpath is $ORIGIN. The Vulkan
+          # loader comes along so machines without libvulkan1 still start
+          # (no ICD just means ggml sees zero Vulkan devices → CPU).
           cp sdl3-prefix/lib/libSDL3.so.0* dist/
+          cp /usr/lib/x86_64-linux-gnu/libvulkan.so.1* dist/
           tar -czf zig-ai-linux-x86_64.tar.gz -C dist .
 
       - uses: actions/upload-artifact@v4
@@ -189,6 +193,12 @@ jobs:
 
       - name: Install ninja
         run: choco install -y ninja
+
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1.5.5
+        with:
+          cache: true
+          stripdown: true
 
       - name: Fetch SDL3 (prebuilt mingw devel package)
         shell: bash
@@ -226,7 +236,8 @@ jobs:
           ls -la build-deps/lib
 
       - name: Build
-        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix
+        shell: bash
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix "-Dvulkan-prefix=$VULKAN_SDK"
 
       - name: Package
         shell: bash

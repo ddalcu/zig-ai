@@ -24,6 +24,15 @@ pub fn build(b: *std.Build) void {
     const link_sd = b.option(bool, "sd", "Link the stable-diffusion.cpp backend") orelse true;
     const link_tts = b.option(bool, "tts", "Link the qwen3-tts.cpp backend") orelse true;
 
+    // GPU on Linux/Windows comes from ggml's Vulkan backend (macOS uses Metal).
+    // Building it needs the Vulkan headers/loader + glslc (libvulkan-dev +
+    // glslc on Linux, the LunarG SDK on Windows); -Dvulkan=false opts out.
+    const use_vulkan = b.option(bool, "vulkan", "Build/link the ggml Vulkan GPU backend (default: on for Linux/Windows)") orelse
+        (target.result.os.tag != .macos);
+    // Where to find the Vulkan import library at link time (Windows: the SDK
+    // root, providing Lib/vulkan-1.lib). Linux finds libvulkan via system paths.
+    const vulkan_prefix = b.option([]const u8, "vulkan-prefix", "Vulkan SDK prefix (Windows link)");
+
     // ---- zigui core module (mirror zigui/build.zig) -----------------------
     const zigui = b.addModule("zigui", .{
         .root_source_file = .{ .cwd_relative = b.fmt("{s}/src/zigui.zig", .{zigui_path}) },
@@ -73,8 +82,8 @@ pub fn build(b: *std.Build) void {
     // CMake, then link the resulting archives. cmake_build is the step the exe
     // must wait on before linking.
     const cmake_build: ?*std.Build.Step = if (link_llama or link_sd or link_tts) blk: {
-        const step = cmakeBuildStep(b);
-        linkAiBackends(b, exe_mod, target, link_llama, link_sd, link_tts);
+        const step = cmakeBuildStep(b, use_vulkan);
+        linkAiBackends(b, exe_mod, target, link_llama, link_sd, link_tts, use_vulkan, vulkan_prefix);
         break :blk step;
     } else null;
 
@@ -92,10 +101,11 @@ pub fn build(b: *std.Build) void {
 /// qwen3-tts.cpp) via our top-level CMakeLists.txt. Returns the build step the
 /// final link must depend on. CMake/Ninja are incremental, so re-running this on
 /// every `zig build` is cheap when the C++ sources are unchanged.
-fn cmakeBuildStep(b: *std.Build) *std.Build.Step {
+fn cmakeBuildStep(b: *std.Build, use_vulkan: bool) *std.Build.Step {
     const configure = b.addSystemCommand(&.{
         "cmake", "-S", ".", "-B", "build-deps", "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
+        if (use_vulkan) "-DGGML_VULKAN=ON" else "-DGGML_VULKAN=OFF",
     });
     const compile = b.addSystemCommand(&.{ "cmake", "--build", "build-deps", "-j" });
     compile.step.dependOn(&configure.step);
@@ -116,7 +126,7 @@ fn cmakeBuildStep(b: *std.Build) *std.Build.Step {
 /// macOS (AppleClang) and Windows (zig cc in CI) both use LLVM libc++, which
 /// `link_libcpp` provides; Linux CMake builds with g++ against libstdc++, so
 /// there we link the system libstdc++ instead.
-fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget, llama: bool, sd: bool, tts: bool) void {
+fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget, llama: bool, sd: bool, tts: bool, vulkan: bool, vulkan_prefix: ?[]const u8) void {
     m.addIncludePath(b.path("deps/llama.cpp/include")); // llama.h
     m.addIncludePath(b.path("deps/llama.cpp/ggml/include")); // ggml*.h
     m.addIncludePath(b.path("deps/stable-diffusion.cpp/include")); // stable-diffusion.h
@@ -134,6 +144,16 @@ fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.Resolve
     if (target.result.os.tag == .macos)
         m.addObjectFile(.{ .cwd_relative = L ++ "libggml-metal.a" });
     m.addObjectFile(.{ .cwd_relative = b.fmt("{s}{s}ggml.a", .{ L, gp }) });
+    // ggml-vulkan sits between ggml (whose backend registry references it) and
+    // ggml-base (whose core symbols it needs) — ELF archive resolution is
+    // strictly left-to-right.
+    if (vulkan) {
+        m.addObjectFile(.{ .cwd_relative = b.fmt("{s}{s}ggml-vulkan.a", .{ L, gp }) });
+        if (vulkan_prefix) |p| m.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/Lib", .{p}) });
+        // The Vulkan loader: vulkan-1.dll ships with every modern GPU driver
+        // on Windows; libvulkan.so.1 is bundled next to the Linux binary.
+        m.linkSystemLibrary(if (target.result.os.tag == .windows) "vulkan-1" else "vulkan", .{});
+    }
     m.addObjectFile(.{ .cwd_relative = b.fmt("{s}{s}ggml-cpu.a", .{ L, gp }) });
     m.addObjectFile(.{ .cwd_relative = b.fmt("{s}{s}ggml-base.a", .{ L, gp }) });
 
