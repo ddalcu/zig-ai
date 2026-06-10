@@ -1,0 +1,1445 @@
+//! The application state: every reactive `State(T)`, text buffer, and discovered
+//! model lives here. `main` constructs one `AppState`, `body` reads it each frame
+//! to rebuild the view, and event callbacks mutate it. Backend façades (llama /
+//! sd / tts) are added in later phases.
+
+const std = @import("std");
+const zigui = @import("zigui");
+const app = @import("zigui_app");
+const models = @import("models.zig");
+const config = @import("config.zig");
+const mcp = @import("mcp.zig");
+const agent = @import("agent.zig");
+const manifest = @import("manifest.zig");
+const llama = @import("backends/llama.zig");
+const sd = @import("backends/sd.zig");
+const tts = @import("backends/tts.zig");
+const video = @import("backends/video.zig");
+const downloader = @import("backends/downloader.zig");
+const audioplay = @import("audio.zig");
+
+pub const HFRepo = downloader.HFRepo;
+pub const RepoFile = downloader.RepoFile;
+
+pub const Role = llama.Role;
+
+/// User theme choice. The integer values are the `Picker` indices in Settings
+/// (System / Light / Dark), so the enum doubles as the `theme_pref` State value.
+pub const ThemePref = enum(i64) { system = 0, light = 1, dark = 2 };
+
+/// Resolve a theme preference to an effective dark/light boolean, querying the
+/// OS theme (cross-platform via SDL) when the choice is `.system`.
+pub fn effectiveDark(pref: ThemePref) bool {
+    return switch (pref) {
+        .light => false,
+        .dark => true,
+        .system => app.systemTheme() == .dark,
+    };
+}
+
+/// One chat message. Heap-allocated so a streaming assistant reply can be held
+/// by a stable pointer while tokens append to its `content`.
+pub const ChatMessage = struct {
+    role: Role,
+    content: std.ArrayList(u8) = .empty,
+    streaming: bool = false,
+    tokens: u64 = 0,
+    tps: f32 = 0,
+    /// Reasoning (`<think>…</think>`) disclosure state for assistant messages.
+    /// null = use the default (expanded while still thinking, collapsed once the
+    /// answer arrives); set explicitly once the user taps the header.
+    think_expanded: ?bool = null,
+    gpa: std.mem.Allocator,
+
+    pub fn create(gpa: std.mem.Allocator, role: Role) !*ChatMessage {
+        const m = try gpa.create(ChatMessage);
+        m.* = .{ .role = role, .gpa = gpa };
+        return m;
+    }
+    pub fn destroy(self: *ChatMessage) void {
+        self.content.deinit(self.gpa);
+        self.gpa.destroy(self);
+    }
+    pub fn setText(self: *ChatMessage, s: []const u8) !void {
+        self.content.clearRetainingCapacity();
+        try self.content.appendSlice(self.gpa, s);
+    }
+};
+
+/// Sidebar screens. The integer values back a `State(i64)` so the sidebar's
+/// selection and the detail switch share one binding.
+pub const Screen = enum(i64) {
+    chat = 0,
+    image = 1,
+    video = 2,
+    audio = 3,
+    models = 4,
+    tasks = 5,
+    logs = 6,
+    settings = 7,
+    mcp = 8,
+    editor = 9,
+};
+
+/// Which config file the in-app text editor is currently editing.
+pub const EditorTarget = enum {
+    system_prompt,
+    mcp_json,
+
+    pub fn fileName(self: EditorTarget) []const u8 {
+        return switch (self) {
+            .system_prompt => config.system_prompt_file,
+            .mcp_json => config.mcp_file,
+        };
+    }
+    pub fn title(self: EditorTarget) []const u8 {
+        return switch (self) {
+            .system_prompt => "System Prompt",
+            .mcp_json => "mcp.json",
+        };
+    }
+};
+
+/// Upper bound on a preset's configurable inputs (the inline config form sizes
+/// its field array to this; the catalog never exceeds it).
+pub const max_mcp_inputs = 4;
+
+/// A bounded ring of log lines, shared by the Logs screen. Oldest lines are
+/// dropped once `max` is reached.
+pub const LogRing = struct {
+    gpa: std.mem.Allocator,
+    lines: std.ArrayList([]u8) = .empty,
+    max: usize = 500,
+
+    pub fn init(gpa: std.mem.Allocator) LogRing {
+        return .{ .gpa = gpa };
+    }
+    pub fn deinit(self: *LogRing) void {
+        for (self.lines.items) |l| self.gpa.free(l);
+        self.lines.deinit(self.gpa);
+    }
+    pub fn append(self: *LogRing, line: []const u8) void {
+        const dup = self.gpa.dupe(u8, line) catch return;
+        self.lines.append(self.gpa, dup) catch {
+            self.gpa.free(dup);
+            return;
+        };
+        if (self.lines.items.len > self.max) {
+            const old = self.lines.orderedRemove(0);
+            self.gpa.free(old);
+        }
+    }
+};
+
+pub const AppState = struct {
+    gpa: std.mem.Allocator,
+    /// Reset every frame; cheap scratch space for `body`-time formatting.
+    frame_arena: std.heap.ArenaAllocator,
+    /// User home directory (owned), resolved from the process environment in
+    /// `main`; used to locate default model folders. Null if unavailable.
+    home: ?[]u8 = null,
+
+    // --- navigation -------------------------------------------------------
+    screen: zigui.State(i64),
+
+    // --- discovered models ------------------------------------------------
+    model_list: models.ModelList,
+    /// Extra user-added scan directories (owned strings).
+    model_dirs: std.ArrayList([]u8) = .empty,
+    /// Selected model index into `model_list.items` (-1 = none) per task.
+    sel_llm: zigui.State(i64),
+    sel_sd: zigui.State(i64),
+    sel_video: zigui.State(i64),
+    sel_tts: zigui.State(i64),
+
+    // --- server / status --------------------------------------------------
+    /// Whether a chat model is currently loaded (drives the status dot).
+    llm_loaded: bool = false,
+
+    /// Display name (owned) of the model last submitted to each backend, captured
+    /// at submit time, plus its on-disk size. Paired with the backend's
+    /// `model_ready` atomic they drive the tray status rows and the RAM proxy
+    /// (`loadedBytes`). Null until a generation has been requested for that kind.
+    loaded_llm: ?[]u8 = null,
+    loaded_sd: ?[]u8 = null,
+    loaded_video: ?[]u8 = null,
+    loaded_tts: ?[]u8 = null,
+    loaded_size_llm: u64 = 0,
+    loaded_size_sd: u64 = 0,
+    loaded_size_video: u64 = 0,
+    loaded_size_tts: u64 = 0,
+
+    // --- chat -------------------------------------------------------------
+    chat_input: zigui.TextFieldState,
+    chat_scroll: zigui.ScrollState = .{},
+    messages: std.ArrayList(*ChatMessage) = .empty,
+    /// The assistant message currently being streamed (borrowed; lives in
+    /// `messages`), or null when idle.
+    pending: ?*ChatMessage = null,
+    llama: llama.Backend,
+    /// Transient "Copied" feedback: identity (text address) of the copy button
+    /// last tapped, and the SDL-tick ms until which to show the confirmation.
+    copied_key: usize = 0,
+    copied_until_ms: u64 = 0,
+
+    // --- agent / MCP ------------------------------------------------------
+    /// When on, chat turns run the agentic tool loop (MCP tools advertised in
+    /// the system prompt; `<tool_call>` blocks executed and fed back).
+    agent_mode: zigui.State(bool),
+    /// The user-editable system prompt (owned). Loaded from `system-prompt.md`
+    /// at startup; falls back to the built-in default.
+    system_prompt: []u8 = &.{},
+    /// MCP runtime: spawns the enabled servers and runs their tools.
+    mcp_mgr: mcp.Manager,
+    /// Agentic loop bookkeeping for the current user turn.
+    agent_iters: u32 = 0,
+    /// Monotonic id matching a dispatched tool call to its result event.
+    agent_seq: u64 = 0,
+    /// True while a tool call is in flight (keeps the loop awake; shows status).
+    agent_busy: bool = false,
+    /// Name of the tool currently running (for the chat status line).
+    agent_tool_buf: [128]u8 = undefined,
+    agent_tool_len: usize = 0,
+
+    // --- in-app text editor (system-prompt.md / mcp.json) -----------------
+    editor_buf: zigui.TextFieldState,
+    editor_scroll: zigui.ScrollState = .{},
+    editor_target: EditorTarget = .system_prompt,
+    /// Transient "Saved" confirmation deadline (SDL ticks), 0 = not showing.
+    editor_saved_until_ms: u64 = 0,
+
+    // --- MCP preset config form -------------------------------------------
+    /// Catalog index of the preset being configured inline (-1 = none). When a
+    /// preset has inputs, "Add" opens this form to collect them.
+    mcp_cfg_idx: i64 = -1,
+    /// True when the open form edits an already-added server (pre-filled, Save
+    /// rewrites the entry) rather than configuring a new one (Add appends).
+    mcp_cfg_editing: bool = false,
+    /// Input fields for the preset config form (one per `PresetInput`; presets
+    /// have at most a couple, so a small fixed array is plenty).
+    mcp_cfg_fields: [max_mcp_inputs]zigui.TextFieldState,
+
+    // --- image ------------------------------------------------------------
+    img_prompt: zigui.TextFieldState,
+    img_steps: zigui.State(f32),
+    img_cfg: zigui.State(f32),
+    img_width: zigui.State(i64),
+    img_height: zigui.State(i64),
+    img_advanced: zigui.State(bool),
+    img_scroll: zigui.ScrollState = .{},
+    /// Last generated image, shown in the preview pane.
+    img_result: ?zigui.canvas.Image = null,
+    sd: sd.Backend,
+
+    // --- video (Wan) ------------------------------------------------------
+    vid_prompt: zigui.TextFieldState,
+    vid_steps: zigui.State(f32),
+    vid_frames_n: zigui.State(i64),
+    vid_scroll: zigui.ScrollState = .{},
+    /// Decoded frames of the last generation; cycled for playback in the view.
+    vid_result: ?[]zigui.canvas.Image = null,
+    vid_fps: i32 = 16,
+    /// Frame currently shown; advanced each frame for simple playback.
+    vid_play_idx: usize = 0,
+    vid_play_tick: u32 = 0,
+    video: video.Backend,
+
+    // --- audio / tts ------------------------------------------------------
+    tts_text: zigui.TextFieldState,
+    tts_temperature: zigui.State(f32),
+    tts_scroll: zigui.ScrollState = .{},
+    /// Number of audio samples produced by the last synthesis (status display).
+    tts_last_samples: usize = 0,
+    tts: tts.Backend,
+    player: audioplay.Player = .{},
+    // Voice-clone reference: a WAV picked via the native file dialog, OR a clip
+    // recorded from the mic (24 kHz mono f32 — settable straight into the
+    // backend). Setting one clears the other; both empty = default voice.
+    tts_ref_path: ?[]u8 = null,
+    tts_rec: std.ArrayList(f32) = .empty,
+    tts_recording: bool = false,
+    recorder: audioplay.Recorder = .{},
+
+    // --- settings ---------------------------------------------------------
+    threads: zigui.State(i64),
+    use_gpu: zigui.State(bool),
+    /// Theme preference; `.system` follows the OS light/dark setting live.
+    theme_pref: zigui.State(i64),
+    new_dir: zigui.TextFieldState,
+
+    // --- models -----------------------------------------------------------
+    models_scroll: zigui.ScrollState = .{},
+    /// Which tab of the Models screen is showing: 0..3 = Chat/Image/Video/TTS
+    /// (local models of that kind), 4 = Download (HuggingFace).
+    models_tab: zigui.State(i64),
+
+    // --- header model-switcher popover (one shared pair; only one screen
+    // renders at a time) --------------------------------------------------
+    model_picker_open: zigui.State(bool),
+    model_picker_scroll: zigui.ScrollState = .{},
+
+    // --- HuggingFace downloader -------------------------------------------
+    downloader: downloader.Backend,
+    dl_search: zigui.TextFieldState,
+    dl_category: zigui.State(i64),
+    dl_results: std.ArrayList(HFRepo) = .empty,
+    /// Files of the repo whose quant popover was last opened (owned), or null.
+    dl_files: ?downloader.Files = null,
+    dl_scroll: zigui.ScrollState = .{},
+    /// The result row whose quant popover is active (-1 = none).
+    dl_filepick_idx: i64 = -1,
+    dl_filepick_open: zigui.State(bool),
+    /// Name of the model currently downloading (owned), or null when idle.
+    dl_active: ?[]u8 = null,
+    /// Name of the individual file within the set in flight (owned), or null.
+    dl_active_file: ?[]u8 = null,
+
+    // --- logs -------------------------------------------------------------
+    logs: LogRing,
+    log_scroll: zigui.ScrollState = .{},
+
+    // --- overlays ---------------------------------------------------------
+    show_settings: zigui.State(bool),
+    /// A modal alert: shown while `alert_present` is true, with `alert_buf` text.
+    alert_present: zigui.State(bool),
+    alert_buf: [512]u8 = undefined,
+    alert_len: usize = 0,
+
+    /// Delete-model confirmation overlay. `delete_path` is the file or folder that
+    /// will be removed; `delete_is_folder` picks deleteTree vs deleteFile.
+    delete_present: zigui.State(bool),
+    delete_path: ?[]u8 = null,
+    delete_is_folder: bool = false,
+    delete_name_buf: [160]u8 = undefined,
+    delete_name_len: usize = 0,
+    /// File count + total size of what will be removed (for the dialog).
+    delete_files: usize = 0,
+    delete_bytes: u64 = 0,
+
+    /// Initialize all reactive fields. Call `deinit` to release them.
+    pub fn init(gpa: std.mem.Allocator) AppState {
+        return .{
+            .gpa = gpa,
+            .frame_arena = std.heap.ArenaAllocator.init(gpa),
+            .screen = zigui.State(i64).init(gpa, @intFromEnum(Screen.chat)),
+            .model_list = models.ModelList.init(gpa),
+            .sel_llm = zigui.State(i64).init(gpa, -1),
+            .sel_sd = zigui.State(i64).init(gpa, -1),
+            .sel_video = zigui.State(i64).init(gpa, -1),
+            .sel_tts = zigui.State(i64).init(gpa, -1),
+            .chat_input = zigui.TextFieldState.init(gpa),
+            .llama = llama.Backend.init(gpa),
+            .agent_mode = zigui.State(bool).init(gpa, false),
+            .mcp_mgr = mcp.Manager.init(gpa),
+            .editor_buf = zigui.TextFieldState.init(gpa),
+            .mcp_cfg_fields = .{
+                zigui.TextFieldState.init(gpa),
+                zigui.TextFieldState.init(gpa),
+                zigui.TextFieldState.init(gpa),
+                zigui.TextFieldState.init(gpa),
+            },
+            .img_prompt = zigui.TextFieldState.init(gpa),
+            .img_steps = zigui.State(f32).init(gpa, 20),
+            .img_cfg = zigui.State(f32).init(gpa, 7),
+            .img_width = zigui.State(i64).init(gpa, 512),
+            .img_height = zigui.State(i64).init(gpa, 512),
+            .img_advanced = zigui.State(bool).init(gpa, false),
+            .sd = sd.Backend.init(gpa),
+            .vid_prompt = zigui.TextFieldState.init(gpa),
+            .vid_steps = zigui.State(f32).init(gpa, 20),
+            .vid_frames_n = zigui.State(i64).init(gpa, 33),
+            .video = video.Backend.init(gpa),
+            .tts = tts.Backend.init(gpa),
+            .tts_text = zigui.TextFieldState.init(gpa),
+            .tts_temperature = zigui.State(f32).init(gpa, 0.9),
+            .threads = zigui.State(i64).init(gpa, 4),
+            .use_gpu = zigui.State(bool).init(gpa, true),
+            .theme_pref = zigui.State(i64).init(gpa, @intFromEnum(ThemePref.system)),
+            .new_dir = zigui.TextFieldState.init(gpa),
+            .models_tab = zigui.State(i64).init(gpa, 0),
+            .model_picker_open = zigui.State(bool).init(gpa, false),
+            .downloader = downloader.Backend.init(gpa),
+            .dl_search = zigui.TextFieldState.init(gpa),
+            .dl_category = zigui.State(i64).init(gpa, 0),
+            .dl_filepick_open = zigui.State(bool).init(gpa, false),
+            .logs = LogRing.init(gpa),
+            .show_settings = zigui.State(bool).init(gpa, false),
+            .alert_present = zigui.State(bool).init(gpa, false),
+            .delete_present = zigui.State(bool).init(gpa, false),
+        };
+    }
+
+    pub fn deinit(self: *AppState) void {
+        if (self.home) |h| self.gpa.free(h);
+        self.screen.deinit();
+        self.model_list.deinit();
+        for (self.model_dirs.items) |d| self.gpa.free(d);
+        self.model_dirs.deinit(self.gpa);
+        self.sel_llm.deinit();
+        self.sel_sd.deinit();
+        self.sel_video.deinit();
+        self.sel_tts.deinit();
+        self.llama.deinit();
+        self.sd.deinit();
+        self.tts.deinit();
+        self.agent_mode.deinit();
+        self.mcp_mgr.deinit();
+        self.editor_buf.deinit();
+        for (&self.mcp_cfg_fields) |*f| f.deinit();
+        if (self.system_prompt.len > 0) self.gpa.free(self.system_prompt);
+        if (self.loaded_llm) |s| self.gpa.free(s);
+        if (self.loaded_sd) |s| self.gpa.free(s);
+        if (self.loaded_video) |s| self.gpa.free(s);
+        if (self.loaded_tts) |s| self.gpa.free(s);
+        self.player.close();
+        self.recorder.stop();
+        if (self.tts_ref_path) |p| self.gpa.free(p);
+        self.tts_rec.deinit(self.gpa);
+        for (self.messages.items) |m| m.destroy();
+        self.messages.deinit(self.gpa);
+        self.chat_input.deinit();
+        self.img_prompt.deinit();
+        self.img_steps.deinit();
+        self.img_cfg.deinit();
+        self.img_width.deinit();
+        self.img_height.deinit();
+        self.img_advanced.deinit();
+        if (self.img_result) |img| self.gpa.free(@constCast(img.pixels));
+        self.vid_prompt.deinit();
+        self.vid_steps.deinit();
+        self.vid_frames_n.deinit();
+        self.freeVideoResult();
+        self.video.deinit();
+        self.tts_text.deinit();
+        self.tts_temperature.deinit();
+        self.threads.deinit();
+        self.use_gpu.deinit();
+        self.theme_pref.deinit();
+        self.new_dir.deinit();
+        self.models_tab.deinit();
+        self.model_picker_open.deinit();
+        self.downloader.deinit();
+        self.dl_search.deinit();
+        self.dl_category.deinit();
+        self.dl_filepick_open.deinit();
+        self.clearDlResults();
+        self.dl_results.deinit(self.gpa);
+        self.clearDlFiles();
+        if (self.dl_active) |a| self.gpa.free(a);
+        if (self.dl_active_file) |a| self.gpa.free(a);
+        self.logs.deinit();
+        self.show_settings.deinit();
+        self.alert_present.deinit();
+        self.delete_present.deinit();
+        if (self.delete_path) |p| self.gpa.free(p);
+        self.frame_arena.deinit();
+    }
+
+    /// Rescan all model directories into `model_list`.
+    pub fn rescanModels(self: *AppState) void {
+        self.model_list.clear();
+        models.scanDefaults(&self.model_list, self.home, self.model_dirs.items);
+    }
+
+    /// Selected model of a given kind, or null. `sel` holds an index into
+    /// `model_list.items`.
+    pub fn selectedModel(self: *AppState, sel: i64) ?models.ModelInfo {
+        if (sel < 0) return null;
+        const idx: usize = @intCast(sel);
+        if (idx >= self.model_list.items.items.len) return null;
+        return self.model_list.items.items[idx];
+    }
+
+    /// Start a fresh conversation (after any in-flight generation is cancelled).
+    pub fn newChat(self: *AppState) void {
+        self.llama.cancel();
+        for (self.messages.items) |m| m.destroy();
+        self.messages.clearRetainingCapacity();
+        self.pending = null;
+        self.agent_busy = false;
+        self.agent_iters = 0;
+        self.agent_tool_len = 0;
+    }
+
+    /// Send the current input as a user message and kick off generation.
+    pub fn sendChat(self: *AppState) void {
+        if (self.pending != null) return; // already generating
+        const text = std.mem.trim(u8, self.chat_input.text(), " \t\n");
+        if (text.len == 0) return;
+        if (self.selectedModel(self.sel_llm.get()) == null) {
+            self.appendNotice("No chat model selected. Pick one in the Models tab.");
+            return;
+        }
+
+        // Append the user message; a fresh user turn resets the agent loop.
+        const um = ChatMessage.create(self.gpa, .user) catch return;
+        um.setText(text) catch {};
+        self.messages.append(self.gpa, um) catch {
+            um.destroy();
+            return;
+        };
+        self.chat_input.setText("") catch {};
+        self.agent_iters = 0;
+        self.startGeneration();
+    }
+
+    /// Append a streaming assistant placeholder and submit the whole conversation
+    /// (prefixed with the system prompt, and — in agent mode — the live tool
+    /// catalogue) to the llama worker. Shared by `sendChat` and the agent loop.
+    fn startGeneration(self: *AppState) void {
+        if (self.pending != null) return;
+        const model = self.selectedModel(self.sel_llm.get()) orelse return;
+
+        const am = ChatMessage.create(self.gpa, .assistant) catch return;
+        am.streaming = true;
+        self.messages.append(self.gpa, am) catch {
+            am.destroy();
+            return;
+        };
+        self.pending = am;
+
+        const fa = self.frame_arena.allocator();
+        const sys = agent.buildSystemPrompt(fa, self.system_prompt, &self.mcp_mgr, self.agent_mode.get());
+
+        // System message (if any) + every message except the empty placeholder.
+        const n = self.messages.items.len - 1;
+        const has_sys = sys.len > 0;
+        const total = n + @as(usize, if (has_sys) 1 else 0);
+        const reqs = self.gpa.alloc(llama.ReqMessage, total) catch return;
+        defer self.gpa.free(reqs);
+        var k: usize = 0;
+        if (has_sys) {
+            reqs[k] = .{ .role = .system, .content = @constCast(sys) };
+            k += 1;
+        }
+        for (self.messages.items[0..n]) |m| {
+            reqs[k] = .{ .role = m.role, .content = m.content.items };
+            k += 1;
+        }
+
+        const params = llama.Params{
+            .temperature = 0.7,
+            .n_threads = @intCast(self.threads.get()),
+            .use_gpu = self.use_gpu.get(),
+        };
+        self.rememberLoaded(&self.loaded_llm, &self.loaded_size_llm, model);
+        self.llama.start() catch {};
+        self.llama.submit(model.path, reqs, params) catch {
+            am.streaming = false;
+            self.pending = null;
+        };
+    }
+
+    /// Kick off image generation from the current prompt + controls.
+    pub fn generateImage(self: *AppState) void {
+        if (self.sd.isBusy()) return;
+        const model = self.selectedModel(self.sel_sd.get()) orelse {
+            self.alert("No image model selected. Pick one in the Models tab.");
+            return;
+        };
+        const prompt = self.img_prompt.text();
+        if (std.mem.trim(u8, prompt, " \t\n").len == 0) return;
+
+        // A classic SD checkpoint is one self-contained file. FLUX is split: the
+        // diffusion file plus a VAE and a text encoder (FLUX.2 = a Qwen3 LLM,
+        // FLUX.1 = CLIP-L + T5-XXL), discovered as sidecars in the model folder.
+        var vae: ?[]u8 = null;
+        var enc1: ?[]u8 = null;
+        var enc2: ?[]u8 = null;
+        defer if (vae) |s| self.gpa.free(s);
+        defer if (enc1) |s| self.gpa.free(s);
+        defer if (enc2) |s| self.gpa.free(s);
+
+        var spec: sd.ModelSpec = .{ .model = model.path };
+        if (std.ascii.indexOfIgnoreCase(model.name, "flux") != null) {
+            vae = models.findSupport(self.gpa, model.dir, &.{ "vae", "ae." }, &.{ ".safetensors", ".gguf" }, &.{"audio"});
+            if (vae == null) {
+                self.alertf("FLUX needs a VAE (e.g. flux2-vae.safetensors) next to {s}", .{model.dir});
+                return;
+            }
+            // FLUX.2 ships a Qwen3 LLM text encoder; FLUX.1 uses CLIP-L + T5-XXL.
+            enc1 = models.findSupport(self.gpa, model.dir, &.{"qwen"}, &.{ ".gguf", ".safetensors" }, &.{});
+            if (enc1) |llm| {
+                spec = .{ .diffusion = model.path, .vae = vae.?, .llm = llm };
+            } else {
+                enc1 = models.findSupport(self.gpa, model.dir, &.{ "clip_l", "clip-l" }, &.{ ".safetensors", ".gguf" }, &.{});
+                enc2 = models.findSupport(self.gpa, model.dir, &.{ "t5xxl", "t5-xxl" }, &.{ ".safetensors", ".gguf" }, &.{});
+                if (enc1 == null or enc2 == null) {
+                    self.alertf("FLUX needs a text encoder next to {s}: Qwen3 (FLUX.2) or CLIP-L + T5-XXL (FLUX.1).", .{model.dir});
+                    return;
+                }
+                spec = .{ .diffusion = model.path, .vae = vae.?, .clip_l = enc1.?, .t5xxl = enc2.? };
+            }
+        }
+
+        self.logf("image: generating with {s}…", .{model.name});
+        self.rememberLoaded(&self.loaded_sd, &self.loaded_size_sd, model);
+        self.sd.start() catch {};
+        self.sd.submit(spec, prompt, "", .{
+            .steps = @intFromFloat(self.img_steps.get()),
+            .cfg = self.img_cfg.get(),
+            .width = @intCast(self.img_width.get()),
+            .height = @intCast(self.img_height.get()),
+            .seed = -1,
+            .n_threads = @intCast(self.threads.get()),
+        }) catch {};
+    }
+
+    /// Drain sd events: progress drives the bar (via atomics), final image
+    /// replaces the preview. Call once per frame.
+    pub fn pumpImage(self: *AppState) void {
+        var tmp: std.ArrayList(sd.Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        self.sd.events.drain(&tmp);
+        for (tmp.items) |ev| switch (ev) {
+            .progress => {}, // read live from self.sd.job atomics in the view
+            .image => |img| {
+                if (self.img_result) |old| self.gpa.free(@constCast(old.pixels));
+                self.img_result = img;
+                self.logf("image: generated {d}x{d}", .{ img.width, img.height });
+            },
+            .err => |e| {
+                self.alert(e);
+                self.gpa.free(e);
+            },
+        };
+    }
+
+    fn freeVideoResult(self: *AppState) void {
+        if (self.vid_result) |frames| {
+            for (frames) |fr| self.gpa.free(@constCast(fr.pixels));
+            self.gpa.free(frames);
+            self.vid_result = null;
+        }
+        self.vid_play_idx = 0;
+        self.vid_play_tick = 0;
+    }
+
+    /// Generate a Wan video from the selected video model. The diffusion .gguf is
+    /// the selected model; its VAE and umt5 text-encoder sidecars are discovered
+    /// by name in the same directory tree.
+    pub fn generateVideo(self: *AppState) void {
+        if (self.video.isBusy()) return;
+        const model = self.selectedModel(self.sel_video.get()) orelse {
+            self.alert("No video model selected. Pick a Wan or LTX model in the Models tab.");
+            return;
+        };
+        const prompt = self.vid_prompt.text();
+        if (std.mem.trim(u8, prompt, " \t\n").len == 0) return;
+
+        // The video VAE: a *.safetensors/.gguf with "vae" but not "audio".
+        const vae = models.findSupport(self.gpa, model.dir, &.{"vae"}, &.{ ".safetensors", ".gguf" }, &.{"audio"}) orelse {
+            self.alertf("No video VAE found near {s}", .{model.dir});
+            return;
+        };
+        defer self.gpa.free(vae);
+
+        // Distinguish Wan (umt5 text encoder) from LTX (Gemma LLM + audio VAE +
+        // embeddings connectors) by which sidecars are present.
+        const gemma = models.findSupport(self.gpa, model.dir, &.{"gemma"}, &.{".gguf"}, &.{});
+        defer if (gemma) |g| self.gpa.free(g);
+
+        var spec: video.ModelSpec = .{ .diffusion = model.path, .vae = vae };
+        var t5: ?[]u8 = null;
+        var avae: ?[]u8 = null;
+        var conn: ?[]u8 = null;
+        defer if (t5) |s| self.gpa.free(s);
+        defer if (avae) |s| self.gpa.free(s);
+        defer if (conn) |s| self.gpa.free(s);
+
+        if (gemma) |g| {
+            // LTX.
+            avae = models.findSupport(self.gpa, model.dir, &.{"audio_vae"}, &.{ ".safetensors", ".gguf" }, &.{});
+            conn = models.findSupport(self.gpa, model.dir, &.{ "connector", "connectors" }, &.{ ".safetensors", ".gguf" }, &.{});
+            if (avae == null or conn == null) {
+                self.alertf("LTX needs an audio-VAE + connectors next to {s}", .{model.dir});
+                return;
+            }
+            spec.llm = g;
+            spec.audio_vae = avae;
+            spec.connectors = conn;
+        } else {
+            // Wan: umt5/t5xxl text encoder.
+            t5 = models.findSupport(self.gpa, model.dir, &.{ "umt5", "t5xxl", "t5-xxl" }, &.{".gguf"}, &.{});
+            if (t5 == null) {
+                self.alertf("No umt5/t5xxl encoder found near {s}", .{model.dir});
+                return;
+            }
+            spec.t5xxl = t5;
+        }
+
+        self.logf("video: generating with {s} (Metal)…", .{model.name});
+        self.rememberLoaded(&self.loaded_video, &self.loaded_size_video, model);
+        self.video.start() catch {};
+        self.video.submit(spec, prompt, "", .{
+            .steps = @intFromFloat(self.vid_steps.get()),
+            .frames = @intCast(self.vid_frames_n.get()),
+            .width = 256,
+            .height = 256,
+            .seed = -1,
+            .n_threads = @intCast(self.threads.get()),
+        }) catch {};
+    }
+
+    /// Drain video events: progress drives the bar (atomics); final frames replace
+    /// the playback buffer. Call once per frame.
+    pub fn pumpVideo(self: *AppState) void {
+        var tmp: std.ArrayList(video.Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        self.video.events.drain(&tmp);
+        for (tmp.items) |ev| switch (ev) {
+            .progress => {}, // read live from self.video.job atomics in the view
+            .frames => |f| {
+                self.freeVideoResult();
+                self.vid_result = f.images;
+                self.vid_fps = f.fps;
+                self.logf("video: generated {d} frames", .{f.images.len});
+            },
+            .err => |e| {
+                self.alert(e);
+                self.gpa.free(e);
+            },
+        };
+
+        // Advance simple frame playback: step once every ~4 UI frames so a 16 fps
+        // clip plays at roughly real time on a 60 fps loop.
+        if (self.vid_result) |frames| {
+            if (frames.len > 1) {
+                self.vid_play_tick +%= 1;
+                if (self.vid_play_tick % 4 == 0)
+                    self.vid_play_idx = (self.vid_play_idx + 1) % frames.len;
+            }
+        }
+    }
+
+    /// Synthesize the current TTS text and play it back.
+    pub fn synthesize(self: *AppState) void {
+        if (self.tts.isBusy()) return;
+        const model = self.selectedModel(self.sel_tts.get()) orelse {
+            self.alert("No TTS model selected. Pick one in the Models tab.");
+            return;
+        };
+        const text = self.tts_text.text();
+        if (std.mem.trim(u8, text, " \t\n").len == 0) return;
+        self.rememberLoaded(&self.loaded_tts, &self.loaded_size_tts, model);
+        self.tts.start() catch {};
+        // Clone the chosen WAV / recorded clip when one is set, else the
+        // default voice.
+        const ref: tts.Ref = if (self.tts_ref_path) |p|
+            .{ .file = p }
+        else if (self.tts_rec.items.len > 0)
+            .{ .samples = self.tts_rec.items }
+        else
+            .none;
+        // qwen3-tts loads a folder, not the .gguf file itself.
+        self.tts.submit(model.dir, text, ref, .{
+            .temperature = self.tts_temperature.get(),
+            .n_threads = @intCast(self.threads.get()),
+            .use_gpu = self.use_gpu.get(),
+        }) catch {};
+    }
+
+    // --- voice-clone reference ---------------------------------------------
+
+    /// Filters for the reference-audio picker. Static: SDL holds the pointer
+    /// until the (async) dialog is dismissed.
+    const wav_filters = [_]app.FileFilter{
+        .{ .name = "WAV audio", .pattern = "wav" },
+    };
+
+    /// Open the native file dialog to pick a reference WAV. The result arrives
+    /// later through `pumpAudio`.
+    pub fn chooseRefWav(self: *AppState) void {
+        _ = self;
+        _ = app.openFileDialog(&wav_filters, null);
+    }
+
+    /// Start mic capture, or stop it and keep the take as the clone reference.
+    pub fn toggleRecord(self: *AppState) void {
+        if (self.tts_recording) {
+            self.recorder.poll(self.gpa, &self.tts_rec);
+            self.recorder.stop();
+            self.tts_recording = false;
+            if (self.tts_rec.items.len > 0) self.setRefPath(null);
+        } else {
+            self.tts_rec.clearRetainingCapacity();
+            if (!self.recorder.start()) {
+                self.alert("Could not open the microphone. Check the OS permission for this app.");
+                return;
+            }
+            self.tts_recording = true;
+        }
+    }
+
+    /// Replace the reference-WAV path (null clears it). Takes ownership of `p`.
+    fn setRefPath(self: *AppState, p: ?[]u8) void {
+        if (self.tts_ref_path) |old| self.gpa.free(old);
+        self.tts_ref_path = p;
+    }
+
+    /// Drop the clone reference (both file and recording) → default voice.
+    pub fn clearRef(self: *AppState) void {
+        self.setRefPath(null);
+        self.tts_rec.clearRetainingCapacity();
+    }
+
+    /// Play back the recorded reference clip.
+    pub fn previewRec(self: *AppState) void {
+        if (self.tts_rec.items.len > 0)
+            self.player.play(self.tts_rec.items, audioplay.Recorder.sample_rate);
+    }
+
+    /// Drain tts events: play synthesized audio and record its length. Also
+    /// pumps the voice-clone inputs: accumulates mic samples while recording
+    /// and collects the file-dialog result once the user picks a WAV.
+    pub fn pumpAudio(self: *AppState) void {
+        if (self.tts_recording) self.recorder.poll(self.gpa, &self.tts_rec);
+        switch (app.takeFileDialogResult(self.gpa)) {
+            .none, .canceled => {},
+            .picked => |p| {
+                self.setRefPath(p);
+                self.tts_rec.clearRetainingCapacity(); // file replaces recording
+                self.logf("tts: clone reference set to {s}", .{p});
+            },
+        }
+        var tmp: std.ArrayList(tts.Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        self.tts.events.drain(&tmp);
+        for (tmp.items) |ev| switch (ev) {
+            .audio => |a| {
+                self.player.play(a.samples, a.sample_rate);
+                self.tts_last_samples = a.samples.len;
+                self.logf("tts: {d} samples @ {d} Hz", .{ a.samples.len, a.sample_rate });
+                self.gpa.free(a.samples);
+            },
+            .err => |e| {
+                self.alert(e);
+                self.gpa.free(e);
+            },
+        };
+    }
+
+    /// Select model at `index` (into `model_list.items`) for its kind, routing
+    /// to the matching `sel_*`. Shared by the Models tab and the header picker.
+    pub fn setSelected(self: *AppState, index: usize) void {
+        if (index >= self.model_list.items.items.len) return;
+        const idx: i64 = @intCast(index);
+        switch (self.model_list.items.items[index].kind) {
+            .text => self.sel_llm.set(idx),
+            .image => self.sel_sd.set(idx),
+            .video => self.sel_video.set(idx),
+            .tts => self.sel_tts.set(idx),
+        }
+    }
+
+    // --- delete a local model ---------------------------------------------
+
+    /// True if `dir` is a top-level scan root (the app models dir, a default
+    /// folder, or a user-added one) — we must never delete those, only a model
+    /// folder inside them.
+    fn isScanRoot(self: *AppState, dir: []const u8) bool {
+        if (self.home) |home| {
+            if (config.modelsDirAlloc(self.gpa, home)) |app_models| {
+                defer self.gpa.free(app_models);
+                if (std.mem.eql(u8, app_models, dir)) return true;
+            }
+            for (models.default_dirs) |dd| {
+                const p = std.fs.path.join(self.gpa, &.{ home, dd.sub }) catch continue;
+                defer self.gpa.free(p);
+                if (std.mem.eql(u8, p, dir)) return true;
+            }
+        }
+        for (self.model_dirs.items) |d| if (std.mem.eql(u8, d, dir)) return true;
+        return false;
+    }
+
+    /// Ask to delete the model at `index`. Only models we own (in the app's own
+    /// folder) are deletable; others are read-only. Captures what will be removed
+    /// and opens the confirmation overlay.
+    pub fn requestDeleteModel(self: *AppState, index: usize) void {
+        if (index >= self.model_list.items.items.len) return;
+        const m = self.model_list.items.items[index];
+        // Hard guard: never delete a model we don't own (LM Studio / mlx-serve /
+        // custom folders are read-only to us).
+        if (!m.source.owned()) return;
+        // Delete the whole model folder (downloads live in their own folder),
+        // unless that folder is a scan root — then delete only the file.
+        const folder = !self.isScanRoot(m.dir);
+        const target = if (folder) m.dir else m.path;
+        if (self.delete_path) |p| self.gpa.free(p);
+        self.delete_path = self.gpa.dupe(u8, target) catch null;
+        self.delete_is_folder = folder;
+        const n = @min(m.name.len, self.delete_name_buf.len);
+        @memcpy(self.delete_name_buf[0..n], m.name[0..n]);
+        self.delete_name_len = n;
+        // How much the user is about to free (the whole folder, or one file).
+        if (folder) {
+            const stats = models.folderStats(self.gpa, m.dir);
+            self.delete_files = stats.files;
+            self.delete_bytes = stats.bytes;
+        } else {
+            self.delete_files = 1;
+            self.delete_bytes = m.size;
+        }
+        self.delete_present.set(true);
+    }
+
+    pub fn deleteModelFiles(self: *const AppState) usize {
+        return self.delete_files;
+    }
+    pub fn deleteModelBytes(self: *const AppState) u64 {
+        return self.delete_bytes;
+    }
+
+    pub fn deleteModelName(self: *const AppState) []const u8 {
+        return self.delete_name_buf[0..self.delete_name_len];
+    }
+    pub fn deleteModelPath(self: *const AppState) []const u8 {
+        return self.delete_path orelse "";
+    }
+
+    pub fn cancelDeleteModel(self: *AppState) void {
+        self.delete_present.set(false);
+        if (self.delete_path) |p| self.gpa.free(p);
+        self.delete_path = null;
+    }
+
+    fn indexOfPath(self: *AppState, path: []const u8) i64 {
+        for (self.model_list.items.items, 0..) |m, i| {
+            if (std.mem.eql(u8, m.path, path)) return @intCast(i);
+        }
+        return -1;
+    }
+
+    /// Delete the captured file/folder, rescan, and re-resolve every selection by
+    /// path so the remaining picks stay correct despite index shifts.
+    pub fn confirmDeleteModel(self: *AppState) void {
+        const target = self.delete_path orelse return;
+
+        // Remember selected models by path so we can re-point after the rescan.
+        const sels = [_]*zigui.State(i64){ &self.sel_llm, &self.sel_sd, &self.sel_video, &self.sel_tts };
+        var kept: [4]?[]u8 = .{ null, null, null, null };
+        for (sels, 0..) |s, i| {
+            if (self.selectedModel(s.get())) |m| kept[i] = self.gpa.dupe(u8, m.path) catch null;
+        }
+        defer for (kept) |k| if (k) |p| self.gpa.free(p);
+
+        var threaded = std.Io.Threaded.init(self.gpa, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const ok = if (self.delete_is_folder)
+            std.Io.Dir.cwd().deleteTree(io, target)
+        else
+            std.Io.Dir.cwd().deleteFile(io, target);
+        ok catch |e| {
+            self.alertf("Failed to delete: {s}", .{@errorName(e)});
+            self.cancelDeleteModel();
+            return;
+        };
+        self.logf("models: deleted {s}", .{target});
+
+        self.rescanModels();
+        // Re-resolve each selection (or clear it if the model is gone).
+        for (sels, 0..) |s, i| {
+            s.set(if (kept[i]) |p| self.indexOfPath(p) else -1);
+        }
+        self.cancelDeleteModel();
+    }
+
+    // --- tray / loaded-model status ---------------------------------------
+
+    /// Record the model just submitted to a backend so the tray can show its
+    /// name and count its bytes toward the RAM proxy. `slot`/`size` point at the
+    /// matching `loaded_*` / `loaded_size_*` fields.
+    fn rememberLoaded(self: *AppState, slot: *?[]u8, size: *u64, m: models.ModelInfo) void {
+        if (slot.*) |old| self.gpa.free(old);
+        slot.* = self.gpa.dupe(u8, m.name) catch null;
+        size.* = m.size;
+    }
+
+    /// Free every backend's cached model to reclaim memory, without shutting the
+    /// workers down (the next generation reloads on demand). A backend that is
+    /// mid-generation is left alone (its `unload` is a no-op while busy).
+    pub fn unloadAll(self: *AppState) void {
+        self.llama.unload();
+        self.sd.unload();
+        self.tts.unload();
+        self.video.unload();
+        // Drop the remembered name/size for any backend that actually unloaded
+        // (a busy one keeps its model, so leave its row intact).
+        if (!self.llama.model_ready.load(.acquire)) self.clearLoaded(&self.loaded_llm, &self.loaded_size_llm);
+        if (!self.sd.model_ready.load(.acquire)) self.clearLoaded(&self.loaded_sd, &self.loaded_size_sd);
+        if (!self.tts.model_ready.load(.acquire)) self.clearLoaded(&self.loaded_tts, &self.loaded_size_tts);
+        if (!self.video.model_ready.load(.acquire)) self.clearLoaded(&self.loaded_video, &self.loaded_size_video);
+        self.llm_loaded = self.llama.model_ready.load(.acquire);
+        self.logf("models: unloaded (freed resident memory)", .{});
+    }
+
+    fn clearLoaded(self: *AppState, slot: *?[]u8, size: *u64) void {
+        if (slot.*) |old| self.gpa.free(old);
+        slot.* = null;
+        size.* = 0;
+    }
+
+    /// Total resident model bytes — the sum of the on-disk sizes of every backend
+    /// whose model is currently loaded. A proxy for RAM use (it excludes the KV
+    /// cache and compute buffers), shown in the tray.
+    pub fn loadedBytes(self: *AppState) u64 {
+        var total: u64 = 0;
+        if (self.llama.model_ready.load(.acquire)) total += self.loaded_size_llm;
+        if (self.sd.model_ready.load(.acquire)) total += self.loaded_size_sd;
+        if (self.tts.model_ready.load(.acquire)) total += self.loaded_size_tts;
+        if (self.video.model_ready.load(.acquire)) total += self.loaded_size_video;
+        return total;
+    }
+
+    // --- downloader -------------------------------------------------------
+
+    fn clearDlResults(self: *AppState) void {
+        for (self.dl_results.items) |r| self.gpa.free(r.id);
+        self.dl_results.clearRetainingCapacity();
+    }
+
+    fn clearDlFiles(self: *AppState) void {
+        if (self.dl_files) |f| downloader.freeFiles(self.gpa, f);
+        self.dl_files = null;
+    }
+
+    fn clearDlActive(self: *AppState) void {
+        if (self.dl_active) |a| self.gpa.free(a);
+        self.dl_active = null;
+        if (self.dl_active_file) |a| self.gpa.free(a);
+        self.dl_active_file = null;
+    }
+
+    /// Map the `dl_category` Picker index to a model Kind (null = "All").
+    fn dlCategory(self: *AppState) ?models.Kind {
+        return switch (self.dl_category.get()) {
+            1 => .text,
+            2 => .image,
+            3 => .video,
+            4 => .tts,
+            else => null,
+        };
+    }
+
+    /// Run a HuggingFace search from the current query + category.
+    pub fn dlSearch(self: *AppState) void {
+        const q = std.mem.trim(u8, self.dl_search.text(), " \t\n");
+        self.dl_filepick_open.set(false);
+        self.dl_filepick_idx = -1;
+        self.downloader.search(q, self.dlCategory());
+    }
+
+    /// Open the quant popover for result row `idx` and fetch its file list.
+    pub fn dlOpenFiles(self: *AppState, idx: usize) void {
+        if (idx >= self.dl_results.items.len) return;
+        self.dl_filepick_idx = @intCast(idx);
+        self.clearDlFiles();
+        self.dl_filepick_open.set(true);
+        self.downloader.listFiles(self.dl_results.items[idx].id);
+    }
+
+    /// Start downloading the chosen quant `file` plus every support file in the
+    /// repo (VAE / text encoder / tokenizer / config), so the model is runnable
+    /// the moment it lands.
+    pub fn dlStart(self: *AppState, file: []const u8) void {
+        if (self.dl_filepick_idx < 0) return;
+        const idx: usize = @intCast(self.dl_filepick_idx);
+        if (idx >= self.dl_results.items.len) return;
+        const home = self.home orelse {
+            self.alert("No home directory; cannot choose a download folder.");
+            return;
+        };
+        const repo = self.dl_results.items[idx];
+
+        // The chosen quant + all non-quant support files. `download` dupes these
+        // synchronously, so a transient gpa list is fine.
+        var list: std.ArrayList(RepoFile) = .empty;
+        defer list.deinit(self.gpa);
+        if (self.dl_files) |files| {
+            for (files.items) |f| {
+                if (f.is_quant) {
+                    if (std.mem.eql(u8, f.path, file)) list.append(self.gpa, f) catch {};
+                } else {
+                    list.append(self.gpa, f) catch {};
+                }
+            }
+        }
+        if (list.items.len == 0) {
+            // No tree loaded; fall back to the single chosen file.
+            list.append(self.gpa, .{ .path = @constCast(file), .size = 0 }) catch return;
+        }
+
+        // Save into the app's own cross-platform models dir (not a hardcoded
+        // ~/.mlx-serve), grouped by kind.
+        const models_root = config.modelsDirAlloc(self.gpa, home) orelse {
+            self.alert("Could not resolve the models directory.");
+            return;
+        };
+        defer self.gpa.free(models_root);
+
+        if (self.dl_active) |a| self.gpa.free(a);
+        self.dl_active = self.gpa.dupe(u8, repo.name()) catch null;
+        if (self.dl_active_file) |a| self.gpa.free(a);
+        self.dl_active_file = null;
+        self.dl_filepick_open.set(false);
+        // For split models (FLUX/Wan), also pull the cross-repo VAE/encoder into
+        // the same folder so the model is runnable on arrival.
+        self.downloader.download(models_root, repo.id, list.items, repo.kind, manifest.sidecarsFor(repo.id));
+    }
+
+    /// Cancel the in-flight download (if any).
+    pub fn dlCancel(self: *AppState) void {
+        self.downloader.job.requestCancel();
+    }
+
+    /// Drain downloader events: results/files replace their buffers, progress is
+    /// read live from atomics, errors raise an alert, done triggers a rescan.
+    pub fn pumpDownloader(self: *AppState) void {
+        var tmp: std.ArrayList(downloader.Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        self.downloader.events.drain(&tmp);
+        for (tmp.items) |ev| switch (ev) {
+            .results => |repos| {
+                self.clearDlResults();
+                self.dl_results.appendSlice(self.gpa, repos) catch {};
+                self.gpa.free(repos); // ids now owned by dl_results
+            },
+            .files => |f| {
+                // Keep only if it matches the row whose popover is open.
+                self.clearDlFiles();
+                self.dl_files = f;
+            },
+            .file => |name| {
+                if (self.dl_active_file) |a| self.gpa.free(a);
+                self.dl_active_file = name; // take ownership
+            },
+            .progress => {}, // read live from downloader atomics in the view
+            .done => |path| {
+                self.logf("download: saved into {s}", .{path});
+                self.clearDlActive();
+                self.gpa.free(path);
+                self.rescanModels();
+            },
+            .err => |e| {
+                self.alert(e);
+                self.gpa.free(e);
+                self.clearDlActive();
+            },
+        };
+    }
+
+    /// Append a formatted line to the Logs ring (UI thread only).
+    pub fn logf(self: *AppState, comptime f: []const u8, args: anytype) void {
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, f, args) catch return;
+        self.logs.append(line);
+    }
+
+    /// Raise a modal alert (and also log it). Use for errors the user must see —
+    /// failed model load, missing model, generation failure — instead of quietly
+    /// switching to the Logs screen.
+    pub fn alert(self: *AppState, text: []const u8) void {
+        const n = @min(text.len, self.alert_buf.len);
+        @memcpy(self.alert_buf[0..n], text[0..n]);
+        self.alert_len = n;
+        self.alert_present.set(true);
+        self.logs.append(text);
+    }
+
+    pub fn alertf(self: *AppState, comptime f: []const u8, args: anytype) void {
+        var buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, f, args) catch return;
+        self.alert(line);
+    }
+
+    pub fn alertText(self: *AppState) []const u8 {
+        return self.alert_buf[0..self.alert_len];
+    }
+
+    fn appendNotice(self: *AppState, text: []const u8) void {
+        const m = ChatMessage.create(self.gpa, .assistant) catch return;
+        m.setText(text) catch {};
+        self.messages.append(self.gpa, m) catch m.destroy();
+    }
+
+    /// Drain llama events into the conversation. Call once per frame.
+    pub fn pumpChat(self: *AppState) void {
+        self.llm_loaded = self.llama.model_ready.load(.acquire);
+
+        var tmp: std.ArrayList(llama.Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        self.llama.events.drain(&tmp);
+        for (tmp.items) |ev| switch (ev) {
+            .token => |s| {
+                if (self.pending) |p| p.content.appendSlice(self.gpa, s) catch {};
+                if (self.chat_scroll.atBottom()) self.chat_scroll.offset = 1_000_000;
+                self.gpa.free(s);
+            },
+            .done => |d| {
+                if (self.pending) |p| {
+                    p.streaming = false;
+                    p.tokens = d.tokens;
+                    p.tps = if (d.ms > 0) @as(f32, @floatFromInt(d.tokens)) / (@as(f32, @floatFromInt(d.ms)) / 1000.0) else 0;
+                    self.pending = null;
+                    self.logf("chat: {d} tokens in {d} ms", .{ d.tokens, d.ms });
+                    self.maybeRunTool(p);
+                } else {
+                    self.logf("chat: {d} tokens in {d} ms", .{ d.tokens, d.ms });
+                }
+            },
+            .err => |e| {
+                if (self.pending) |p| {
+                    p.setText(e) catch {};
+                    p.streaming = false;
+                } else self.appendNotice(e);
+                self.pending = null;
+                self.gpa.free(e);
+            },
+        };
+    }
+
+    // --- agent loop + MCP -------------------------------------------------
+
+    /// After an assistant turn finishes, if agent mode is on and the reply ends
+    /// with a `<tool_call>` block, dispatch it to the MCP manager. The result
+    /// comes back through `pumpMcp`, which continues the loop.
+    fn maybeRunTool(self: *AppState, msg: *ChatMessage) void {
+        if (!self.agent_mode.get()) return;
+        if (self.agent_iters >= agent.max_iterations) {
+            self.appendNotice("Agent stopped: reached the tool-call limit for this turn.");
+            return;
+        }
+        const fa = self.frame_arena.allocator();
+        const call = agent.parseToolCall(fa, msg.content.items) orelse return;
+
+        if (!self.mcp_mgr.hasTool(call.name)) {
+            const err = std.fmt.allocPrint(fa, "Error: unknown tool \"{s}\". Use only the tools listed in the system prompt.", .{call.name}) catch "Error: unknown tool.";
+            self.continueWithToolResult(err);
+            return;
+        }
+
+        self.agent_iters += 1;
+        self.agent_seq += 1;
+        self.agent_busy = true;
+        self.setAgentToolName(call.name);
+        self.logf("agent: calling {s} (step {d})", .{ call.name, self.agent_iters });
+        self.mcp_mgr.callAsync(self.agent_seq, call.name, call.args_json);
+    }
+
+    fn setAgentToolName(self: *AppState, name: []const u8) void {
+        const n = @min(name.len, self.agent_tool_buf.len);
+        @memcpy(self.agent_tool_buf[0..n], name[0..n]);
+        self.agent_tool_len = n;
+    }
+
+    pub fn agentToolName(self: *const AppState) []const u8 {
+        return self.agent_tool_buf[0..self.agent_tool_len];
+    }
+
+    /// Append a tool result as a user message and resume generation.
+    fn continueWithToolResult(self: *AppState, text: []const u8) void {
+        const fa = self.frame_arena.allocator();
+        const body = std.fmt.allocPrint(fa, "Tool result:\n{s}", .{text}) catch text;
+        const m = ChatMessage.create(self.gpa, .user) catch return;
+        m.setText(body) catch {};
+        self.messages.append(self.gpa, m) catch {
+            m.destroy();
+            return;
+        };
+        self.startGeneration();
+    }
+
+    /// Drain MCP events: tool results resume the agent loop; logs go to the ring.
+    /// Call once per frame.
+    pub fn pumpMcp(self: *AppState) void {
+        var tmp: std.ArrayList(mcp.Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        self.mcp_mgr.events.drain(&tmp);
+        for (tmp.items) |ev| switch (ev) {
+            .changed => {},
+            .log => |s| {
+                self.logs.append(s);
+                self.gpa.free(s);
+            },
+            .result => |r| {
+                // Ignore stale results from a previous turn (e.g. after New chat).
+                if (r.seq == self.agent_seq) {
+                    self.agent_busy = false;
+                    self.agent_tool_len = 0;
+                    self.continueWithToolResult(r.text);
+                }
+                self.gpa.free(r.text);
+            },
+        };
+    }
+
+    // --- config: system prompt + MCP --------------------------------------
+
+    /// Load the persisted config files and bring up the MCP runtime. Called once
+    /// from `main` after the home directory and environment are known.
+    pub fn loadConfig(self: *AppState, environ: std.process.Environ) void {
+        const home = self.home orelse return;
+        config.ensureDefaults(self.gpa, home);
+        if (self.system_prompt.len > 0) self.gpa.free(self.system_prompt);
+        self.system_prompt = config.loadSystemPrompt(self.gpa, home);
+        self.mcp_mgr.setContext(home, environ);
+        self.mcp_mgr.start() catch {};
+    }
+
+    /// Reload the system prompt from disk (after an external or in-app edit).
+    fn reloadSystemPrompt(self: *AppState) void {
+        const home = self.home orelse return;
+        if (self.system_prompt.len > 0) self.gpa.free(self.system_prompt);
+        self.system_prompt = config.loadSystemPrompt(self.gpa, home);
+    }
+
+    // --- in-app text editor -----------------------------------------------
+
+    /// Open the editor on a config file: load its current bytes into the buffer
+    /// and switch to the editor screen.
+    pub fn openEditor(self: *AppState, target: EditorTarget) void {
+        self.editor_target = target;
+        const home = self.home;
+        var text: []u8 = &.{};
+        var owned = false;
+        if (home) |h| {
+            if (config.read(self.gpa, h, target.fileName())) |bytes| {
+                text = bytes;
+                owned = true;
+            }
+        }
+        // Seed an empty mcp.json / the default prompt so the buffer isn't blank.
+        if (text.len == 0) {
+            switch (target) {
+                .system_prompt => self.editor_buf.setText(config.default_system_prompt) catch {},
+                .mcp_json => self.editor_buf.setText("{\n  \"mcpServers\": {}\n}\n") catch {},
+            }
+        } else {
+            self.editor_buf.setText(text) catch {};
+        }
+        if (owned) self.gpa.free(text);
+        self.editor_scroll = .{};
+        self.editor_saved_until_ms = 0;
+        self.screen.set(@intFromEnum(Screen.editor));
+    }
+
+    /// Save the editor buffer back to its file and apply the change.
+    pub fn saveEditor(self: *AppState) void {
+        const home = self.home orelse {
+            self.alert("No home directory; cannot save.");
+            return;
+        };
+        const data = self.editor_buf.text();
+        if (!config.write(self.gpa, home, self.editor_target.fileName(), data)) {
+            self.alert("Failed to write the file.");
+            return;
+        }
+        switch (self.editor_target) {
+            .system_prompt => self.reloadSystemPrompt(),
+            .mcp_json => self.mcp_mgr.reload(),
+        }
+        self.logf("editor: saved {s}", .{self.editor_target.fileName()});
+    }
+
+    // --- MCP marketplace actions ------------------------------------------
+
+    /// Handle an "Add" tap on a catalog preset: if it needs configuration, open
+    /// the inline form to collect values; otherwise add it straight away.
+    pub fn addMcpPresetByIndex(self: *AppState, idx: usize) void {
+        if (idx >= mcp.catalog.len) return;
+        const preset = mcp.catalog[idx];
+        if (preset.needsConfig()) {
+            self.openMcpConfig(idx);
+        } else {
+            self.addMcpPreset(preset);
+        }
+    }
+
+    /// Add a preset server to mcp.json and respawn the runtime.
+    pub fn addMcpPreset(self: *AppState, preset: mcp.Preset) void {
+        const home = self.home orelse return;
+        if (mcp.addPreset(self.gpa, home, preset)) {
+            self.logf("mcp: added preset {s}", .{preset.id});
+            self.mcp_mgr.reload();
+        }
+    }
+
+    /// Open the inline config form for catalog preset `idx`, clearing its fields.
+    pub fn openMcpConfig(self: *AppState, idx: usize) void {
+        self.mcp_cfg_idx = @intCast(idx);
+        self.mcp_cfg_editing = false;
+        for (&self.mcp_cfg_fields) |*f| f.setText("") catch {};
+    }
+
+    /// Open the config form on an already-added preset server, pre-filled with
+    /// the entry's current values, to edit them in place.
+    pub fn openMcpEdit(self: *AppState, idx: usize) void {
+        if (idx >= mcp.catalog.len) return;
+        const home = self.home orelse return;
+        const preset = mcp.catalog[idx];
+        self.mcp_cfg_idx = @intCast(idx);
+        self.mcp_cfg_editing = true;
+        for (&self.mcp_cfg_fields) |*f| f.setText("") catch {};
+
+        var reg = mcp.loadRegistry(self.gpa, home);
+        defer reg.deinit();
+        for (reg.servers.items) |s| {
+            if (!std.mem.eql(u8, s.name, preset.id)) continue;
+            var vals: [max_mcp_inputs][]const u8 = .{""} ** max_mcp_inputs;
+            const n = @min(preset.inputs.len, max_mcp_inputs);
+            mcp.currentValues(preset, s, vals[0..n]);
+            // setText copies, so the values may die with `reg`.
+            for (0..n) |i| self.mcp_cfg_fields[i].setText(vals[i]) catch {};
+            break;
+        }
+    }
+
+    pub fn cancelMcpConfig(self: *AppState) void {
+        self.mcp_cfg_idx = -1;
+        self.mcp_cfg_editing = false;
+    }
+
+    /// Write the configured preset (collecting values from the form fields) and
+    /// respawn the runtime. In edit mode this rewrites the existing entry
+    /// (keeping its disabled flag) instead of appending a new one.
+    pub fn confirmMcpConfig(self: *AppState) void {
+        if (self.mcp_cfg_idx < 0) return;
+        const idx: usize = @intCast(self.mcp_cfg_idx);
+        if (idx >= mcp.catalog.len) return;
+        const home = self.home orelse return;
+        const preset = mcp.catalog[idx];
+
+        var values: [max_mcp_inputs][]const u8 = undefined;
+        const n = @min(preset.inputs.len, max_mcp_inputs);
+        for (0..n) |i| values[i] = self.mcp_cfg_fields[i].text();
+
+        const ok = if (self.mcp_cfg_editing)
+            mcp.updatePresetValues(self.gpa, home, preset, values[0..n])
+        else
+            mcp.addPresetWithValues(self.gpa, home, preset, values[0..n]);
+        if (ok) {
+            const verb: []const u8 = if (self.mcp_cfg_editing) "updated" else "added";
+            self.logf("mcp: {s} preset {s}", .{ verb, preset.id });
+            self.mcp_mgr.reload();
+        }
+        self.mcp_cfg_idx = -1;
+        self.mcp_cfg_editing = false;
+    }
+
+    /// Remove a server entry by name and respawn the runtime.
+    pub fn removeMcpServer(self: *AppState, name: []const u8) void {
+        const home = self.home orelse return;
+        if (mcp.removeServer(self.gpa, home, name)) {
+            self.logf("mcp: removed {s}", .{name});
+            self.mcp_mgr.reload();
+        }
+    }
+
+    /// Toggle a server's disabled flag and respawn the runtime.
+    pub fn toggleMcpServer(self: *AppState, name: []const u8, disabled: bool) void {
+        const home = self.home orelse return;
+        if (mcp.setDisabled(self.gpa, home, name, disabled)) self.mcp_mgr.reload();
+    }
+};

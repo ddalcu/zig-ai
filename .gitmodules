@@ -1,0 +1,9 @@
+[submodule "deps/llama.cpp"]
+	path = deps/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "deps/stable-diffusion.cpp"]
+	path = deps/stable-diffusion.cpp
+	url = https://github.com/leejet/stable-diffusion.cpp.git
+[submodule "deps/qwen3-tts.cpp"]
+	path = deps/qwen3-tts.cpp
+	url = https://github.com/predict-woo/qwen3-tts.cpp.git

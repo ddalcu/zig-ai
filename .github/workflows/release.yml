@@ -1,0 +1,242 @@
+# Release builds: macOS (arm64), Linux (x86_64), Windows (x86_64).
+#
+# Triggered by pushing a tag like `v0.1.0` (attaches binaries to a GitHub
+# release for that tag) or manually via workflow_dispatch (artifacts only).
+#
+# Requirements / assumptions:
+#   * The zigui UI library is available at <same owner>/zigui — build.zig takes
+#     its path via -Dzigui. If the repo name or ref differs, adjust the
+#     "Check out zigui" steps.
+#   * deps/ submodules are public upstreams (cloned recursively here); the two
+#     local Metal patches needed for video-on-Metal live in deps/patches/ and
+#     are applied after checkout.
+#   * SDL3 is pinned below (same minor as local dev: 3.4.x — the tray API
+#     needs >= 3.4). macOS: Homebrew. Linux: built from source (shared lib
+#     bundled next to the binary; the rpath is $ORIGIN). Windows: the upstream
+#     prebuilt VC devel package (SDL3.dll zipped next to the exe).
+#
+# The Windows job builds the C++ deps with `zig cc` (mingw/libc++ toolchain)
+# so the archives match the ABI of the zig-linked exe. It is marked
+# continue-on-error: it has not been exercised yet and llama.cpp/MSVC-isms may
+# need follow-up; mac/linux releases shouldn't be held hostage to it.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.16.0
+  SDL_REF: release-3.4.10
+  # zigui release the app builds against (https://github.com/ddalcu/zigui).
+  ZIGUI_REF: v0.2.0
+
+jobs:
+  build-macos:
+    runs-on: macos-latest # arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check out zigui
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/zigui
+          ref: ${{ env.ZIGUI_REF }}
+          path: zigui-src
+
+      - name: Apply local submodule patches
+        run: |
+          git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
+          git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install build deps
+        run: brew install ninja sdl3
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp zig-out/bin/zig-ai dist/
+          SDL_PREFIX="$(brew --prefix sdl3)"
+          cp "$SDL_PREFIX"/lib/libSDL3.*.dylib dist/
+          # The binary records the Homebrew keg path for SDL3; rewrite it to
+          # @rpath so the bundled dylib (rpath @executable_path) is found on
+          # machines without Homebrew. Re-sign (ad-hoc): editing the load
+          # command invalidates the signature, and unsigned arm64 won't run.
+          SDL_REF_PATH=$(otool -L dist/zig-ai | awk '/libSDL3/{print $1}')
+          SDL_BASENAME=$(basename "$SDL_REF_PATH")
+          install_name_tool -change "$SDL_REF_PATH" "@rpath/$SDL_BASENAME" dist/zig-ai
+          codesign --force --sign - dist/zig-ai
+          tar -czf zig-ai-macos-arm64.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zig-ai-macos-arm64
+          path: zig-ai-macos-arm64.tar.gz
+
+  build-linux:
+    runs-on: ubuntu-latest # x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check out zigui
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/zigui
+          ref: ${{ env.ZIGUI_REF }}
+          path: zigui-src
+
+      - name: Apply local submodule patches
+        run: |
+          git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
+          git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          # ninja + the X11/Wayland/audio/dbus dev headers SDL3 builds against
+          # (dbus is what the tray uses on Linux; udev for input hotplug).
+          sudo apt-get install -y ninja-build build-essential \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libwayland-dev libxkbcommon-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libdrm-dev libgbm-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libdbus-1-dev libudev-dev libusb-1.0-0-dev
+
+      - name: Cache SDL3
+        id: cache-sdl3
+        uses: actions/cache@v4
+        with:
+          path: sdl3-prefix
+          key: sdl3-${{ env.SDL_REF }}-${{ runner.os }}
+
+      - name: Build SDL3
+        if: steps.cache-sdl3.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$SDL_REF" https://github.com/libsdl-org/SDL sdl3-src
+          cmake -S sdl3-src -B sdl3-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/sdl3-prefix" \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build sdl3-build -j
+          cmake --install sdl3-build
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp zig-out/bin/zig-ai dist/
+          # Bundle the shared lib; the binary's rpath is $ORIGIN.
+          cp sdl3-prefix/lib/libSDL3.so.0* dist/
+          tar -czf zig-ai-linux-x86_64.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zig-ai-linux-x86_64
+          path: zig-ai-linux-x86_64.tar.gz
+
+  build-windows:
+    runs-on: windows-latest # x86_64
+    # Untested pipeline (no local Windows box): allowed to fail without
+    # blocking the mac/linux release. Promote to required once it's green.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check out zigui
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/zigui
+          ref: ${{ env.ZIGUI_REF }}
+          path: zigui-src
+
+      - name: Apply local submodule patches
+        shell: bash
+        run: |
+          git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
+          git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install ninja
+        run: choco install -y ninja
+
+      - name: Fetch SDL3 (prebuilt mingw devel package)
+        shell: bash
+        # The mingw package matches the windows-gnu/zig toolchain (gnu import
+        # lib) and already has the include/ + lib/ prefix layout -Dsdl3 wants.
+        run: |
+          VER="${SDL_REF#release-}"
+          curl -fsSL -o sdl3.zip \
+            "https://github.com/libsdl-org/SDL/releases/download/${SDL_REF}/SDL3-devel-${VER}-mingw.zip"
+          unzip -q sdl3.zip
+          cp -r "SDL3-${VER}/x86_64-w64-mingw32" sdl3-prefix
+
+      - name: Set up zig cc as the CMake toolchain
+        shell: bash
+        # The C++ deps must share an ABI/stdlib with the zig-linked exe
+        # (windows-gnu + LLVM libc++), so CMake compiles them with zig cc
+        # rather than MSVC. build.zig's cmake step inherits CC/CXX.
+        run: |
+          mkdir -p "$PWD/zigcc"
+          printf '@echo off\nzig cc -target x86_64-windows-gnu %%*\n'  > "$PWD/zigcc/zig-cc.cmd"
+          printf '@echo off\nzig c++ -target x86_64-windows-gnu %%*\n' > "$PWD/zigcc/zig-cxx.cmd"
+          echo "CC=$PWD/zigcc/zig-cc.cmd"  >> "$GITHUB_ENV"
+          echo "CXX=$PWD/zigcc/zig-cxx.cmd" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp zig-out/bin/zig-ai.exe dist/
+          cp sdl3-prefix/bin/SDL3.dll dist/
+          cd dist && 7z a ../zig-ai-windows-x86_64.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zig-ai-windows-x86_64
+          path: zig-ai-windows-x86_64.zip
+
+  release:
+    # Attach whatever was built to the tag's release. Runs even if the
+    # (experimental) Windows job failed, as long as mac+linux succeeded.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && needs.build-macos.result == 'success' && needs.build-linux.result == 'success' }}
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
