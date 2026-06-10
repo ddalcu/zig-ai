@@ -114,7 +114,7 @@ jobs:
           # (dbus is what the tray uses on Linux; udev for input hotplug).
           sudo apt-get install -y ninja-build build-essential \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libxss-dev libwayland-dev libxkbcommon-dev \
+            libxfixes-dev libxtst-dev libxss-dev libwayland-dev libxkbcommon-dev \
             libegl1-mesa-dev libgl1-mesa-dev libdrm-dev libgbm-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev \
             libdbus-1-dev libudev-dev libusb-1.0-0-dev
@@ -198,13 +198,13 @@ jobs:
         shell: bash
         # The C++ deps must share an ABI/stdlib with the zig-linked exe
         # (windows-gnu + LLVM libc++), so CMake compiles them with zig cc
-        # rather than MSVC. build.zig's cmake step inherits CC/CXX.
+        # rather than MSVC. CMake parses flags out of the CC/CXX env vars and
+        # zig is on PATH, so no wrapper scripts (whose POSIX-style paths CMake
+        # on Windows can't resolve) are needed. build.zig's cmake step
+        # inherits CC/CXX.
         run: |
-          mkdir -p "$PWD/zigcc"
-          printf '@echo off\nzig cc -target x86_64-windows-gnu %%*\n'  > "$PWD/zigcc/zig-cc.cmd"
-          printf '@echo off\nzig c++ -target x86_64-windows-gnu %%*\n' > "$PWD/zigcc/zig-cxx.cmd"
-          echo "CC=$PWD/zigcc/zig-cc.cmd"  >> "$GITHUB_ENV"
-          echo "CXX=$PWD/zigcc/zig-cxx.cmd" >> "$GITHUB_ENV"
+          echo 'CC=zig cc -target x86_64-windows-gnu'   >> "$GITHUB_ENV"
+          echo 'CXX=zig c++ -target x86_64-windows-gnu' >> "$GITHUB_ENV"
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix
