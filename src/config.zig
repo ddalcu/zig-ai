@@ -34,6 +34,21 @@ pub const default_system_prompt =
     \\
 ;
 
+/// Read the user's home directory from the environment: HOME on POSIX,
+/// USERPROFILE on Windows (WTF-16 → WTF-8). Caller owns the returned slice.
+/// (`Environ.getPosix` doesn't compile for Windows targets, so the branch must
+/// be comptime — if/else, not an early return.)
+pub fn homeDirAlloc(gpa: std.mem.Allocator, environ: std.process.Environ) ?[]u8 {
+    if (builtin.os.tag == .windows) {
+        const key = comptime std.unicode.wtf8ToWtf16LeStringLiteral("USERPROFILE");
+        const w = std.process.Environ.getWindows(environ, key) orelse return null;
+        return std.unicode.wtf16LeToWtf8Alloc(gpa, w) catch null;
+    } else {
+        const h = std.process.Environ.getPosix(environ, "HOME") orelse return null;
+        return gpa.dupe(u8, h) catch null;
+    }
+}
+
 /// Build the per-user config directory path (caller owns it). Mirrors
 /// settings_store: macOS → Application Support, Windows → AppData\Roaming,
 /// else → ~/.config. Null if there's no home to anchor it to.

@@ -366,10 +366,11 @@ const config = @import("config.zig");
 /// runtime from `~/…/zig-ai/mcp.json`, and print the discovered servers + tools.
 /// Spawns the real server subprocesses (needs `npx`), so run it deliberately.
 fn runMcpSmoke(gpa: std.mem.Allocator, environ: std.process.Environ, add_preset: ?[]const u8) !void {
-    const home = std.process.Environ.getPosix(environ, "HOME") orelse {
+    const home = config.homeDirAlloc(gpa, environ) orelse {
         std.debug.print("mcp-smoke: no HOME\n", .{});
         return;
     };
+    defer gpa.free(home);
     config.ensureDefaults(gpa, home);
     if (add_preset) |id| {
         if (mcp.presetById(id)) |p| {
@@ -790,9 +791,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var st = AppState.init(gpa);
     defer st.deinit();
-    if (std.process.Environ.getPosix(init.environ, "HOME")) |h| {
-        st.home = gpa.dupe(u8, h) catch null;
-    }
+    st.home = config.homeDirAlloc(gpa, init.environ);
     // Restore persisted settings (theme, threads, GPU, added model folders), then
     // let an explicit `--dark` override the stored/OS theme for this run.
     settings_store.load(&st);

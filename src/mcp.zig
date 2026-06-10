@@ -780,8 +780,9 @@ const native_os = @import("builtin").os.tag;
 /// gpa-owned text, or null when there is nothing to add (then the inherited
 /// environment is already right).
 fn augmentedPathAlloc(gpa: std.mem.Allocator, io: Io, environ: std.process.Environ, home: []const u8) ?[]u8 {
-    if (native_os == .windows) return null;
-    const base = std.process.Environ.getPosix(environ, "PATH") orelse "";
+    // Comptime if/else (not an early return): `getPosix` doesn't compile for
+    // Windows targets, so the call must be unanalyzed there.
+    const base = if (native_os == .windows) return null else (std.process.Environ.getPosix(environ, "PATH") orelse "");
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
