@@ -128,11 +128,14 @@ fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.Resolve
     if (tts) m.addObjectFile(.{ .cwd_relative = L ++ "libqwen3_tts.a" });
 
     // Shared ggml set (one copy, from llama.cpp). Metal only exists on macOS.
+    // ggml's CMake drops the `lib` archive prefix on Windows (ggml.a), while
+    // the llama/sd/qwen3 targets above keep it — hence the split naming.
+    const gp = if (target.result.os.tag == .windows) "" else "lib";
     if (target.result.os.tag == .macos)
         m.addObjectFile(.{ .cwd_relative = L ++ "libggml-metal.a" });
-    m.addObjectFile(.{ .cwd_relative = L ++ "libggml.a" });
-    m.addObjectFile(.{ .cwd_relative = L ++ "libggml-cpu.a" });
-    m.addObjectFile(.{ .cwd_relative = L ++ "libggml-base.a" });
+    m.addObjectFile(.{ .cwd_relative = b.fmt("{s}{s}ggml.a", .{ L, gp }) });
+    m.addObjectFile(.{ .cwd_relative = b.fmt("{s}{s}ggml-cpu.a", .{ L, gp }) });
+    m.addObjectFile(.{ .cwd_relative = b.fmt("{s}{s}ggml-base.a", .{ L, gp }) });
 
     // One C++ runtime everywhere: the deps are compiled with (Apple)clang /
     // zig cc on every platform — CI sets CC/CXX to `zig cc` on Linux and
