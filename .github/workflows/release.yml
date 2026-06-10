@@ -203,6 +203,10 @@ jobs:
             "https://github.com/libsdl-org/SDL/releases/download/${SDL_REF}/SDL3-devel-${VER}-mingw.zip"
           unzip -q sdl3.zip
           cp -r "SDL3-${VER}/x86_64-w64-mingw32" sdl3-prefix
+          # zig probes SDL3.dll / SDL3.lib / libSDL3.a but not the mingw
+          # import-lib name libSDL3.dll.a — expose it as SDL3.lib (lld links
+          # gnu import libraries fine regardless of extension).
+          cp sdl3-prefix/lib/libSDL3.dll.a sdl3-prefix/lib/SDL3.lib
 
       - name: Set up zig cc as the CMake toolchain
         shell: bash
