@@ -120,7 +120,7 @@ jobs:
             libegl1-mesa-dev libgl1-mesa-dev libdrm-dev libgbm-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev \
             libdbus-1-dev libudev-dev libusb-1.0-0-dev \
-            libvulkan-dev glslc
+            libvulkan-dev glslc glslang-tools
 
       - name: Cache SDL3
         id: cache-sdl3
