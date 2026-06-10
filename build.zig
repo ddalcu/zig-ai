@@ -134,17 +134,17 @@ fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.Resolve
     m.addObjectFile(.{ .cwd_relative = L ++ "libggml-cpu.a" });
     m.addObjectFile(.{ .cwd_relative = L ++ "libggml-base.a" });
 
-    switch (target.result.os.tag) {
-        .macos => {
-            m.link_libcpp = true;
-            const frameworks = [_][]const u8{
-                "Metal", "MetalKit", "Foundation", "CoreFoundation",
-                "Accelerate", "QuartzCore", "MetalPerformanceShaders",
-            };
-            for (frameworks) |f| m.linkFramework(f, .{});
-        },
-        .linux => m.linkSystemLibrary("stdc++", .{}),
-        else => m.link_libcpp = true,
+    // One C++ runtime everywhere: the deps are compiled with (Apple)clang /
+    // zig cc on every platform — CI sets CC/CXX to `zig cc` on Linux and
+    // Windows — so zig's libc++ satisfies them at link. (Linking g++-built
+    // archives would need libstdc++ instead; don't mix.)
+    m.link_libcpp = true;
+    if (target.result.os.tag == .macos) {
+        const frameworks = [_][]const u8{
+            "Metal", "MetalKit", "Foundation", "CoreFoundation",
+            "Accelerate", "QuartzCore", "MetalPerformanceShaders",
+        };
+        for (frameworks) |f| m.linkFramework(f, .{});
     }
 }
 

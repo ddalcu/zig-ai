@@ -52,6 +52,7 @@ jobs:
         run: |
           git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
           git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
+          git -C deps/qwen3-tts.cpp apply ../patches/qwen3-tts.cpp-win-portability.patch
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -102,6 +103,7 @@ jobs:
         run: |
           git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
           git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
+          git -C deps/qwen3-tts.cpp apply ../patches/qwen3-tts.cpp-win-portability.patch
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -138,6 +140,13 @@ jobs:
           cmake --install sdl3-build
 
       - name: Build
+        # The C++ deps compile with zig cc (libc++) so they ABI-match the
+        # zig-linked exe — linking g++/libstdc++ archives with zig's lld
+        # leaves std::__cxx11 symbols undefined. SDL3 above is plain C, so
+        # building it with gcc is fine.
+        env:
+          CC: zig cc
+          CXX: zig c++
         run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix
 
       - name: Package
@@ -175,6 +184,7 @@ jobs:
         run: |
           git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
           git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
+          git -C deps/qwen3-tts.cpp apply ../patches/qwen3-tts.cpp-win-portability.patch
 
       - uses: mlugg/setup-zig@v2
         with:
