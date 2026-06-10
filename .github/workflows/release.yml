@@ -216,6 +216,14 @@ jobs:
           echo 'CC=zig cc -target x86_64-windows-gnu'   >> "$GITHUB_ENV"
           echo 'CXX=zig c++ -target x86_64-windows-gnu' >> "$GITHUB_ENV"
 
+      - name: Build C++ deps
+        shell: bash
+        # Separate step so the archive names CMake actually produced are
+        # visible in the log (Windows naming has differed from lib<x>.a).
+        run: |
+          zig build deps
+          ls -la build-deps/lib
+
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix
 
