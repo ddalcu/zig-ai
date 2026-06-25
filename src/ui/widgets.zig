@@ -219,7 +219,7 @@ pub fn modelPicker(st: *AppState, kind: models.Kind) zigui.View {
             }).spacing(1).alignment(zigui.Alignment.leading),
             zigui.Spacer(),
         }).spacing(8).frameMaxWidth()
-            .paddingInsets(.{ .top = 5, .leading = 6, .bottom = 5, .trailing = 6 })
+            .paddingInsets(.{ .top = 6, .leading = 8, .bottom = 6, .trailing = 8 })
             .cornerRadius(6)
             .hoverFill(hoverTint())
             .onTap(.{ .ctx = pickCtx(st, i), .func = onPickModel });
@@ -231,8 +231,18 @@ pub fn modelPicker(st: *AppState, kind: models.Kind) zigui.View {
             .font(.caption).foreground(th.colors.secondary_label).padding(6)) catch {};
     }
 
-    const content = card(zigui.ScrollViewState(&st.model_picker_scroll, zigui.VStack(rows.items).spacing(2).frameMaxWidth())
-        .frameWidth(300).frameMaxHeight()).frameWidth(320);
+    // The popover already paints a frosted panel (background, border, rounded
+    // corners), so the content just needs padding — no inner `card` (that drew a
+    // second, redundant panel). Let the list set the panel's height so a short
+    // list isn't a tall, mostly-empty box; only once it would grow past
+    // `max_visible` rows do we cap the height and let it scroll.
+    const max_visible = 8;
+    const list = zigui.VStack(rows.items).spacing(2).frameMaxWidth();
+    const body = if (shown > max_visible)
+        zigui.ScrollViewState(&st.model_picker_scroll, list).frameMaxWidth().frameHeight(320)
+    else
+        list;
+    const content = body.padding(6).frameWidth(300);
 
     return trigger.popover(st.model_picker_open.binding(), content);
 }

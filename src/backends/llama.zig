@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const channel = @import("../channel.zig");
+const jinja = @import("../jinja.zig");
 
 pub const c = @cImport({
     @cInclude("llama.h");
@@ -56,6 +57,9 @@ const Request = struct {
     model_path: []u8,
     messages: []ReqMessage,
     params: Params,
+    /// When true, `messages[0].content` is a raw prompt fed verbatim to the
+    /// tokenizer (no chat template) — used by the HTTP `/v1/completions` endpoint.
+    raw: bool = false,
 };
 
 pub const Backend = struct {
@@ -183,6 +187,95 @@ pub const Backend = struct {
         _ = pt.pthread_cond_signal(&self.cond);
     }
 
+    /// Like `submit`, but `prompt` is fed to the tokenizer verbatim (no chat
+    /// template) — for the OpenAI `/v1/completions` endpoint.
+    pub fn submitRaw(self: *Backend, model_path: []const u8, prompt: []const u8, params: Params) !void {
+        const mp = try self.gpa.dupe(u8, model_path);
+        errdefer self.gpa.free(mp);
+        const msgs = try self.gpa.alloc(ReqMessage, 1);
+        errdefer self.gpa.free(msgs);
+        msgs[0] = .{ .role = .user, .content = try self.gpa.dupe(u8, prompt) };
+
+        _ = pt.pthread_mutex_lock(&self.mutex);
+        defer _ = pt.pthread_mutex_unlock(&self.mutex);
+        if (self.request) |old| {
+            self.gpa.free(old.model_path);
+            for (old.messages) |m| self.gpa.free(m.content);
+            self.gpa.free(old.messages);
+        }
+        self.request = .{ .model_path = mp, .messages = msgs, .params = params, .raw = true };
+        self.has_request = true;
+        self.job.beginJob();
+        _ = pt.pthread_cond_signal(&self.cond);
+    }
+
+    pub const EmbedResult = struct { vectors: [][]f32, n_embd: usize };
+
+    /// Compute L2-normalized embeddings for each text. Runs SYNCHRONOUSLY on the
+    /// caller's thread — the HTTP server calls this while holding its request
+    /// lock, so the worker thread is idle and `self.model` access is exclusive.
+    /// Vectors are allocated in `a` (the caller's arena).
+    pub fn embed(self: *Backend, a: std.mem.Allocator, model_path: []const u8, params: Params, texts: []const []const u8) !EmbedResult {
+        if (!self.ensureModel(model_path, params)) {
+            self.drainDiscard();
+            return error.ModelLoadFailed;
+        }
+        const model = self.model.?;
+        const vocab = c.llama_model_get_vocab(model);
+        const n_embd: usize = @intCast(c.llama_model_n_embd(model));
+
+        var cparams = c.llama_context_default_params();
+        cparams.n_ctx = params.n_ctx;
+        cparams.n_threads = params.n_threads;
+        cparams.n_threads_batch = params.n_threads;
+        cparams.embeddings = true;
+        cparams.pooling_type = c.LLAMA_POOLING_TYPE_MEAN; // one vector per input
+        const ctx = c.llama_init_from_model(model, cparams) orelse return error.ContextFailed;
+        defer c.llama_free(ctx);
+        const memory = c.llama_get_memory(ctx);
+        const n_batch: usize = @intCast(c.llama_n_batch(ctx));
+
+        const vectors = try a.alloc([]f32, texts.len);
+        for (texts, 0..) |text, i| {
+            const tokens = try self.tokenize(vocab, text);
+            defer self.gpa.free(tokens);
+            if (tokens.len == 0) return error.EmptyInput;
+            // A pooled-embedding batch must be <= n_batch; truncate over-long
+            // inputs (embed the leading window) rather than abort in llama_decode.
+            const use_len: usize = @min(tokens.len, n_batch);
+            c.llama_memory_clear(memory, true); // fresh sequence per input
+            const batch = c.llama_batch_get_one(@constCast(tokens.ptr), @intCast(use_len));
+            if (c.llama_decode(ctx, batch) != 0) return error.DecodeFailed;
+            const emb = c.llama_get_embeddings_seq(ctx, 0);
+            if (emb == null) return error.NoEmbeddings;
+            const vec = try a.alloc(f32, n_embd);
+            var norm: f32 = 0;
+            for (0..n_embd) |k| {
+                vec[k] = emb[k];
+                norm += emb[k] * emb[k];
+            }
+            if (norm > 0) {
+                const inv = 1.0 / @sqrt(norm);
+                for (vec) |*v| v.* *= inv;
+            }
+            vectors[i] = vec;
+        }
+        return .{ .vectors = vectors, .n_embd = n_embd };
+    }
+
+    /// Drop and free any pending events (used to clear a stray error after a
+    /// failed synchronous op so it doesn't pollute a later request's drain).
+    fn drainDiscard(self: *Backend) void {
+        var tmp: std.ArrayList(Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        self.events.drain(&tmp);
+        for (tmp.items) |ev| switch (ev) {
+            .token => |t| self.gpa.free(t),
+            .err => |e| self.gpa.free(e),
+            .done => {},
+        };
+    }
+
     // --- worker thread ----------------------------------------------------
 
     fn workerMain(self: *Backend) void {
@@ -248,11 +341,18 @@ pub const Backend = struct {
         const model = self.model.?;
         const vocab = c.llama_model_get_vocab(model);
 
-        // Build the templated prompt from the conversation.
-        const prompt = self.buildPrompt(model, req.messages) catch {
-            self.emitErr("failed to format prompt", .{});
-            return;
-        };
+        // Raw mode (/v1/completions): tokenize the prompt verbatim. Otherwise
+        // build the templated prompt from the conversation.
+        const prompt = if (req.raw)
+            (self.gpa.dupe(u8, if (req.messages.len > 0) req.messages[0].content else "") catch {
+                self.emitErr("out of memory", .{});
+                return;
+            })
+        else
+            (self.buildPrompt(model, req.messages) catch {
+                self.emitErr("failed to format prompt", .{});
+                return;
+            });
         defer self.gpa.free(prompt);
 
         // Tokenize (with special tokens, since the template embeds them).
@@ -283,27 +383,59 @@ pub const Backend = struct {
             return;
         };
         defer c.llama_sampler_free(smpl);
+        // Repetition penalty FIRST — without it, models (especially on an
+        // off-distribution prompt) collapse into "x_x_x" loops. last_n=64, 1.1x.
+        c.llama_sampler_chain_add(smpl, c.llama_sampler_init_penalties(64, 1.1, 0.0, 0.0));
         c.llama_sampler_chain_add(smpl, c.llama_sampler_init_top_k(req.params.top_k));
         c.llama_sampler_chain_add(smpl, c.llama_sampler_init_top_p(req.params.top_p, 1));
         c.llama_sampler_chain_add(smpl, c.llama_sampler_init_temp(req.params.temperature));
         c.llama_sampler_chain_add(smpl, c.llama_sampler_init_dist(req.params.seed));
 
         const n_ctx = c.llama_n_ctx(ctx);
+        const n_batch: usize = @intCast(c.llama_n_batch(ctx));
         const gen_start = nowMs();
 
-        // Canonical streaming loop (see llama.cpp simple.cpp): decode the prompt
-        // batch, sample, emit, then feed the new token back via batch_get_one.
-        var batch = c.llama_batch_get_one(@constCast(tokens.ptr), @intCast(tokens.len));
+        // A prompt longer than the context can't fit even after decoding — bail
+        // with a clear message instead of overflowing the KV cache.
+        if (tokens.len >= n_ctx) {
+            self.emitErr("prompt is {d} tokens but the context is only {d}; shorten the conversation or disable agent mode", .{ tokens.len, n_ctx });
+            return;
+        }
+
+        // Decode the prompt in n_batch-sized chunks: llama_decode asserts a single
+        // batch is <= n_batch (default 2048), which long agent/tool prompts exceed.
+        var fed: usize = 0;
+        while (fed < tokens.len) {
+            if (self.job.cancelRequested()) {
+                self.events.push(.{ .done = .{ .tokens = 0, .ms = 0 } });
+                return;
+            }
+            const chunk = @min(n_batch, tokens.len - fed);
+            const pbatch = c.llama_batch_get_one(@constCast(tokens.ptr + fed), @intCast(chunk));
+            if (c.llama_decode(ctx, pbatch) != 0) {
+                self.emitErr("decode failed (prompt)", .{});
+                return;
+            }
+            fed += chunk;
+        }
+
+        // If the chat template opened a reasoning block at the end of the prompt
+        // (e.g. Qwen3 appends `<think>`, gemma a thought channel), the model's
+        // output starts INSIDE that block. Emit the open tag first so the
+        // downstream parser treats the leading output as reasoning, not answer.
+        if (!req.raw) {
+            if (promptOpensThink(prompt)) |open| {
+                if (self.gpa.dupe(u8, open)) |d| self.events.push(.{ .token = d }) else |_| {}
+            }
+        }
+
+        // Streaming loop (see llama.cpp simple.cpp): sample from the last logits,
+        // emit, then feed the new token back via batch_get_one.
         var cur_token: c.llama_token = 0;
         var produced: u64 = 0;
         var n_past: u32 = @intCast(tokens.len);
 
         while (!self.job.cancelRequested()) {
-            const rc = c.llama_decode(ctx, batch);
-            if (rc != 0) {
-                if (produced == 0) self.emitErr("decode failed (rc={d})", .{rc});
-                break;
-            }
             cur_token = c.llama_sampler_sample(smpl, ctx, -1);
             if (c.llama_vocab_is_eog(vocab, cur_token)) break;
 
@@ -317,7 +449,8 @@ pub const Backend = struct {
             n_past += 1;
             if (n_past >= n_ctx) break;
 
-            batch = c.llama_batch_get_one(&cur_token, 1);
+            const tbatch = c.llama_batch_get_one(&cur_token, 1);
+            if (c.llama_decode(ctx, tbatch) != 0) break;
         }
 
         const elapsed: u64 = @intCast(@max(0, nowMs() - gen_start));
@@ -342,7 +475,47 @@ pub const Backend = struct {
     }
 
     fn buildPrompt(self: *Backend, model: ?*const c.llama_model, messages: []const ReqMessage) ![]u8 {
-        // Convert to llama_chat_message[] with null-terminated role/content.
+        const tmpl = c.llama_model_chat_template(model, null); // the GGUF's Jinja, or null
+        if (tmpl != null) {
+            const vocab = c.llama_model_get_vocab(model);
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const merged = mergeSystemIntoUser(arena.allocator(), messages);
+
+            // Primary: render the model's ACTUAL chat_template with our Jinja
+            // engine, so any model (incl. ones llama.cpp's matcher doesn't know,
+            // like gemma-4) gets its correct prompt format.
+            if (try self.renderJinja(tmpl, messages, vocab)) |p| return p;
+            if (merged) |mm| if (try self.renderJinja(tmpl, mm, vocab)) |p| return p;
+
+            // Secondary: llama.cpp's hardcoded template matcher.
+            if (try self.applyTemplate(tmpl, messages)) |p| return p;
+            if (merged) |mm| if (try self.applyTemplate(tmpl, mm)) |p| return p;
+        }
+        return self.fallbackPrompt(messages);
+    }
+
+    /// Render the GGUF's Jinja `tmpl` with `messages`. We supply `eos_token` (used
+    /// by templates to close turns) but leave `bos_token` empty and let the
+    /// tokenizer add BOS (`add_special=true`), avoiding double-BOS. Returns the
+    /// prompt (owned), or null if rendering failed (then the caller falls back).
+    fn renderJinja(self: *Backend, tmpl: [*c]const u8, messages: []const ReqMessage, vocab: ?*const c.llama_vocab) !?[]u8 {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const msgs_json = try buildMessagesJson(a, messages);
+        var eos_buf: [128]u8 = undefined;
+        const eos = tokenText(vocab, c.llama_vocab_eos(vocab), &eos_buf);
+        var extra: std.Io.Writer.Allocating = .init(a);
+        try extra.writer.writeAll("{\"bos_token\":\"\",\"eos_token\":");
+        try jsonStr(&extra.writer, eos);
+        try extra.writer.writeAll("}");
+        return jinja.renderChat(self.gpa, std.mem.span(tmpl), msgs_json, null, extra.written(), true);
+    }
+
+    /// Apply the chat template to `messages`. Returns the rendered prompt (owned),
+    /// or null if the template rejected the message set (n < 0).
+    fn applyTemplate(self: *Backend, tmpl: [*c]const u8, messages: []const ReqMessage) !?[]u8 {
         const chat = try self.gpa.alloc(c.llama_chat_message, messages.len);
         defer self.gpa.free(chat);
         var zbufs = try self.gpa.alloc([]u8, messages.len);
@@ -353,15 +526,8 @@ pub const Backend = struct {
         for (messages, 0..) |m, i| {
             const content_z = try self.gpa.dupeZ(u8, m.content);
             zbufs[i] = content_z;
-            chat[i] = .{
-                .role = roleStr(m.role),
-                .content = content_z.ptr,
-            };
+            chat[i] = .{ .role = roleStr(m.role), .content = content_z.ptr };
         }
-
-        const tmpl = c.llama_model_chat_template(model, null); // may be null
-
-        // Apply template; grow the buffer if needed.
         var cap: i32 = 0;
         for (messages) |m| cap += @intCast(m.content.len + 32);
         var out = try self.gpa.alloc(u8, @intCast(@max(cap, 256)));
@@ -373,11 +539,40 @@ pub const Backend = struct {
             n = c.llama_chat_apply_template(tmpl, chat.ptr, messages.len, true, out.ptr, @intCast(out.len));
         }
         if (n < 0) {
-            // No template available — fall back to a plain concatenation.
             self.gpa.free(out);
-            return self.fallbackPrompt(messages);
+            return null;
         }
         return self.gpa.realloc(out, @intCast(n)) catch out[0..@intCast(n)];
+    }
+
+    /// Build a copy of `messages` with all `system` content folded into the first
+    /// user turn (gemma-style models reject a system role). Returns null if there
+    /// was no system message. Everything is allocated in `a`.
+    fn mergeSystemIntoUser(a: std.mem.Allocator, messages: []const ReqMessage) ?[]ReqMessage {
+        var sys: std.ArrayList(u8) = .empty;
+        var has_sys = false;
+        for (messages) |m| {
+            if (m.role != .system) continue;
+            has_sys = true;
+            if (sys.items.len > 0) sys.appendSlice(a, "\n\n") catch return null;
+            sys.appendSlice(a, m.content) catch return null;
+        }
+        if (!has_sys) return null;
+
+        var out: std.ArrayList(ReqMessage) = .empty;
+        var injected = false;
+        for (messages) |m| {
+            if (m.role == .system) continue;
+            if (!injected and m.role == .user) {
+                const merged = std.fmt.allocPrint(a, "{s}\n\n{s}", .{ sys.items, m.content }) catch return null;
+                out.append(a, .{ .role = .user, .content = merged }) catch return null;
+                injected = true;
+            } else {
+                out.append(a, .{ .role = m.role, .content = m.content }) catch return null;
+            }
+        }
+        if (!injected) out.insert(a, 0, .{ .role = .user, .content = sys.items }) catch return null;
+        return out.items;
     }
 
     fn fallbackPrompt(self: *Backend, messages: []const ReqMessage) ![]u8 {
@@ -417,4 +612,56 @@ fn roleLabel(r: Role) []const u8 {
         .user => "user",
         .assistant => "assistant",
     };
+}
+
+/// Serialize messages to a JSON array `[{"role","content"},…]` for the Jinja engine.
+fn buildMessagesJson(a: std.mem.Allocator, messages: []const ReqMessage) ![]u8 {
+    var b: std.Io.Writer.Allocating = .init(a);
+    const w = &b.writer;
+    try w.writeByte('[');
+    for (messages, 0..) |m, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.print("{{\"role\":\"{s}\",\"content\":", .{roleLabel(m.role)});
+        try jsonStr(w, m.content);
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+    return b.written();
+}
+
+/// Write `s` as a JSON string literal (with quotes), escaping per RFC 8259.
+fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |ch| switch (ch) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => if (ch < 0x20) try w.print("\\u{x:0>4}", .{ch}) else try w.writeByte(ch),
+    };
+    try w.writeByte('"');
+}
+
+/// If `prompt` ends inside an unclosed reasoning block (the template opened one
+/// for the generation turn), return the open tag; else null.
+fn promptOpensThink(prompt: []const u8) ?[]const u8 {
+    const pairs = [_]struct { open: []const u8, close: []const u8 }{
+        .{ .open = "<think>", .close = "</think>" },
+        .{ .open = "<|channel>thought", .close = "<channel|>" },
+    };
+    for (pairs) |p| {
+        const lo = std.mem.lastIndexOf(u8, prompt, p.open) orelse continue;
+        const lc = std.mem.lastIndexOf(u8, prompt, p.close);
+        if (lc == null or lc.? < lo) return p.open;
+    }
+    return null;
+}
+
+/// Render a single token to its text (special tokens included). Empty on failure.
+fn tokenText(vocab: ?*const c.llama_vocab, token: c.llama_token, buf: []u8) []const u8 {
+    if (token < 0) return "";
+    const n = c.llama_token_to_piece(vocab, token, buf.ptr, @intCast(buf.len), 0, true);
+    if (n <= 0) return "";
+    return buf[0..@intCast(n)];
 }

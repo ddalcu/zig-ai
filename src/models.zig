@@ -13,6 +13,34 @@ const c = @cImport({
     @cInclude("sys/stat.h");
 });
 
+const gguf = @cImport({
+    @cInclude("gguf.h");
+});
+
+/// Read a model's training context length from GGUF metadata
+/// (`<arch>.context_length`) without loading tensors. Null if unavailable.
+pub fn readCtxCap(gpa: std.mem.Allocator, path: []const u8) ?u32 {
+    const path_z = gpa.dupeZ(u8, path) catch return null;
+    defer gpa.free(path_z);
+    var params = std.mem.zeroes(gguf.struct_gguf_init_params);
+    params.no_alloc = true;
+    const ctx = gguf.gguf_init_from_file(path_z.ptr, params) orelse return null;
+    defer gguf.gguf_free(ctx);
+    const arch_id = gguf.gguf_find_key(ctx, "general.architecture");
+    if (arch_id < 0) return null;
+    const arch = std.mem.span(gguf.gguf_get_val_str(ctx, arch_id));
+    var key_buf: [128]u8 = undefined;
+    const key = std.fmt.bufPrintZ(&key_buf, "{s}.context_length", .{arch}) catch return null;
+    const kid = gguf.gguf_find_key(ctx, key.ptr);
+    if (kid < 0) return null;
+    return switch (gguf.gguf_get_kv_type(ctx, kid)) {
+        gguf.GGUF_TYPE_UINT32 => gguf.gguf_get_val_u32(ctx, kid),
+        gguf.GGUF_TYPE_UINT64 => @intCast(gguf.gguf_get_val_u64(ctx, kid)),
+        gguf.GGUF_TYPE_INT32 => @intCast(@max(0, gguf.gguf_get_val_i32(ctx, kid))),
+        else => null,
+    };
+}
+
 pub const Kind = enum {
     text,
     image,

@@ -24,10 +24,11 @@ pub fn view(st: *AppState) zigui.View {
         var rows: std.ArrayList(zigui.View) = .empty;
         for (lines) |line| {
             // WrappedText so long lines (paths, error messages) wrap instead of
-            // overflowing the card.
-            rows.append(fa, zigui.WrappedText(line).font(.caption2).foreground(th.colors.secondary_label).frameMaxWidth()) catch {};
+            // overflowing the card. `frameAlign(.leading)` keeps short lines pinned
+            // to the left edge (a max-width frame centers its content by default).
+            rows.append(fa, zigui.WrappedText(line).font(.caption2).foreground(th.colors.secondary_label).frameMaxWidth().frameAlign(.leading)) catch {};
         }
-        body = zigui.ScrollViewState(&st.log_scroll, zigui.VStack(rows.items).spacing(2).frameMaxWidth())
+        body = zigui.ScrollViewState(&st.log_scroll, zigui.VStack(rows.items).spacing(2).alignment(zigui.Alignment.leading).frameMaxWidth())
             .frameMaxWidth().frameMaxHeight();
     }
 

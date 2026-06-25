@@ -21,6 +21,14 @@ pub const HFRepo = struct {
     id: []u8,
     downloads: i64 = 0,
     likes: i64 = 0,
+    /// Last-modified time as a Unix epoch (seconds); 0 means unknown.
+    last_modified: i64 = 0,
+    /// Quant size range in bytes (smallest..largest GGUF in the repo). Only valid
+    /// once `size_loaded` — the search response doesn't carry per-file sizes, so
+    /// these are filled in lazily by background tree fetches (see `repo_size`).
+    size_min: u64 = 0,
+    size_max: u64 = 0,
+    size_loaded: bool = false,
     kind: models.Kind = .text,
 
     /// "author" portion of the id (borrows into `id`).
@@ -34,6 +42,10 @@ pub const HFRepo = struct {
         return self.id[slash + 1 ..];
     }
 };
+
+/// A resolved quant size range for one repo, delivered by background enrichment
+/// after the initial search results. `id` is owned ("author/name").
+pub const RepoSize = struct { id: []u8, min: u64, max: u64 };
 
 /// One top-level file inside a repo. `path` is owned. `is_quant` marks a
 /// standalone, user-selectable model weight (an interchangeable GGUF quant);
@@ -53,6 +65,7 @@ pub const Files = struct {
 
 pub const Event = union(enum) {
     results: []HFRepo, // search complete; UI takes ownership
+    repo_size: RepoSize, // a repo's quant size range resolved; UI takes ownership of `id`
     files: Files, // tree listing complete; UI takes ownership
     file: []u8, // a new file in the set started downloading (owned basename)
     progress, // a download tick (UI reads the byte atomics)
@@ -104,19 +117,64 @@ pub const Backend = struct {
     file_index: std.atomic.Value(u32) = .init(0),
     file_count: std.atomic.Value(u32) = .init(0),
 
+    /// Bumped on every search so a still-running background size-enrichment pass
+    /// (from an earlier search) stops as soon as a newer search starts.
+    search_gen: std.atomic.Value(u64) = .init(0),
+
+    /// Count of worker threads currently touching `net`. `deinit` waits for this
+    /// to reach 0 before tearing down the Io/Client — tearing it down mid-request
+    /// panics in std's cancel path.
+    active_workers: std.atomic.Value(u32) = .init(0),
+    /// Set by `deinit` so long-running workers (enrichment) bail promptly.
+    shutting_down: std.atomic.Value(bool) = .init(false),
+
+    /// Short-lived response cache for cheap JSON GETs (search + file trees), so
+    /// e.g. opening a repo's quant dropdown reuses the tree the size-enrichment
+    /// pass already fetched instead of re-hitting HuggingFace. Keyed by URL,
+    /// 30-minute TTL. Downloads bypass this (they stream with Range headers).
+    http_cache: std.ArrayList(CacheEntry) = .empty,
+    cache_lock: channel.SpinLock = .{},
+
     net: ?*Net = null,
+
+    /// One cached HTTP response. `url` and `body` are owned; `at_ms` is a monotonic
+    /// timestamp (ms) from the `Io` clock.
+    const CacheEntry = struct { url: []u8, body: []u8, at_ms: i64 };
+    const cache_ttl_ms: i64 = 30 * 60 * 1000;
 
     pub fn init(gpa: std.mem.Allocator) Backend {
         return .{ .gpa = gpa, .events = channel.Channel(Event).init(gpa) };
     }
 
     pub fn deinit(self: *Backend) void {
+        // Stop background work and wait for in-flight requests to finish before
+        // tearing down the Io/Client — destroying them mid-request panics inside
+        // std's cancellation path.
+        self.shutting_down.store(true, .release);
+        _ = self.search_gen.fetchAdd(1, .monotonic); // halt the enrichment loop
+        self.job.requestCancel(); // abort an active download
+        while (self.active_workers.load(.acquire) > 0) std.Thread.yield() catch {};
+
+        for (self.http_cache.items) |e| {
+            self.gpa.free(e.url);
+            self.gpa.free(e.body);
+        }
+        self.http_cache.deinit(self.gpa);
         if (self.net) |n| {
             n.client.deinit();
             n.threaded.deinit();
             self.gpa.destroy(n);
         }
         self.events.deinit();
+    }
+
+    /// Mark a worker thread as live (it's about to use `net`); pair with
+    /// `workerExit` via `defer` so `deinit` knows when teardown is safe.
+    fn workerEnter(self: *Backend) void {
+        _ = self.active_workers.fetchAdd(1, .acq_rel);
+    }
+    fn workerExit(self: *Backend) void {
+        _ = self.active_workers.fetchSub(1, .acq_rel);
     }
 
     /// Lazily build the networking context at a stable heap address. Called from
@@ -145,8 +203,10 @@ pub const Backend = struct {
     /// Kick off an async HF search. `query` and `category` (a models.Kind, or
     /// null for "All") are duped; results arrive as a `.results` event.
     pub fn search(self: *Backend, query: []const u8, category: ?models.Kind) void {
+        // A newer search supersedes any in-flight size enrichment from an older one.
+        const gen = self.search_gen.fetchAdd(1, .monotonic) + 1;
         const q = self.gpa.dupe(u8, query) catch return;
-        const th = std.Thread.spawn(.{}, searchWorker, .{ self, q, category }) catch {
+        const th = std.Thread.spawn(.{}, searchWorker, .{ self, q, category, gen }) catch {
             self.gpa.free(q);
             self.emitErr("could not start search thread", .{});
             return;
@@ -154,7 +214,9 @@ pub const Backend = struct {
         th.detach();
     }
 
-    fn searchWorker(self: *Backend, query: []u8, category: ?models.Kind) void {
+    fn searchWorker(self: *Backend, query: []u8, category: ?models.Kind, gen: u64) void {
+        self.workerEnter();
+        defer self.workerExit();
         defer self.gpa.free(query);
         const net = self.ensureNet() orelse {
             self.emitErr("downloader: out of memory", .{});
@@ -163,7 +225,7 @@ pub const Backend = struct {
 
         // Bias the search term toward the category's known model families; the
         // post-filter on classified Kind does the real narrowing.
-        const bias: []const u8 = switch (category orelse return self.runSearch(net, query, null)) {
+        const bias: []const u8 = switch (category orelse return self.runSearch(net, query, null, gen)) {
             .text => "",
             .image => " flux",
             .video => " wan",
@@ -174,16 +236,16 @@ pub const Backend = struct {
             return;
         };
         defer self.gpa.free(term);
-        self.runSearch(net, term, category);
+        self.runSearch(net, term, category, gen);
     }
 
-    fn runSearch(self: *Backend, net: *Net, term: []const u8, category: ?models.Kind) void {
+    fn runSearch(self: *Backend, net: *Net, term: []const u8, category: ?models.Kind, gen: u64) void {
         // Percent-encode the search term into the query string.
         var url_buf: std.ArrayList(u8) = .empty;
         defer url_buf.deinit(self.gpa);
         url_buf.appendSlice(self.gpa, "https://huggingface.co/api/models?filter=gguf&sort=downloads&direction=-1&limit=50&full=true&config=false&search=") catch return;
         percentEncode(self.gpa, &url_buf, term) catch return;
-        url_buf.appendSlice(self.gpa, "&expand[]=downloads&expand[]=likes&expand[]=pipeline_tag") catch return;
+        url_buf.appendSlice(self.gpa, "&expand[]=downloads&expand[]=likes&expand[]=pipeline_tag&expand[]=lastModified") catch return;
 
         const body = self.httpGet(net, url_buf.items, null) catch |e| {
             self.emitErr("HF search failed: {s}", .{@errorName(e)});
@@ -195,7 +257,70 @@ pub const Backend = struct {
             self.emitErr("could not parse HF search response", .{});
             return;
         };
+
+        // Snapshot the repo ids before handing `repos` to the UI (which takes
+        // ownership), so the background size pass has its own copy to work from.
+        const ids = self.dupeIds(repos);
         self.events.push(.{ .results = repos });
+        if (ids) |id_list| self.enrichSizes(net, id_list, gen);
+    }
+
+    /// Duplicate every repo id into a freshly owned slice-of-slices, or null on
+    /// OOM (callers degrade gracefully — sizes simply stay unresolved).
+    fn dupeIds(self: *Backend, repos: []const HFRepo) ?[][]u8 {
+        const ids = self.gpa.alloc([]u8, repos.len) catch return null;
+        var n: usize = 0;
+        for (repos) |r| {
+            ids[n] = self.gpa.dupe(u8, r.id) catch {
+                for (ids[0..n]) |id| self.gpa.free(id);
+                self.gpa.free(ids);
+                return null;
+            };
+            n += 1;
+        }
+        return ids;
+    }
+
+    /// Fetch each repo's file tree in turn and emit its quant size range as a
+    /// `repo_size` event. Bails the moment a newer search bumps `search_gen`.
+    /// Takes ownership of `ids` (frees them).
+    fn enrichSizes(self: *Backend, net: *Net, ids: [][]u8, gen: u64) void {
+        defer {
+            for (ids) |id| self.gpa.free(id);
+            self.gpa.free(ids);
+        }
+        for (ids) |id| {
+            if (self.shutting_down.load(.acquire)) return; // app is quitting
+            if (self.search_gen.load(.monotonic) != gen) return; // superseded
+            const range = self.fetchQuantSizeRange(net, id) orelse continue;
+            const id_dup = self.gpa.dupe(u8, id) catch continue;
+            self.events.push(.{ .repo_size = .{ .id = id_dup, .min = range.min, .max = range.max } });
+        }
+    }
+
+    /// Fetch a repo's tree and return the min/max size of its GGUF quants, or null
+    /// if the fetch fails or the repo has no sized quants.
+    fn fetchQuantSizeRange(self: *Backend, net: *Net, repo_id: []const u8) ?struct { min: u64, max: u64 } {
+        const url = std.fmt.allocPrint(self.gpa, "https://huggingface.co/api/models/{s}/tree/main", .{repo_id}) catch return null;
+        defer self.gpa.free(url);
+        const body = self.httpGet(net, url, null) catch return null;
+        defer self.gpa.free(body);
+        const items = self.parseTree(body) catch return null;
+        defer {
+            for (items) |f| self.gpa.free(f.path);
+            self.gpa.free(items);
+        }
+        var mn: u64 = std.math.maxInt(u64);
+        var mx: u64 = 0;
+        var any = false;
+        for (items) |f| {
+            if (!f.is_quant or f.size == 0) continue;
+            any = true;
+            mn = @min(mn, f.size);
+            mx = @max(mx, f.size);
+        }
+        if (!any) return null;
+        return .{ .min = mn, .max = mx };
     }
 
     const ApiModel = struct {
@@ -203,6 +328,7 @@ pub const Backend = struct {
         modelId: ?[]const u8 = null,
         downloads: ?i64 = null,
         likes: ?i64 = null,
+        lastModified: ?[]const u8 = null,
     };
 
     fn parseSearch(self: *Backend, body: []const u8, category: ?models.Kind) ![]HFRepo {
@@ -226,6 +352,7 @@ pub const Backend = struct {
                 .id = id_dup,
                 .downloads = m.downloads orelse 0,
                 .likes = m.likes orelse 0,
+                .last_modified = if (m.lastModified) |s| parseIso8601(s) orelse 0 else 0,
                 .kind = kind,
             }) catch {
                 self.gpa.free(id_dup);
@@ -250,6 +377,8 @@ pub const Backend = struct {
     }
 
     fn listFilesWorker(self: *Backend, repo_id: []u8) void {
+        self.workerEnter();
+        defer self.workerExit();
         const net = self.ensureNet() orelse {
             self.gpa.free(repo_id);
             self.emitErr("downloader: out of memory", .{});
@@ -373,6 +502,8 @@ pub const Backend = struct {
     }
 
     fn downloadWorker(self: *Backend, models_root: []u8, repo_id: []u8, set: []DlFile, kind: models.Kind, sidecars: []const manifest.Sidecar) void {
+        self.workerEnter();
+        defer self.workerExit();
         defer {
             self.gpa.free(models_root);
             self.gpa.free(repo_id);
@@ -540,6 +671,12 @@ pub const Backend = struct {
     /// One-shot GET capturing the (uncompressed) response body into an owned,
     /// growable buffer. Caller frees the returned slice.
     fn httpGet(self: *Backend, net: *Net, url: []const u8, extra: ?[]const std.http.Header) ![]u8 {
+        // Plain GETs (no custom headers) are cacheable; serve a fresh copy from
+        // the cache when one is still warm.
+        const cacheable = extra == null;
+        if (cacheable) {
+            if (self.cacheGet(net, url)) |hit| return hit;
+        }
         var body: Io.Writer.Allocating = .init(self.gpa);
         defer body.deinit();
         const res = try net.client.fetch(.{
@@ -548,7 +685,54 @@ pub const Backend = struct {
             .extra_headers = extra orelse &.{},
         });
         if (res.status.class() != .success) return error.HttpError;
-        return body.toOwnedSlice();
+        const out = try body.toOwnedSlice();
+        if (cacheable) self.cachePut(net, url, out); // stores its own copy
+        return out;
+    }
+
+    fn nowMs(net: *Net) i64 {
+        return Io.Timestamp.now(net.io(), .awake).toMilliseconds();
+    }
+
+    /// Return an owned copy of a still-warm cached response for `url`, or null.
+    fn cacheGet(self: *Backend, net: *Net, url: []const u8) ?[]u8 {
+        const now = nowMs(net);
+        self.cache_lock.lock();
+        defer self.cache_lock.unlock();
+        for (self.http_cache.items) |e| {
+            if (std.mem.eql(u8, e.url, url)) {
+                if (now - e.at_ms <= cache_ttl_ms) return self.gpa.dupe(u8, e.body) catch null;
+                return null; // stale — a refetch will replace it
+            }
+        }
+        return null;
+    }
+
+    /// Store a copy of `body` for `url` (replacing any prior entry) and drop any
+    /// entries that have aged out, so the cache stays small.
+    fn cachePut(self: *Backend, net: *Net, url: []const u8, body: []const u8) void {
+        const now = nowMs(net);
+        const url_dup = self.gpa.dupe(u8, url) catch return;
+        const body_dup = self.gpa.dupe(u8, body) catch {
+            self.gpa.free(url_dup);
+            return;
+        };
+        self.cache_lock.lock();
+        defer self.cache_lock.unlock();
+        // Evict expired entries first.
+        var i: usize = 0;
+        while (i < self.http_cache.items.len) {
+            const e = self.http_cache.items[i];
+            if (std.mem.eql(u8, e.url, url) or now - e.at_ms > cache_ttl_ms) {
+                self.gpa.free(e.url);
+                self.gpa.free(e.body);
+                _ = self.http_cache.swapRemove(i);
+            } else i += 1;
+        }
+        self.http_cache.append(self.gpa, .{ .url = url_dup, .body = body_dup, .at_ms = now }) catch {
+            self.gpa.free(url_dup);
+            self.gpa.free(body_dup);
+        };
     }
 };
 
@@ -600,6 +784,39 @@ fn firstSegment(id: []const u8) []const u8 {
 fn lastSegment(id: []const u8) []const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, id, '/') orelse return id;
     return id[slash + 1 ..];
+}
+
+/// Parse an ISO-8601 timestamp ("2024-01-15T12:34:56.000Z") into a Unix epoch in
+/// seconds. Returns null if it's too short or malformed. Only the date and
+/// hh:mm:ss are read (sub-seconds and zone suffix are ignored — HF stamps are UTC).
+fn parseIso8601(s: []const u8) ?i64 {
+    if (s.len < 19 or s[4] != '-' or s[7] != '-' or s[13] != ':' or s[16] != ':') return null;
+    const y = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
+    const mo = std.fmt.parseInt(i64, s[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(i64, s[8..10], 10) catch return null;
+    const h = std.fmt.parseInt(i64, s[11..13], 10) catch return null;
+    const mi = std.fmt.parseInt(i64, s[14..16], 10) catch return null;
+    const se = std.fmt.parseInt(i64, s[17..19], 10) catch return null;
+    return daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+}
+
+/// Days since the Unix epoch for a civil (proleptic Gregorian) date. Howard
+/// Hinnant's algorithm; valid for the modern dates HF returns (years > 0).
+fn daysFromCivil(year: i64, m: i64, d: i64) i64 {
+    const y = year - @as(i64, if (m <= 2) 1 else 0);
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400; // [0, 399]
+    const doy = @divFloor(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + d - 1; // [0, 365]
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy; // [0, 146096]
+    return era * 146097 + doe - 719468;
+}
+
+test "parseIso8601: epoch round-trip" {
+    // 2024-01-15T00:00:00Z = 1705276800
+    try std.testing.expectEqual(@as(?i64, 1705276800), parseIso8601("2024-01-15T00:00:00.000Z"));
+    // The Unix epoch itself.
+    try std.testing.expectEqual(@as(?i64, 0), parseIso8601("1970-01-01T00:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601("not-a-date"));
 }
 
 /// Append `s` to `out`, percent-encoding everything outside the RFC 3986

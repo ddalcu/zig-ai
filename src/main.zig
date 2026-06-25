@@ -13,11 +13,22 @@ const AppState = st_mod.AppState;
 const settings_store = @import("settings_store.zig");
 const shell = @import("ui/shell.zig");
 const widgets = @import("ui/widgets.zig");
+const api = @import("server/api.zig");
+const launcher = @import("launcher.zig");
 
 // libc stdio for the headless BMP writer (--screenshot), matching the llm-chat
 // example's dev tooling.
 const cstdio = @cImport({
     @cInclude("stdio.h");
+});
+
+// BSD sockets for discovering the LAN IP shown in the tray (POSIX only; Windows
+// falls back to "localhost"). std.posix dropped raw sockets and std.Io.net has
+// no getsockname, so we go straight to libc.
+const csock = if (builtin.os.tag == .windows) struct {} else @cImport({
+    @cInclude("sys/socket.h");
+    @cInclude("netinet/in.h");
+    @cInclude("unistd.h");
 });
 
 // --- system tray -------------------------------------------------------------
@@ -82,6 +93,46 @@ fn toggleHideClose() void {
     app.setHideOnClose(!app.hideOnClose());
 }
 
+// --- CLI coding-agent launcher (tray) ----------------------------------------
+// A tray click sets the pending CLI and opens a native folder picker; the
+// result is collected in `refreshTray` (main thread) and handed to the launcher.
+var g_pending_cli: ?launcher.Cli = null;
+
+fn startCliLaunch(cli: launcher.Cli) void {
+    g_pending_cli = cli;
+    app.showWindow(); // give the folder dialog a parent + bring the app forward
+    if (!app.openFolderDialog(null)) g_pending_cli = null; // a dialog was already open
+}
+fn launchOpencode() void {
+    startCliLaunch(.opencode);
+}
+fn launchPi() void {
+    startCliLaunch(.pi);
+}
+
+/// Collect a finished folder-pick and launch the pending CLI. Called once per
+/// frame from `refreshTray` (the dialog's completion pushes an event that wakes
+/// the loop, so this runs promptly even when otherwise idle).
+fn pumpCliLauncher(a: *AppState) void {
+    const cli = g_pending_cli orelse return;
+    switch (app.takeFileDialogResult(a.gpa)) {
+        .none => return,
+        .canceled => g_pending_cli = null,
+        .picked => |folder| {
+            defer a.gpa.free(folder);
+            g_pending_cli = null;
+            var url_buf: [64]u8 = undefined;
+            const base = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{api.port}) catch "http://127.0.0.1:8080";
+            const sel = a.selectedModel(a.sel_llm.get());
+            const model = if (sel) |m| m.name else "local";
+            if (launcher.launch(a.gpa, a.environ, a.home, cli, base, model, folder)) |emsg| {
+                defer a.gpa.free(emsg);
+                std.debug.print("launcher: {s} failed: {s}\n", .{ cli.display(), emsg });
+            }
+        },
+    }
+}
+
 /// Keep the event loop awake (~60fps) while any backend is generating, so the
 /// per-frame channel drain runs and the transcript fills in live.
 fn busyCheck() bool {
@@ -98,7 +149,7 @@ fn busyCheck() bool {
     const agent_active = a.agent_busy or a.mcp_mgr.events.len() > 0;
     // Stay awake while the mic is recording so pumpAudio drains the capture
     // stream and the elapsed-time readout ticks.
-    return a.llama.isBusy() or a.sd.isBusy() or a.video.isBusy() or a.tts.isBusy() or
+    return a.chat.isBusy() or a.sd.isBusy() or a.video.isBusy() or a.tts.isBusy() or
         a.downloader.isBusy() or playing_video or copy_feedback or agent_active or
         a.tts_recording;
 }
@@ -108,6 +159,43 @@ fn busyCheck() bool {
 /// here makes the Settings toggle apply without a restart.
 fn themeProvider() zigui.Theme {
     return widgets.active;
+}
+
+/// Model resolver for the HTTP API server: returns the GUI's selected chat model
+/// path (thread-safe). Called from the server thread.
+fn apiResolveModel(ctx: *anyopaque, out: []u8) ?[]const u8 {
+    const st: *AppState = @ptrCast(@alignCast(ctx));
+    return st.apiModelPath(out);
+}
+
+/// Best-effort primary LAN IPv4 — the address the OS would use to reach the
+/// internet — via a connect-less UDP socket (no packets sent). Null if it can't
+/// be determined (e.g. Windows, or no network).
+fn localIp(buf: []u8) ?[]const u8 {
+    if (builtin.os.tag == .windows) return null;
+    const fd = csock.socket(csock.AF_INET, csock.SOCK_DGRAM, 0);
+    if (fd < 0) return null;
+    defer _ = csock.close(fd);
+    var dest = std.mem.zeroes(csock.struct_sockaddr_in);
+    dest.sin_family = @intCast(csock.AF_INET);
+    dest.sin_port = std.mem.nativeToBig(u16, 53);
+    dest.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x08080808); // 8.8.8.8
+    if (csock.connect(fd, @ptrCast(&dest), @sizeOf(csock.struct_sockaddr_in)) != 0) return null;
+    var local = std.mem.zeroes(csock.struct_sockaddr_in);
+    var len: csock.socklen_t = @sizeOf(csock.struct_sockaddr_in);
+    if (csock.getsockname(fd, @ptrCast(&local), &len) != 0) return null;
+    const octets: [4]u8 = @bitCast(local.sin_addr.s_addr);
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ octets[0], octets[1], octets[2], octets[3] }) catch null;
+}
+
+/// Persistent storage for the tray's API-server label (the tray references it).
+var g_api_url_buf: [96]u8 = undefined;
+
+/// The OpenAI-API URL to advertise in the tray, using the LAN IP when available.
+fn apiTrayLabel() [:0]const u8 {
+    var ip_buf: [16]u8 = undefined;
+    const ip = localIp(&ip_buf) orelse "localhost";
+    return std.fmt.bufPrintZ(&g_api_url_buf, "API: http://{s}:{d}/v1", .{ ip, api.port }) catch "API: listening";
 }
 
 fn setupTray(gpa: std.mem.Allocator, st: *AppState) void {
@@ -129,6 +217,9 @@ fn setupTray(gpa: std.mem.Allocator, st: *AppState) void {
     g_e_audio = m.addLabel("Audio: —");
     g_e_ram = m.addLabel("RAM: —");
     m.addSeparator();
+    // OpenAI-compatible HTTP server address (static — bound to 0.0.0.0).
+    _ = m.addLabel(apiTrayLabel());
+    m.addSeparator();
 
     // Actions.
     _ = m.addItem("Open zig-ai", zigui.action(app.showWindow));
@@ -138,6 +229,11 @@ fn setupTray(gpa: std.mem.Allocator, st: *AppState) void {
         _ = go.addItem("Video", zigui.actionCtx(AppState, st, gotoVideo));
         _ = go.addItem("Audio", zigui.actionCtx(AppState, st, gotoAudio));
     }
+    // Launch a CLI coding agent in a chosen folder, pointed at our local server.
+    if (m.addSubmenu("Launch coding agent")) |code| {
+        _ = code.addItem("opencode", zigui.action(launchOpencode));
+        _ = code.addItem("pi", zigui.action(launchPi));
+    }
     g_e_unload = m.addItem("Unload all models", zigui.actionCtx(AppState, st, unloadAllCb));
     g_e_hideclose = m.addCheckItem("Keep running when window closes", app.hideOnClose(), zigui.action(toggleHideClose));
     m.addSeparator();
@@ -146,7 +242,7 @@ fn setupTray(gpa: std.mem.Allocator, st: *AppState) void {
 
 /// Whether any backend currently has a model resident in memory.
 fn anyModelReady(a: *AppState) bool {
-    return a.llama.model_ready.load(.acquire) or a.sd.model_ready.load(.acquire) or
+    return a.chat.status().loaded or a.sd.model_ready.load(.acquire) or
         a.video.model_ready.load(.acquire) or a.tts.model_ready.load(.acquire);
 }
 
@@ -171,7 +267,9 @@ fn rowLabel(buf: []u8, label: []const u8, ready: bool, busy: bool, name: ?[]cons
 fn refreshTray() void {
     const a = g_app orelse return;
 
-    const llm_busy = a.llama.isBusy();
+    pumpCliLauncher(a);
+
+    const llm_busy = a.chat.isBusy();
     const sd_busy = a.sd.isBusy();
     const vid_busy = a.video.isBusy();
     const tts_busy = a.tts.isBusy();
@@ -206,7 +304,7 @@ fn refreshTray() void {
 
     // Per-backend rows.
     var buf: [256]u8 = undefined;
-    if (g_e_chat) |e| e.setLabel(rowLabel(&buf, "Chat", a.llama.model_ready.load(.acquire), llm_busy, a.loaded_llm));
+    if (g_e_chat) |e| e.setLabel(rowLabel(&buf, "Chat", a.chat.status().loaded, llm_busy, a.loaded_llm));
     if (g_e_image) |e| e.setLabel(rowLabel(&buf, "Image", a.sd.model_ready.load(.acquire), sd_busy, a.loaded_sd));
     if (g_e_video) |e| e.setLabel(rowLabel(&buf, "Video", a.video.model_ready.load(.acquire), vid_busy, a.loaded_video));
     if (g_e_audio) |e| e.setLabel(rowLabel(&buf, "Audio", a.tts.model_ready.load(.acquire), tts_busy, a.loaded_tts));
@@ -630,7 +728,10 @@ fn runVideoSmoke(
 // --- entry -------------------------------------------------------------------
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    const gpa = std.heap.page_allocator;
+    // smp_allocator (fast, thread-safe) rather than page_allocator — the latter
+    // does an mmap/munmap syscall per allocation, which is costly for the many
+    // small allocations streaming + the immediate-mode UI make every frame.
+    const gpa = std.heap.smp_allocator;
 
     var screenshot_path: ?[:0]const u8 = null;
     // `--dark` forces dark mode regardless of the persisted/OS preference (handy
@@ -717,7 +818,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (std.mem.eql(u8, s, "video")) start_screen = .video;
                 if (std.mem.eql(u8, s, "audio")) start_screen = .audio;
                 if (std.mem.eql(u8, s, "models")) start_screen = .models;
-                if (std.mem.eql(u8, s, "tasks")) start_screen = .tasks;
                 if (std.mem.eql(u8, s, "logs")) start_screen = .logs;
                 if (std.mem.eql(u8, s, "settings")) start_screen = .settings;
                 if (std.mem.eql(u8, s, "mcp")) start_screen = .mcp;
@@ -803,6 +903,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (start_screen == .editor) st.openEditor(.system_prompt); // seed the buffer
     if (start_screen == .mcp and mock) st.openMcpConfig(1); // demo the config form
     st.rescanModels();
+    st.resolveStartupChatModel(); // re-select the chat model used last session
 
     // Seed the starting theme; for `.system` this queries the OS. shell.body
     // re-resolves this every frame, so it also tracks live OS theme changes.
@@ -838,9 +939,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const kinds = [_]models.Kind{ .tts, .image, .text };
         const dls = [_]i64{ 5322, 163017, 736566 };
         const lks = [_]i64{ 120, 1500, 980 };
-        for (ids, kinds, dls, lks) |id, k, d, l| {
+        const smin = [_]u64{ 325_400_000, 2_400_000_000, 800_000_000 };
+        const smax = [_]u64{ 3_600_000_000, 80_000_000_000, 1_300_000_000 };
+        const mod = [_]i64{ 1_733_000_000, 1_705_276_800, 1_718_000_000 };
+        for (ids, kinds, dls, lks, smin, smax, mod) |id, k, d, l, mn, mx, lm| {
             const idd = gpa.dupe(u8, id) catch continue;
-            st.dl_results.append(gpa, .{ .id = idd, .downloads = d, .likes = l, .kind = k }) catch gpa.free(idd);
+            st.dl_results.append(gpa, .{
+                .id = idd,
+                .downloads = d,
+                .likes = l,
+                .kind = k,
+                .size_min = mn,
+                .size_max = mx,
+                .size_loaded = true,
+                .last_modified = lm,
+            }) catch gpa.free(idd);
         }
         st.dl_filepick_idx = 0;
         const fs = gpa.alloc(st_mod.RepoFile, 3) catch unreachable;
@@ -860,6 +973,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Done only in the interactive path (after the smoke/screenshot early-returns)
     // so headless runs never spawn server subprocesses.
     st.loadConfig(init.environ);
+
+    // Local OpenAI-compatible HTTP server (localhost), serving the selected chat
+    // model over /v1/chat/completions. Lazily loads its own model on first request.
+    var chat_api = api.Server.init(gpa, .{}, .{ .ctx = &st, .func = &apiResolveModel });
+    chat_api.start() catch |e| std.debug.print("api: server failed to start: {s}\n", .{@errorName(e)});
+    defer chat_api.deinit();
+    // The GUI talks to that server over HTTP for chat (single chat engine).
+    st.chat.port = api.port;
+    st.chat.start() catch |e| std.debug.print("chat client failed to start: {s}\n", .{@errorName(e)});
 
     g_app = &st;
     app.setBusyCheck(&busyCheck);

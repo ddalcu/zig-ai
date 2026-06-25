@@ -236,9 +236,12 @@ pub const Backend = struct {
     }
 
     fn ensureCtx(self: *Backend, paths: ModelPaths, params: Params) bool {
-        if (self.loaded) |lp| {
-            if (samePaths(lp, paths) and self.ctx != null) return true;
-        }
+        // NOTE: we deliberately do NOT reuse a cached sd_ctx across generations.
+        // Reusing it crashes on the 2nd generation — stable-diffusion.cpp/ggml hands
+        // the new graph a tensor with a dangling Metal buffer, segfaulting in
+        // ggml_metal_buffer_get_id during the text encoder. Recreating the context
+        // each run (a model reload) is the reliable fix until that upstream reuse
+        // bug is resolved. (`loaded` is still tracked for error messages / status.)
         if (self.ctx) |ctx| {
             c.free_sd_ctx(ctx);
             self.ctx = null;

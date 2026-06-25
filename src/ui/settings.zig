@@ -10,6 +10,23 @@ const st_mod = @import("../state.zig");
 const models = @import("../models.zig");
 const AppState = st_mod.AppState;
 
+/// An f32 slider view over the i64 `chat_n_ctx` state, snapping to 1024-token
+/// steps. (Slider needs an f32 binding; the setting itself stays an integer.)
+fn ctxBinding(st: *AppState) zigui.Binding(f32) {
+    const G = struct {
+        fn get(p: *anyopaque) f32 {
+            const s: *AppState = @ptrCast(@alignCast(p));
+            return @floatFromInt(s.chat_n_ctx.get());
+        }
+        fn set(p: *anyopaque, v: f32) void {
+            const s: *AppState = @ptrCast(@alignCast(p));
+            const snapped: i64 = @as(i64, @intFromFloat(@round(v / 1024.0))) * 1024;
+            s.chat_n_ctx.set(@max(snapped, 1024));
+        }
+    };
+    return .{ .ctx = st, .getFn = G.get, .setFn = G.set };
+}
+
 fn onAddDir(st: *AppState) void {
     const text = st.new_dir.text();
     if (text.len == 0) return;
@@ -90,9 +107,31 @@ pub fn view(st: *AppState) zigui.View {
         w.settingRow("Use GPU (Metal)", zigui.Toggle("", st.use_gpu.binding())),
     }).spacing(10));
 
+    const ctx_cap = st.chatCtxCap();
+    const ctx_cur = @min(@as(u32, @intCast(@max(st.chat_n_ctx.get(), 0))), ctx_cap);
+    const generation = w.card(zigui.VStack(.{
+        w.sectionHeader("Chat generation"),
+        w.settingRow(w.fmt("Temperature: {d:.2}", .{st.chat_temp.get()}), zigui.Slider(st.chat_temp.binding(), 0, 2).frameWidth(180)),
+        w.settingRow(w.fmt("Top-P: {d:.2}", .{st.chat_top_p.get()}), zigui.Slider(st.chat_top_p.binding(), 0, 1).frameWidth(180)),
+        w.settingRow("Top-K", zigui.Stepper(w.fmt("{d}", .{st.chat_top_k.get()}), st.chat_top_k.binding(), 0, 200, 5)),
+        w.settingRow(
+            w.fmt("Context: {d} / {d} tokens", .{ ctx_cur, ctx_cap }),
+            zigui.Slider(ctxBinding(st), 2048, @floatFromInt(@max(ctx_cap, 4096))).frameWidth(180),
+        ),
+        zigui.Text("Applies to new messages, capped at the selected model's trained context. Larger uses more memory.")
+            .font(.caption).foreground(th.colors.tertiary_label).frameMaxWidth(),
+    }).spacing(10));
+
+    // Built-in zigui theme families (macOS, Windows 10, …), in registry order.
+    const family_names = comptime blk: {
+        var names: [zigui.theme_registry.all.len][]const u8 = undefined;
+        for (zigui.theme_registry.all, 0..) |fam, i| names[i] = fam.displayName();
+        break :blk names;
+    };
     const appearance = w.card(zigui.VStack(.{
         w.sectionHeader("Appearance"),
-        w.settingRow("Theme", zigui.Picker(st.theme_pref.binding(), &[_][]const u8{ "System", "Light", "Dark" })),
+        w.settingRow("Mode", zigui.Picker(st.theme_pref.binding(), &[_][]const u8{ "System", "Light", "Dark" })),
+        w.settingRow("Theme", zigui.Picker(st.theme_family.binding(), &family_names)),
     }).spacing(10));
 
     const agent_card = w.card(zigui.VStack(.{
@@ -108,12 +147,15 @@ pub fn view(st: *AppState) zigui.View {
         }).spacing(8).frameMaxWidth(),
     }).spacing(10));
 
+    // Header stays fixed; the cards scroll (the page outgrew the viewport).
     return zigui.VStack(.{
         w.header("Settings", zigui.Spacer()),
-        folders,
-        perf,
-        appearance,
-        agent_card,
-        zigui.Spacer(),
+        zigui.ScrollViewState(&st.settings_scroll, zigui.VStack(.{
+            folders,
+            perf,
+            generation,
+            appearance,
+            agent_card,
+        }).spacing(14).frameMaxWidth()).frameMaxWidth().frameMaxHeight(),
     }).spacing(14).frameMaxWidth().frameMaxHeight();
 }

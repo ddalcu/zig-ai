@@ -31,7 +31,7 @@ env:
   ZIG_VERSION: 0.16.0
   SDL_REF: release-3.4.10
   # zigui release the app builds against (https://github.com/ddalcu/zigui).
-  ZIGUI_REF: v0.2.0
+  ZIGUI_REF: v0.3.0
 
 jobs:
   build-macos:

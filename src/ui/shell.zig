@@ -17,7 +17,6 @@ const video = @import("video.zig");
 const audio = @import("audio.zig");
 const model_browser = @import("model_browser.zig");
 const settings = @import("settings.zig");
-const tasks = @import("tasks.zig");
 const logs = @import("logs.zig");
 const mcp_view = @import("mcp_view.zig");
 const editor = @import("editor.zig");
@@ -46,7 +45,6 @@ const nav_items = [_]NavItem{
     .{ .screen = .audio, .label = "Audio", .icon = .audio_lines },
     .{ .screen = .models, .label = "Models", .icon = .boxes },
     .{ .screen = .mcp, .label = "MCP", .icon = .cpu },
-    .{ .screen = .tasks, .label = "Tasks", .icon = .list },
     .{ .screen = .logs, .label = "Logs", .icon = .scroll_text },
     .{ .screen = .settings, .label = "Settings", .icon = .settings },
 };
@@ -128,7 +126,10 @@ pub fn body(st: *AppState) zigui.View {
     // theme provider reads `w.active` after this body builds — see main's
     // setThemeProvider.
     const pref: st_mod.ThemePref = @enumFromInt(st.theme_pref.get());
-    w.active = if (st_mod.effectiveDark(pref)) zigui.macos.dark else zigui.default_theme;
+    const scheme: zigui.theme.ColorScheme = if (st_mod.effectiveDark(pref)) .dark else .light;
+    const families = zigui.theme_registry.all;
+    const fam_idx: usize = @intCast(std.math.clamp(st.theme_family.get(), 0, @as(i64, families.len - 1)));
+    w.active = zigui.themeForScheme(families[fam_idx], scheme);
     // Persist settings when one of the tracked values changes (cheap no-op
     // otherwise; only writes on an actual edit to theme/threads/GPU/folders).
     settings_store.maybeSave(st);
@@ -141,7 +142,6 @@ pub fn body(st: *AppState) zigui.View {
         .video => video.view(st),
         .audio => audio.view(st),
         .models => model_browser.view(st),
-        .tasks => tasks.view(st),
         .logs => logs.view(st),
         .settings => settings.view(st),
         .mcp => mcp_view.view(st),

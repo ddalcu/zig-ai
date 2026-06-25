@@ -8,10 +8,12 @@ const zigui = @import("zigui");
 const app = @import("zigui_app");
 const models = @import("models.zig");
 const config = @import("config.zig");
+const codecs = @import("codecs/codecs.zig");
+const channel = @import("channel.zig");
 const mcp = @import("mcp.zig");
 const agent = @import("agent.zig");
 const manifest = @import("manifest.zig");
-const llama = @import("backends/llama.zig");
+const chat_client = @import("backends/chat_client.zig");
 const sd = @import("backends/sd.zig");
 const tts = @import("backends/tts.zig");
 const video = @import("backends/video.zig");
@@ -21,7 +23,18 @@ const audioplay = @import("audio.zig");
 pub const HFRepo = downloader.HFRepo;
 pub const RepoFile = downloader.RepoFile;
 
-pub const Role = llama.Role;
+pub const Role = enum {
+    system,
+    user,
+    assistant,
+    tool,
+    pub fn str(self: Role) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// A tool call captured from the server's structured `tool_calls` (owned).
+pub const MsgToolCall = struct { name: []u8, args: []u8 };
 
 /// User theme choice. The integer values are the `Picker` indices in Settings
 /// (System / Light / Dark), so the enum doubles as the `theme_pref` State value.
@@ -42,13 +55,19 @@ pub fn effectiveDark(pref: ThemePref) bool {
 pub const ChatMessage = struct {
     role: Role,
     content: std.ArrayList(u8) = .empty,
+    /// Chain-of-thought, supplied separately by the server (`reasoning_content`).
+    reasoning: std.ArrayList(u8) = .empty,
+    /// The tool call this assistant turn made (from the server's `tool_calls`),
+    /// or null. For a `.tool` message, `content` holds the result.
+    tool_call: ?MsgToolCall = null,
     streaming: bool = false,
     tokens: u64 = 0,
     tps: f32 = 0,
-    /// Reasoning (`<think>…</think>`) disclosure state for assistant messages.
-    /// null = use the default (expanded while still thinking, collapsed once the
-    /// answer arrives); set explicitly once the user taps the header.
+    /// Reasoning disclosure state. null = default (expanded while thinking,
+    /// collapsed once the answer arrives); set explicitly once the user taps it.
     think_expanded: ?bool = null,
+    /// Tool-result disclosure state (collapsed by default).
+    tool_expanded: bool = false,
     gpa: std.mem.Allocator,
 
     pub fn create(gpa: std.mem.Allocator, role: Role) !*ChatMessage {
@@ -58,13 +77,69 @@ pub const ChatMessage = struct {
     }
     pub fn destroy(self: *ChatMessage) void {
         self.content.deinit(self.gpa);
+        self.reasoning.deinit(self.gpa);
+        if (self.tool_call) |tc| {
+            self.gpa.free(tc.name);
+            self.gpa.free(tc.args);
+        }
         self.gpa.destroy(self);
     }
     pub fn setText(self: *ChatMessage, s: []const u8) !void {
         self.content.clearRetainingCapacity();
         try self.content.appendSlice(self.gpa, s);
     }
+    pub fn setToolCall(self: *ChatMessage, name: []const u8, args: []const u8) void {
+        const nd = self.gpa.dupe(u8, name) catch return;
+        const ad = self.gpa.dupe(u8, args) catch {
+            self.gpa.free(nd);
+            return;
+        };
+        if (self.tool_call) |tc| {
+            self.gpa.free(tc.name);
+            self.gpa.free(tc.args);
+        }
+        self.tool_call = .{ .name = nd, .args = ad };
+    }
 };
+
+/// Write `s` as a JSON string literal (with quotes), escaping per RFC 8259.
+fn jsonStr(w: *std.Io.Writer, s: []const u8) void {
+    w.writeByte('"') catch return;
+    for (s) |ch| switch (ch) {
+        '"' => w.writeAll("\\\"") catch return,
+        '\\' => w.writeAll("\\\\") catch return,
+        '\n' => w.writeAll("\\n") catch return,
+        '\r' => w.writeAll("\\r") catch return,
+        '\t' => w.writeAll("\\t") catch return,
+        else => if (ch < 0x20) (w.print("\\u{x:0>4}", .{ch}) catch return) else (w.writeByte(ch) catch return),
+    };
+    w.writeByte('"') catch return;
+}
+
+/// Serialize one ChatMessage as an OpenAI message object (role/content, plus
+/// `tool_calls` for an assistant call or `tool_call_id` for a tool result).
+fn writeMsgObj(w: *std.Io.Writer, first: *bool, m: *ChatMessage) void {
+    if (!first.*) w.writeAll(",") catch return;
+    first.* = false;
+    w.writeAll("{\"role\":") catch return;
+    jsonStr(w, m.role.str());
+    if (m.role == .tool) {
+        w.writeAll(",\"tool_call_id\":\"call_0\",\"content\":") catch return;
+        jsonStr(w, m.content.items);
+    } else if (m.tool_call) |tc| {
+        w.writeAll(",\"content\":") catch return;
+        jsonStr(w, m.content.items);
+        w.writeAll(",\"tool_calls\":[{\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":") catch return;
+        jsonStr(w, tc.name);
+        w.writeAll(",\"arguments\":") catch return;
+        jsonStr(w, tc.args); // args is raw JSON; emit as a JSON string per OpenAI
+        w.writeAll("}}]") catch return;
+    } else {
+        w.writeAll(",\"content\":") catch return;
+        jsonStr(w, m.content.items);
+    }
+    w.writeAll("}") catch return;
+}
 
 /// Sidebar screens. The integer values back a `State(i64)` so the sidebar's
 /// selection and the detail switch share one binding.
@@ -74,11 +149,10 @@ pub const Screen = enum(i64) {
     video = 2,
     audio = 3,
     models = 4,
-    tasks = 5,
-    logs = 6,
-    settings = 7,
-    mcp = 8,
-    editor = 9,
+    logs = 5,
+    settings = 6,
+    mcp = 7,
+    editor = 8,
 };
 
 /// Which config file the in-app text editor is currently editing.
@@ -138,12 +212,23 @@ pub const AppState = struct {
     /// User home directory (owned), resolved from the process environment in
     /// `main`; used to locate default model folders. Null if unavailable.
     home: ?[]u8 = null,
+    /// The process environment, captured in `loadConfig`; read by the CLI
+    /// launcher for PATH / TMPDIR etc. (`std.process.Environ`).
+    environ: std.process.Environ = undefined,
 
     // --- navigation -------------------------------------------------------
     screen: zigui.State(i64),
 
     // --- discovered models ------------------------------------------------
     model_list: models.ModelList,
+    /// Guards `model_list` rebuilds vs cross-thread reads (the HTTP API server).
+    model_list_lock: channel.SpinLock = .{},
+    /// Selected chat model's training context cap (read from GGUF, cached by path).
+    chat_ctx_cap: u32 = 32768,
+    chat_ctx_cap_path: ?[]u8 = null,
+    /// The chat model path persisted from a previous run, resolved to `sel_llm`
+    /// after the first model scan (see `resolveStartupChatModel`).
+    startup_chat_model: ?[]u8 = null,
     /// Extra user-added scan directories (owned strings).
     model_dirs: std.ArrayList([]u8) = .empty,
     /// Selected model index into `model_list.items` (-1 = none) per task.
@@ -176,7 +261,8 @@ pub const AppState = struct {
     /// The assistant message currently being streamed (borrowed; lives in
     /// `messages`), or null when idle.
     pending: ?*ChatMessage = null,
-    llama: llama.Backend,
+    /// Chat goes through the in-process HTTP server (the single chat engine).
+    chat: chat_client.Backend,
     /// Transient "Copied" feedback: identity (text address) of the copy button
     /// last tapped, and the SDL-tick ms until which to show the confirmation.
     copied_key: usize = 0,
@@ -186,6 +272,10 @@ pub const AppState = struct {
     /// When on, chat turns run the agentic tool loop (MCP tools advertised in
     /// the system prompt; `<tool_call>` blocks executed and fed back).
     agent_mode: zigui.State(bool),
+    /// Whether the chat header's "Agent + MCP" capabilities popover is open.
+    agent_tools_open: zigui.State(bool),
+    /// Scroll offset for that popover's tool list.
+    agent_tools_scroll: zigui.ScrollState = .{},
     /// The user-editable system prompt (owned). Loaded from `system-prompt.md`
     /// at startup; falls back to the built-in default.
     system_prompt: []u8 = &.{},
@@ -263,8 +353,16 @@ pub const AppState = struct {
     // --- settings ---------------------------------------------------------
     threads: zigui.State(i64),
     use_gpu: zigui.State(bool),
+    // Chat sampling / context settings (applied to each new generation).
+    chat_temp: zigui.State(f32),
+    chat_top_p: zigui.State(f32),
+    chat_top_k: zigui.State(i64),
+    chat_n_ctx: zigui.State(i64),
     /// Theme preference; `.system` follows the OS light/dark setting live.
     theme_pref: zigui.State(i64),
+    /// Visual theme family — an index into `zigui.theme_registry.all`
+    /// (macOS, Windows 10, …). The light/dark palette is chosen from `theme_pref`.
+    theme_family: zigui.State(i64),
     new_dir: zigui.TextFieldState,
 
     // --- models -----------------------------------------------------------
@@ -286,6 +384,9 @@ pub const AppState = struct {
     /// Files of the repo whose quant popover was last opened (owned), or null.
     dl_files: ?downloader.Files = null,
     dl_scroll: zigui.ScrollState = .{},
+    /// Which column the results table is sorted by (index = -1 keeps the HF API's
+    /// own download-ranked order until the user clicks a header).
+    dl_sort: zigui.State(zigui.SortColumn),
     /// The result row whose quant popover is active (-1 = none).
     dl_filepick_idx: i64 = -1,
     dl_filepick_open: zigui.State(bool),
@@ -297,6 +398,7 @@ pub const AppState = struct {
     // --- logs -------------------------------------------------------------
     logs: LogRing,
     log_scroll: zigui.ScrollState = .{},
+    settings_scroll: zigui.ScrollState = .{},
 
     // --- overlays ---------------------------------------------------------
     show_settings: zigui.State(bool),
@@ -328,8 +430,9 @@ pub const AppState = struct {
             .sel_video = zigui.State(i64).init(gpa, -1),
             .sel_tts = zigui.State(i64).init(gpa, -1),
             .chat_input = zigui.TextFieldState.init(gpa),
-            .llama = llama.Backend.init(gpa),
+            .chat = chat_client.Backend.init(gpa),
             .agent_mode = zigui.State(bool).init(gpa, false),
+            .agent_tools_open = zigui.State(bool).init(gpa, false),
             .mcp_mgr = mcp.Manager.init(gpa),
             .editor_buf = zigui.TextFieldState.init(gpa),
             .mcp_cfg_fields = .{
@@ -354,13 +457,19 @@ pub const AppState = struct {
             .tts_temperature = zigui.State(f32).init(gpa, 0.9),
             .threads = zigui.State(i64).init(gpa, 4),
             .use_gpu = zigui.State(bool).init(gpa, true),
+            .chat_temp = zigui.State(f32).init(gpa, 0.7),
+            .chat_top_p = zigui.State(f32).init(gpa, 0.95),
+            .chat_top_k = zigui.State(i64).init(gpa, 40),
+            .chat_n_ctx = zigui.State(i64).init(gpa, 16384),
             .theme_pref = zigui.State(i64).init(gpa, @intFromEnum(ThemePref.system)),
+            .theme_family = zigui.State(i64).init(gpa, 0), // 0 = macOS (theme_registry.all[0])
             .new_dir = zigui.TextFieldState.init(gpa),
             .models_tab = zigui.State(i64).init(gpa, 0),
             .model_picker_open = zigui.State(bool).init(gpa, false),
             .downloader = downloader.Backend.init(gpa),
             .dl_search = zigui.TextFieldState.init(gpa),
             .dl_category = zigui.State(i64).init(gpa, 0),
+            .dl_sort = zigui.State(zigui.SortColumn).init(gpa, .{}),
             .dl_filepick_open = zigui.State(bool).init(gpa, false),
             .logs = LogRing.init(gpa),
             .show_settings = zigui.State(bool).init(gpa, false),
@@ -373,16 +482,19 @@ pub const AppState = struct {
         if (self.home) |h| self.gpa.free(h);
         self.screen.deinit();
         self.model_list.deinit();
+        if (self.chat_ctx_cap_path) |p| self.gpa.free(p);
+        if (self.startup_chat_model) |p| self.gpa.free(p);
         for (self.model_dirs.items) |d| self.gpa.free(d);
         self.model_dirs.deinit(self.gpa);
         self.sel_llm.deinit();
         self.sel_sd.deinit();
         self.sel_video.deinit();
         self.sel_tts.deinit();
-        self.llama.deinit();
+        self.chat.deinit();
         self.sd.deinit();
         self.tts.deinit();
         self.agent_mode.deinit();
+        self.agent_tools_open.deinit();
         self.mcp_mgr.deinit();
         self.editor_buf.deinit();
         for (&self.mcp_cfg_fields) |*f| f.deinit();
@@ -414,13 +526,19 @@ pub const AppState = struct {
         self.tts_temperature.deinit();
         self.threads.deinit();
         self.use_gpu.deinit();
+        self.chat_temp.deinit();
+        self.chat_top_p.deinit();
+        self.chat_top_k.deinit();
+        self.chat_n_ctx.deinit();
         self.theme_pref.deinit();
+        self.theme_family.deinit();
         self.new_dir.deinit();
         self.models_tab.deinit();
         self.model_picker_open.deinit();
         self.downloader.deinit();
         self.dl_search.deinit();
         self.dl_category.deinit();
+        self.dl_sort.deinit();
         self.dl_filepick_open.deinit();
         self.clearDlResults();
         self.dl_results.deinit(self.gpa);
@@ -435,10 +553,25 @@ pub const AppState = struct {
         self.frame_arena.deinit();
     }
 
-    /// Rescan all model directories into `model_list`.
+    /// Rescan all model directories into `model_list`. Guarded so the HTTP API
+    /// server (another thread) can safely read the selected model's path.
     pub fn rescanModels(self: *AppState) void {
+        self.model_list_lock.lock();
+        defer self.model_list_lock.unlock();
         self.model_list.clear();
         models.scanDefaults(&self.model_list, self.home, self.model_dirs.items);
+    }
+
+    /// Copy the currently-selected chat model's path into `out` (thread-safe; for
+    /// the HTTP API server). Returns the slice, or null if no chat model is
+    /// selected. Reads under `model_list_lock` so it can't race `rescanModels`.
+    pub fn apiModelPath(self: *AppState, out: []u8) ?[]const u8 {
+        self.model_list_lock.lock();
+        defer self.model_list_lock.unlock();
+        const m = self.selectedModel(self.sel_llm.get()) orelse return null;
+        const n = @min(m.path.len, out.len);
+        @memcpy(out[0..n], m.path[0..n]);
+        return out[0..n];
     }
 
     /// Selected model of a given kind, or null. `sel` holds an index into
@@ -450,9 +583,36 @@ pub const AppState = struct {
         return self.model_list.items.items[idx];
     }
 
+    /// Training context cap of the selected chat model, read from its GGUF and
+    /// cached by path (re-read when the selection changes). Falls back to 32768.
+    pub fn chatCtxCap(self: *AppState) u32 {
+        const m = self.selectedModel(self.sel_llm.get()) orelse return 32768;
+        const stale = self.chat_ctx_cap_path == null or !std.mem.eql(u8, self.chat_ctx_cap_path.?, m.path);
+        if (stale) {
+            if (self.chat_ctx_cap_path) |p| self.gpa.free(p);
+            self.chat_ctx_cap_path = self.gpa.dupe(u8, m.path) catch null;
+            self.chat_ctx_cap = models.readCtxCap(self.gpa, m.path) orelse 32768;
+        }
+        return self.chat_ctx_cap;
+    }
+
+    /// After the first scan, select the chat model used in the previous session
+    /// (matched by path) so it's ready without re-picking.
+    pub fn resolveStartupChatModel(self: *AppState) void {
+        const want = self.startup_chat_model orelse return;
+        for (self.model_list.items.items, 0..) |m, i| {
+            if (m.kind == .text and std.mem.eql(u8, m.path, want)) {
+                self.sel_llm.set(@intCast(i));
+                break;
+            }
+        }
+        self.gpa.free(want);
+        self.startup_chat_model = null;
+    }
+
     /// Start a fresh conversation (after any in-flight generation is cancelled).
     pub fn newChat(self: *AppState) void {
-        self.llama.cancel();
+        self.chat.cancel();
         for (self.messages.items) |m| m.destroy();
         self.messages.clearRetainingCapacity();
         self.pending = null;
@@ -480,6 +640,9 @@ pub const AppState = struct {
         };
         self.chat_input.setText("") catch {};
         self.agent_iters = 0;
+        // Jump to the bottom so the new message + the thinking indicator are
+        // visible (clamped to the real max on the next render).
+        self.chat_scroll.offset = 1_000_000;
         self.startGeneration();
     }
 
@@ -499,35 +662,65 @@ pub const AppState = struct {
         self.pending = am;
 
         const fa = self.frame_arena.allocator();
-        const sys = agent.buildSystemPrompt(fa, self.system_prompt, &self.mcp_mgr, self.agent_mode.get());
-
-        // System message (if any) + every message except the empty placeholder.
-        const n = self.messages.items.len - 1;
-        const has_sys = sys.len > 0;
-        const total = n + @as(usize, if (has_sys) 1 else 0);
-        const reqs = self.gpa.alloc(llama.ReqMessage, total) catch return;
-        defer self.gpa.free(reqs);
-        var k: usize = 0;
-        if (has_sys) {
-            reqs[k] = .{ .role = .system, .content = @constCast(sys) };
-            k += 1;
-        }
-        for (self.messages.items[0..n]) |m| {
-            reqs[k] = .{ .role = m.role, .content = m.content.items };
-            k += 1;
-        }
-
-        const params = llama.Params{
-            .temperature = 0.7,
-            .n_threads = @intCast(self.threads.get()),
-            .use_gpu = self.use_gpu.get(),
+        const body = self.buildChatRequest(fa, model) orelse {
+            am.streaming = false;
+            self.pending = null;
+            return;
         };
         self.rememberLoaded(&self.loaded_llm, &self.loaded_size_llm, model);
-        self.llama.start() catch {};
-        self.llama.submit(model.path, reqs, params) catch {
+        self.chat.start() catch {};
+        self.chat.submit(body) catch {
             am.streaming = false;
             self.pending = null;
         };
+    }
+
+    /// Build the OpenAI `/v1/chat/completions` request body for the current
+    /// conversation. The raw system prompt is sent as-is; agent-mode tools are
+    /// sent as `tools[]` so the SERVER injects the tool prompt (single engine).
+    fn buildChatRequest(self: *AppState, fa: std.mem.Allocator, model: models.ModelInfo) ?[]const u8 {
+        var b: std.Io.Writer.Allocating = .init(fa);
+        const w = &b.writer;
+        w.writeAll("{\"model\":") catch return null;
+        jsonStr(w, model.name);
+        w.writeAll(",\"stream\":true,\"messages\":[") catch return null;
+        var first = true;
+        if (self.system_prompt.len > 0) {
+            w.writeAll("{\"role\":\"system\",\"content\":") catch {};
+            jsonStr(w, self.system_prompt);
+            w.writeAll("}") catch {};
+            first = false;
+        }
+        const n = self.messages.items.len - 1; // exclude the empty assistant placeholder
+        for (self.messages.items[0..n]) |m| writeMsgObj(w, &first, m);
+        w.writeAll("]") catch {};
+
+        if (self.agent_mode.get()) {
+            const tools = self.mcp_mgr.toolListAlloc(fa);
+            if (tools.len > 0) {
+                w.writeAll(",\"tools\":[") catch {};
+                for (tools, 0..) |t, i| {
+                    if (i > 0) w.writeAll(",") catch {};
+                    w.writeAll("{\"type\":\"function\",\"function\":{\"name\":") catch {};
+                    jsonStr(w, t.qualified);
+                    if (t.description.len > 0) {
+                        w.writeAll(",\"description\":") catch {};
+                        jsonStr(w, t.description);
+                    }
+                    w.writeAll(",\"parameters\":") catch {};
+                    if (t.schema.len > 0 and !std.mem.eql(u8, t.schema, "{}")) w.writeAll(t.schema) catch {} else w.writeAll("{\"type\":\"object\"}") catch {};
+                    w.writeAll("}}") catch {};
+                }
+                w.writeAll("]") catch {};
+            }
+        }
+        // Cap the context at the model's trained limit (n_ctx beyond it is wasted
+        // memory and can degrade quality).
+        const n_ctx = @min(@as(u32, @intCast(@max(self.chat_n_ctx.get(), 0))), self.chatCtxCap());
+        w.print(",\"temperature\":{d},\"top_p\":{d},\"top_k\":{d},\"n_ctx\":{d},\"n_threads\":{d}}}", .{
+            self.chat_temp.get(), self.chat_top_p.get(), self.chat_top_k.get(), n_ctx, self.threads.get(),
+        }) catch return null;
+        return b.written();
     }
 
     /// Kick off image generation from the current prompt + controls.
@@ -597,12 +790,57 @@ pub const AppState = struct {
                 if (self.img_result) |old| self.gpa.free(@constCast(old.pixels));
                 self.img_result = img;
                 self.logf("image: generated {d}x{d}", .{ img.width, img.height });
+                // Auto-save to the outputs folder so it survives + can be opened.
+                if (self.home) |home| {
+                    if (config.outputsPathAlloc(self.gpa, home, "image", "png")) |p| {
+                        defer self.gpa.free(p);
+                        if (self.gpa.dupeZ(u8, p)) |pz| {
+                            defer self.gpa.free(pz);
+                            if (codecs.writePng(pz, img.pixels, img.width, img.height))
+                                self.logf("image: saved {s}", .{p})
+                            else
+                                self.logf("image: save failed", .{});
+                        } else |_| {}
+                    }
+                }
             },
             .err => |e| {
                 self.alert(e);
                 self.gpa.free(e);
             },
         };
+    }
+
+    /// Reveal the outputs folder (where generations are auto-saved) in the OS file
+    /// manager. Creates it first so opening never fails on a missing dir.
+    pub fn openOutputsFolder(self: *AppState) void {
+        const home = self.home orelse return;
+        const dir = config.outputsDirAlloc(self.gpa, home) orelse return;
+        defer self.gpa.free(dir);
+        config.ensureDir(self.gpa, dir);
+        const url = config.fileUrlAlloc(self.gpa, dir) orelse return;
+        defer self.gpa.free(url);
+        _ = app.openUrl(url.ptr);
+    }
+
+    /// Encode the just-generated frames to an MP4 in the outputs folder (H.264 via
+    /// the vendored minih264/minimp4 — no ffmpeg). Runs on the UI thread; fast for
+    /// the short clips we generate.
+    fn saveVideoMp4(self: *AppState, frames: []const zigui.canvas.Image, fps: i32) void {
+        if (frames.len == 0) return;
+        const home = self.home orelse return;
+        const ptrs = self.gpa.alloc([*]const u8, frames.len) catch return;
+        defer self.gpa.free(ptrs);
+        for (frames, 0..) |fr, i| ptrs[i] = fr.pixels.ptr;
+        const path = config.outputsPathAlloc(self.gpa, home, "video", "mp4") orelse return;
+        defer self.gpa.free(path);
+        const pz = self.gpa.dupeZ(u8, path) catch return;
+        defer self.gpa.free(pz);
+        const f: u32 = if (fps > 0) @intCast(fps) else 8;
+        if (codecs.encodeMp4(pz, ptrs, frames[0].width, frames[0].height, f))
+            self.logf("video: saved {s}", .{path})
+        else
+            self.logf("video: save failed", .{});
     }
 
     fn freeVideoResult(self: *AppState) void {
@@ -694,6 +932,7 @@ pub const AppState = struct {
                 self.vid_result = f.images;
                 self.vid_fps = f.fps;
                 self.logf("video: generated {d} frames", .{f.images.len});
+                self.saveVideoMp4(f.images, f.fps);
             },
             .err => |e| {
                 self.alert(e);
@@ -961,18 +1200,17 @@ pub const AppState = struct {
     /// workers down (the next generation reloads on demand). A backend that is
     /// mid-generation is left alone (its `unload` is a no-op while busy).
     pub fn unloadAll(self: *AppState) void {
-        self.llama.unload();
+        // Chat runs in the server now; it owns the chat model's lifetime, so the
+        // GUI can only unload the in-process image/video/audio backends.
         self.sd.unload();
         self.tts.unload();
         self.video.unload();
         // Drop the remembered name/size for any backend that actually unloaded
         // (a busy one keeps its model, so leave its row intact).
-        if (!self.llama.model_ready.load(.acquire)) self.clearLoaded(&self.loaded_llm, &self.loaded_size_llm);
         if (!self.sd.model_ready.load(.acquire)) self.clearLoaded(&self.loaded_sd, &self.loaded_size_sd);
         if (!self.tts.model_ready.load(.acquire)) self.clearLoaded(&self.loaded_tts, &self.loaded_size_tts);
         if (!self.video.model_ready.load(.acquire)) self.clearLoaded(&self.loaded_video, &self.loaded_size_video);
-        self.llm_loaded = self.llama.model_ready.load(.acquire);
-        self.logf("models: unloaded (freed resident memory)", .{});
+        self.logf("models: unloaded image/video/audio (freed resident memory)", .{});
     }
 
     fn clearLoaded(self: *AppState, slot: *?[]u8, size: *u64) void {
@@ -986,7 +1224,8 @@ pub const AppState = struct {
     /// cache and compute buffers), shown in the tray.
     pub fn loadedBytes(self: *AppState) u64 {
         var total: u64 = 0;
-        if (self.llama.model_ready.load(.acquire)) total += self.loaded_size_llm;
+        const cs = self.chat.status(); // server-reported chat model bytes
+        if (cs.loaded) total += cs.bytes;
         if (self.sd.model_ready.load(.acquire)) total += self.loaded_size_sd;
         if (self.tts.model_ready.load(.acquire)) total += self.loaded_size_tts;
         if (self.video.model_ready.load(.acquire)) total += self.loaded_size_video;
@@ -1106,6 +1345,19 @@ pub const AppState = struct {
                 self.dl_results.appendSlice(self.gpa, repos) catch {};
                 self.gpa.free(repos); // ids now owned by dl_results
             },
+            .repo_size => |rs| {
+                // Match by id (the table may have re-sorted since the search), so a
+                // stale event from a superseded search simply finds nothing.
+                for (self.dl_results.items) |*r| {
+                    if (std.mem.eql(u8, r.id, rs.id)) {
+                        r.size_min = rs.min;
+                        r.size_max = rs.max;
+                        r.size_loaded = true;
+                        break;
+                    }
+                }
+                self.gpa.free(rs.id);
+            },
             .files => |f| {
                 // Keep only if it matches the row whose popover is open.
                 self.clearDlFiles();
@@ -1166,27 +1418,38 @@ pub const AppState = struct {
 
     /// Drain llama events into the conversation. Call once per frame.
     pub fn pumpChat(self: *AppState) void {
-        self.llm_loaded = self.llama.model_ready.load(.acquire);
+        self.llm_loaded = self.chat.status().loaded;
 
-        var tmp: std.ArrayList(llama.Event) = .empty;
+        var tmp: std.ArrayList(chat_client.Event) = .empty;
         defer tmp.deinit(self.gpa);
-        self.llama.events.drain(&tmp);
+        self.chat.events.drain(&tmp);
         for (tmp.items) |ev| switch (ev) {
-            .token => |s| {
+            .content => |s| {
                 if (self.pending) |p| p.content.appendSlice(self.gpa, s) catch {};
                 if (self.chat_scroll.atBottom()) self.chat_scroll.offset = 1_000_000;
                 self.gpa.free(s);
             },
+            .reasoning => |s| {
+                if (self.pending) |p| p.reasoning.appendSlice(self.gpa, s) catch {};
+                if (self.chat_scroll.atBottom()) self.chat_scroll.offset = 1_000_000;
+                self.gpa.free(s);
+            },
+            .tool => |tc| {
+                if (self.pending) |p| p.setToolCall(tc.name, tc.args);
+                self.gpa.free(tc.name);
+                self.gpa.free(tc.args);
+            },
             .done => |d| {
                 if (self.pending) |p| {
                     p.streaming = false;
-                    p.tokens = d.tokens;
-                    p.tps = if (d.ms > 0) @as(f32, @floatFromInt(d.tokens)) / (@as(f32, @floatFromInt(d.ms)) / 1000.0) else 0;
+                    // The server doesn't stream a token count, so approximate for
+                    // the tok/s readout from the emitted text length.
+                    const approx: u64 = @intCast((p.content.items.len + p.reasoning.items.len) / 4);
+                    p.tokens = approx;
+                    p.tps = if (d.ms > 0) @as(f32, @floatFromInt(approx)) / (@as(f32, @floatFromInt(d.ms)) / 1000.0) else 0;
                     self.pending = null;
-                    self.logf("chat: {d} tokens in {d} ms", .{ d.tokens, d.ms });
+                    self.logf("chat: ~{d} tokens in {d} ms", .{ approx, d.ms });
                     self.maybeRunTool(p);
-                } else {
-                    self.logf("chat: {d} tokens in {d} ms", .{ d.tokens, d.ms });
                 }
             },
             .err => |e| {
@@ -1202,30 +1465,28 @@ pub const AppState = struct {
 
     // --- agent loop + MCP -------------------------------------------------
 
-    /// After an assistant turn finishes, if agent mode is on and the reply ends
-    /// with a `<tool_call>` block, dispatch it to the MCP manager. The result
-    /// comes back through `pumpMcp`, which continues the loop.
+    /// After an assistant turn finishes, if agent mode is on and the server
+    /// returned a tool call, dispatch it to the MCP manager. The result comes
+    /// back through `pumpMcp`, which continues the loop.
     fn maybeRunTool(self: *AppState, msg: *ChatMessage) void {
         if (!self.agent_mode.get()) return;
+        const tc = msg.tool_call orelse return;
         if (self.agent_iters >= agent.max_iterations) {
             self.appendNotice("Agent stopped: reached the tool-call limit for this turn.");
             return;
         }
-        const fa = self.frame_arena.allocator();
-        const call = agent.parseToolCall(fa, msg.content.items) orelse return;
-
-        if (!self.mcp_mgr.hasTool(call.name)) {
-            const err = std.fmt.allocPrint(fa, "Error: unknown tool \"{s}\". Use only the tools listed in the system prompt.", .{call.name}) catch "Error: unknown tool.";
+        if (!self.mcp_mgr.hasTool(tc.name)) {
+            const fa = self.frame_arena.allocator();
+            const err = std.fmt.allocPrint(fa, "Error: unknown tool \"{s}\". Use only the tools provided.", .{tc.name}) catch "Error: unknown tool.";
             self.continueWithToolResult(err);
             return;
         }
-
         self.agent_iters += 1;
         self.agent_seq += 1;
         self.agent_busy = true;
-        self.setAgentToolName(call.name);
-        self.logf("agent: calling {s} (step {d})", .{ call.name, self.agent_iters });
-        self.mcp_mgr.callAsync(self.agent_seq, call.name, call.args_json);
+        self.setAgentToolName(tc.name);
+        self.logf("agent: calling {s} (step {d})", .{ tc.name, self.agent_iters });
+        self.mcp_mgr.callAsync(self.agent_seq, tc.name, tc.args);
     }
 
     fn setAgentToolName(self: *AppState, name: []const u8) void {
@@ -1238,12 +1499,11 @@ pub const AppState = struct {
         return self.agent_tool_buf[0..self.agent_tool_len];
     }
 
-    /// Append a tool result as a user message and resume generation.
+    /// Append the tool result as a `tool` message and resume generation. (The
+    /// server maps role:"tool" into the model's prompt; see api.zig.)
     fn continueWithToolResult(self: *AppState, text: []const u8) void {
-        const fa = self.frame_arena.allocator();
-        const body = std.fmt.allocPrint(fa, "Tool result:\n{s}", .{text}) catch text;
-        const m = ChatMessage.create(self.gpa, .user) catch return;
-        m.setText(body) catch {};
+        const m = ChatMessage.create(self.gpa, .tool) catch return;
+        m.setText(text) catch {};
         self.messages.append(self.gpa, m) catch {
             m.destroy();
             return;
@@ -1280,6 +1540,7 @@ pub const AppState = struct {
     /// Load the persisted config files and bring up the MCP runtime. Called once
     /// from `main` after the home directory and environment are known.
     pub fn loadConfig(self: *AppState, environ: std.process.Environ) void {
+        self.environ = environ;
         const home = self.home orelse return;
         config.ensureDefaults(self.gpa, home);
         if (self.system_prompt.len > 0) self.gpa.free(self.system_prompt);

@@ -58,9 +58,22 @@ fn leftPanel(st: *AppState) zigui.View {
     return w.card(zigui.VStack(rows.items).spacing(10)).frameWidth(340);
 }
 
+fn onOpenFolder(st: *AppState) void {
+    st.openOutputsFolder();
+}
+
 fn rightPanel(st: *AppState) zigui.View {
     if (st.img_result) |img| {
-        return w.card(zigui.Image(img).frameMaxWidth().frameMaxHeight()).frameMaxWidth().frameMaxHeight();
+        // `scaledToFit` keeps the image inside the preview pane (aspect-fit,
+        // centered) instead of rendering at native pixels and overflowing.
+        return w.card(zigui.VStack(.{
+            zigui.Image(img).scaledToFit().frameMaxWidth().frameMaxHeight(),
+            zigui.HStack(.{
+                zigui.Spacer(),
+                w.secondaryButton(.folder, "Open folder", zigui.actionCtx(AppState, st, onOpenFolder)),
+            }).frameMaxWidth(),
+        }).spacing(10).frameMaxWidth().frameMaxHeight())
+            .frameMaxWidth().frameMaxHeight();
     }
     return w.card(w.emptyState(.image, "No image yet", "Enter a prompt and press Generate."))
         .frameMaxWidth()

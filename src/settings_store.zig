@@ -25,15 +25,21 @@ const max_bytes = 1 << 20; // a settings file this large is corrupt; ignore it
 /// `AppState.init`, so a missing or older file degrades to sane values.
 const Persisted = struct {
     theme_pref: i64 = @intFromEnum(st_mod.ThemePref.system),
+    theme_family: i64 = 0,
     threads: i64 = 4,
     use_gpu: bool = true,
     agent_mode: bool = false,
+    chat_temp: f32 = 0.7,
+    chat_top_p: f32 = 0.95,
+    chat_top_k: i64 = 40,
+    chat_n_ctx: i64 = 16384,
+    chat_model: []const u8 = "", // path of the last-used chat model (re-selected on startup)
     model_dirs: []const []const u8 = &.{},
 };
 
 /// A cheap fingerprint of the persisted fields, used to skip writes when nothing
 /// changed. The last value written is remembered so `maybeSave` can compare.
-const Sig = struct { theme: i64, threads: i64, gpu: bool, agent: bool, dirs: u64 };
+const Sig = struct { theme: i64, family: i64, threads: i64, gpu: bool, agent: bool, temp: f32, top_p: f32, top_k: i64, nctx: i64, model: u64, dirs: u64 };
 var last_sig: ?Sig = null;
 
 fn hashDirs(dirs: []const []const u8) u64 {
@@ -48,11 +54,23 @@ fn hashDirs(dirs: []const []const u8) u64 {
 fn signature(st: *AppState) Sig {
     return .{
         .theme = st.theme_pref.get(),
+        .family = st.theme_family.get(),
         .threads = st.threads.get(),
         .gpu = st.use_gpu.get(),
         .agent = st.agent_mode.get(),
+        .temp = st.chat_temp.get(),
+        .top_p = st.chat_top_p.get(),
+        .top_k = st.chat_top_k.get(),
+        .nctx = st.chat_n_ctx.get(),
+        .model = std.hash.Wyhash.hash(0, chatModelPath(st)),
         .dirs = hashDirs(st.model_dirs.items),
     };
+}
+
+/// Path of the currently-selected chat model (empty if none).
+fn chatModelPath(st: *AppState) []const u8 {
+    const m = st.selectedModel(st.sel_llm.get()) orelse return "";
+    return m.path;
 }
 
 /// Build the config-directory path for the current OS (caller owns it). Null if
@@ -94,9 +112,20 @@ pub fn load(st: *AppState) void {
     const p = parsed.value;
 
     st.theme_pref.set(p.theme_pref);
+    st.theme_family.set(p.theme_family);
     st.threads.set(p.threads);
     st.use_gpu.set(p.use_gpu);
     st.agent_mode.set(p.agent_mode);
+    st.chat_temp.set(p.chat_temp);
+    st.chat_top_p.set(p.chat_top_p);
+    st.chat_top_k.set(p.chat_top_k);
+    st.chat_n_ctx.set(p.chat_n_ctx);
+    // Stash the last chat model's path; `resolveStartupChatModel` selects it once
+    // the model list is scanned (load runs before the scan).
+    if (p.chat_model.len > 0) {
+        if (st.startup_chat_model) |old| gpa.free(old);
+        st.startup_chat_model = gpa.dupe(u8, p.chat_model) catch null;
+    }
 
     // Replace the added-folder list with the persisted one (owned copies).
     for (st.model_dirs.items) |d| gpa.free(d);
@@ -138,9 +167,15 @@ fn save(st: *AppState) void {
 
     const persisted: Persisted = .{
         .theme_pref = st.theme_pref.get(),
+        .theme_family = st.theme_family.get(),
         .threads = st.threads.get(),
         .use_gpu = st.use_gpu.get(),
         .agent_mode = st.agent_mode.get(),
+        .chat_temp = st.chat_temp.get(),
+        .chat_top_p = st.chat_top_p.get(),
+        .chat_top_k = st.chat_top_k.get(),
+        .chat_n_ctx = st.chat_n_ctx.get(),
+        .chat_model = chatModelPath(st),
         .model_dirs = st.model_dirs.items,
     };
     const bytes = std.json.Stringify.valueAlloc(gpa, persisted, .{ .whitespace = .indent_2 }) catch return;

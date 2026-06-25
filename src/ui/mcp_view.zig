@@ -134,13 +134,15 @@ fn serverRow(st: *AppState, fa: std.mem.Allocator, name: []const u8, cmd_summary
         break :blk w.tintedButton(.edit, "Edit", th.colors.accent, .{ .ctx = ecx, .func = onEditServer });
     } else zigui.HStack(.{});
 
+    // The name/command column flexes to fill the row and truncates with an
+    // ellipsis, so a long command can't overflow the card or shove the actions
+    // off the right edge — the trailing tool-count + buttons stay anchored.
     const row = zigui.HStack(.{
         w.statusDot(dot),
         zigui.VStack(.{
-            zigui.Text(name).font(.subheadline),
-            zigui.Text(cmd_summary).font(.caption2).foreground(th.colors.tertiary_label),
-        }).spacing(1).alignment(zigui.Alignment.leading),
-        zigui.Spacer(),
+            zigui.Text(name).font(.subheadline).truncated(),
+            zigui.Text(cmd_summary).font(.caption2).foreground(th.colors.tertiary_label).truncated(),
+        }).spacing(1).alignment(zigui.Alignment.leading).frameMaxWidth().frameAlign(.leading),
         zigui.Text(detail).font(.caption).foreground(th.colors.secondary_label),
         edit_btn,
         w.tintedButton(toggle_icon, toggle_label, th.colors.accent, .{ .ctx = tcx, .func = onToggle }),
@@ -163,10 +165,10 @@ fn presetRow(st: *AppState, fa: std.mem.Allocator, idx: usize, preset: mcp.Prese
     acx.* = .{ .st = st, .idx = idx };
 
     var info: std.ArrayList(zigui.View) = .empty;
-    info.append(fa, zigui.Text(preset.name).font(.subheadline)) catch {};
-    info.append(fa, zigui.Text(preset.description).font(.caption).foreground(th.colors.secondary_label)) catch {};
+    info.append(fa, zigui.Text(preset.name).font(.subheadline).truncated()) catch {};
+    info.append(fa, zigui.WrappedText(preset.description).font(.caption).foreground(th.colors.secondary_label)) catch {};
     if (preset.note.len > 0)
-        info.append(fa, zigui.Text(preset.note).font(.caption2).foreground(th.colors.tertiary_label)) catch {};
+        info.append(fa, zigui.WrappedText(preset.note).font(.caption2).foreground(th.colors.tertiary_label)) catch {};
 
     // Editing an existing server renders its form under the SERVER row, not here.
     const configuring = !st.mcp_cfg_editing and st.mcp_cfg_idx == @as(i64, @intCast(idx));
@@ -178,8 +180,7 @@ fn presetRow(st: *AppState, fa: std.mem.Allocator, idx: usize, preset: mcp.Prese
         w.tintedButton(.plus, "Add", th.colors.accent, .{ .ctx = acx, .func = onAddPreset });
 
     const row = zigui.HStack(.{
-        zigui.VStack(info.items).spacing(2).alignment(zigui.Alignment.leading),
-        zigui.Spacer(),
+        zigui.VStack(info.items).spacing(2).alignment(zigui.Alignment.leading).frameMaxWidth().frameAlign(.leading),
         action,
     }).spacing(10).frameMaxWidth();
 
@@ -199,7 +200,7 @@ pub fn view(st: *AppState) zigui.View {
         w.secondaryButton(.edit, "Edit mcp.json", zigui.actionCtx(AppState, st, onEditJson)),
     }).frameMaxWidth();
 
-    const intro = zigui.Text("Connect tools the agent can use. Add a preset below, or edit mcp.json to add your own. Secrets and placeholders are filled in the editor.")
+    const intro = zigui.WrappedText("Connect tools the agent can use. Add a preset below, or edit mcp.json to add your own. Secrets and placeholders are filled in the editor.")
         .font(.caption).foreground(th.colors.secondary_label).frameMaxWidth();
 
     // Configured servers (from mcp.json) overlaid with live runtime status.

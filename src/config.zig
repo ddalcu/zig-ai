@@ -70,6 +70,58 @@ pub fn modelsDirAlloc(gpa: std.mem.Allocator, home: []const u8) ?[]u8 {
     return std.fs.path.join(gpa, &.{ dir, "models" }) catch null;
 }
 
+/// The app's own outputs directory: `<config dir>/outputs`, where generated
+/// images/videos are auto-saved. Caller owns the result.
+pub fn outputsDirAlloc(gpa: std.mem.Allocator, home: []const u8) ?[]u8 {
+    const dir = dirAlloc(gpa, home) orelse return null;
+    defer gpa.free(dir);
+    return std.fs.path.join(gpa, &.{ dir, "outputs" }) catch null;
+}
+
+/// Build a timestamped output path `<outputs>/<kind>-<unix_ms>.<ext>` (the ms
+/// stamp keeps generations from clobbering each other), creating the outputs dir
+/// if needed. Caller owns the result; the encoder then writes to it.
+pub fn outputsPathAlloc(gpa: std.mem.Allocator, home: []const u8, kind: []const u8, ext: []const u8) ?[]u8 {
+    const dir = outputsDirAlloc(gpa, home) orelse return null;
+    defer gpa.free(dir);
+    var threaded = Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    return std.fmt.allocPrint(gpa, "{s}/{s}-{d}.{s}", .{ dir, kind, ms, ext }) catch null;
+}
+
+/// Create `dir` (and parents) if absent. Best-effort.
+pub fn ensureDir(gpa: std.mem.Allocator, dir: []const u8) void {
+    var threaded = Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    Io.Dir.cwd().createDirPath(threaded.io(), dir) catch {};
+}
+
+/// Build a NUL-terminated `file://` URL for `path`, percent-encoding everything
+/// outside the unreserved set (so spaces in "Application Support" don't break the
+/// OS handler). Keeps `/` intact. Caller owns the result.
+pub fn fileUrlAlloc(gpa: std.mem.Allocator, path: []const u8) ?[:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "file://") catch return null;
+    const hex = "0123456789ABCDEF";
+    for (path) |ch| {
+        const keep = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or
+            (ch >= '0' and ch <= '9') or ch == '-' or ch == '_' or ch == '.' or
+            ch == '~' or ch == '/';
+        if (keep) {
+            out.append(gpa, ch) catch return null;
+        } else {
+            out.append(gpa, '%') catch return null;
+            out.append(gpa, hex[ch >> 4]) catch return null;
+            out.append(gpa, hex[ch & 0xF]) catch return null;
+        }
+    }
+    return gpa.dupeZ(u8, out.items) catch null;
+}
+
 /// Full path to a config file within the config dir (caller owns it).
 pub fn pathAlloc(gpa: std.mem.Allocator, home: []const u8, name: []const u8) ?[]u8 {
     const dir = dirAlloc(gpa, home) orelse return null;

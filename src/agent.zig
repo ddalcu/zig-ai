@@ -74,6 +74,64 @@ pub fn buildSystemPrompt(
     return out.items;
 }
 
+/// Return the first balanced `{…}` JSON object in `s` (string- and escape-aware),
+/// or null. Used to recover a tool call when the model omits the close tag.
+fn extractJsonObject(s: []const u8) ?[]const u8 {
+    const start = std.mem.indexOfScalar(u8, s, '{') orelse return null;
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (in_str) {
+            if (esc) {
+                esc = false;
+            } else if (c == '\\') {
+                esc = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return s[start .. i + 1];
+        }
+    }
+    return null;
+}
+
+/// Recover a tool-call object whose trailing `}`(s) the model dropped: take from
+/// the first `{` to the end of `s`, and if braces are net-open, append enough
+/// closing braces to balance. Returns null if there's no `{` or it's not the
+/// missing-close case (so we don't fabricate structure from genuine garbage).
+fn balanceObject(arena: std.mem.Allocator, s: []const u8) ?[]const u8 {
+    const start = std.mem.indexOfScalar(u8, s, '{') orelse return null;
+    var depth: isize = 0;
+    var in_str = false;
+    var esc = false;
+    for (s[start..]) |c| {
+        if (in_str) {
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            depth -= 1;
+        }
+    }
+    if (depth <= 0) return null; // balanced (handled elsewhere) or over-closed
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, s[start..]) catch return null;
+    var i: isize = 0;
+    while (i < depth) : (i += 1) out.append(arena, '}') catch return null;
+    return out.items;
+}
+
 fn appendOneLine(arena: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) void {
     for (s) |ch| {
         out.append(arena, if (ch == '\n' or ch == '\r') ' ' else ch) catch return;
@@ -91,9 +149,12 @@ pub const ToolCall = struct {
 pub fn parseToolCall(arena: std.mem.Allocator, text: []const u8) ?ToolCall {
     const start = std.mem.indexOf(u8, text, open_tag) orelse return null;
     const after = start + open_tag.len;
-    const end_rel = std.mem.indexOfPos(u8, text, after, close_tag) orelse return null;
-    const body = std.mem.trim(u8, text[after..end_rel], " \t\r\n");
-    if (body.len == 0) return null;
+    // The call object is between the tags when both are present, else everything
+    // after the open tag. Small local models are sloppy: they drop the close tag
+    // and/or trailing `}`, so try a clean balanced object first, then a
+    // brace-repaired one.
+    const region = if (std.mem.indexOfPos(u8, text, after, close_tag)) |e| text[after..e] else text[after..];
+    const body = extractJsonObject(region) orelse balanceObject(arena, region) orelse return null;
 
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return null;
     if (value != .object) return null;
@@ -120,6 +181,27 @@ test "parseToolCall extracts name and arguments" {
     const tc = parseToolCall(arena, text) orelse return error.NoCall;
     try std.testing.expectEqualStrings("fs__read_file", tc.name);
     try std.testing.expect(std.mem.indexOf(u8, tc.args_json, "/tmp/x") != null);
+}
+
+test "parseToolCall tolerates a missing close tag" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}";
+    const tc = parseToolCall(arena, text) orelse return error.NoCall;
+    try std.testing.expectEqualStrings("get_weather", tc.name);
+    try std.testing.expect(std.mem.indexOf(u8, tc.args_json, "Paris") != null);
+}
+
+test "parseToolCall repairs a dropped trailing brace" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // outer `}` missing before the close tag (a real gemma-E2B failure)
+    const text = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}</tool_call>";
+    const tc = parseToolCall(arena, text) orelse return error.NoCall;
+    try std.testing.expectEqualStrings("get_weather", tc.name);
+    try std.testing.expect(std.mem.indexOf(u8, tc.args_json, "Tokyo") != null);
 }
 
 test "parseToolCall returns null without a block" {

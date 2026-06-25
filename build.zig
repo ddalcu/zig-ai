@@ -78,6 +78,36 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "link_tts", link_tts);
     exe_mod.addOptions("build_options", build_opts);
 
+    // Vendored single-header media encoders (PNG + H.264/MP4, no ffmpeg) compiled
+    // straight into the exe. minih264 (CC0) + minimp4 (public domain) + a pure-C
+    // stb_image_write copy all live self-contained in deps/codecs.
+    exe_mod.addIncludePath(b.path("deps/codecs"));
+    exe_mod.addCSourceFiles(.{
+        .files = &.{
+            "src/codecs/codecs.c",
+            "src/codecs/codecs_h264.c",
+            "src/codecs/codecs_mp4.c",
+        },
+        .flags = &.{"-O2"},
+    });
+
+    // Vendored Jinja engine (Apache-2.0, from mlx-serve / llama.cpp lineage) so we
+    // can render a model's actual `chat_template` — llama.cpp's C API only matches
+    // a hardcoded template list, which newer models (e.g. gemma-4) aren't in.
+    exe_mod.addIncludePath(b.path("deps/jinja"));
+    exe_mod.addCSourceFiles(.{
+        .files = &.{
+            "deps/jinja/lexer.cpp",
+            "deps/jinja/parser.cpp",
+            "deps/jinja/runtime.cpp",
+            "deps/jinja/value.cpp",
+            "deps/jinja/jinja_string.cpp",
+            "deps/jinja/jinja_wrapper.cpp",
+        },
+        .flags = &.{ "-std=c++17", "-O2" },
+    });
+    exe_mod.link_libcpp = true; // the Jinja sources are C++
+
     // Build the AI backends (llama/sd/qwen3-tts) from the deps/ submodules via
     // CMake, then link the resulting archives. cmake_build is the step the exe
     // must wait on before linking.

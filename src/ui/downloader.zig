@@ -68,8 +68,19 @@ fn quantPopover(st: *AppState) zigui.View {
             rows.append(fa, zigui.Text("No GGUF model files in this repo.")
                 .font(.caption).foreground(th.colors.secondary_label)) catch {};
         }
-        for (files.items) |f| {
-            if (!f.is_quant) continue;
+        // List quants smallest-first. Sort an index array so the underlying
+        // file set (owned by state) keeps its order.
+        var qidx: std.ArrayList(usize) = .empty;
+        for (files.items, 0..) |f, i| {
+            if (f.is_quant) qidx.append(fa, i) catch {};
+        }
+        std.mem.sort(usize, qidx.items, files.items, struct {
+            fn lt(items: []const st_mod.RepoFile, a: usize, b: usize) bool {
+                return items[a].size < items[b].size;
+            }
+        }.lt);
+        for (qidx.items) |i| {
+            const f = files.items[i];
             var sbuf: [32]u8 = undefined;
             rows.append(fa, zigui.HStack(.{
                 zigui.Text(f.path).font(.caption),
@@ -116,41 +127,171 @@ fn quantPopover(st: *AppState) zigui.View {
     return w.card(content).frameWidth(340);
 }
 
-// --- result rows ------------------------------------------------------------
+// --- results table ----------------------------------------------------------
 
-fn resultRow(st: *AppState, index: usize, repo: st_mod.HFRepo) zigui.View {
+// Column positions in the results table. The `sortable` numeric columns map to
+// the comparators in `orderLess`; keep these in sync with `columns` in `view`.
+const COL_TYPE = 0;
+const COL_NAME = 1;
+const COL_SIZE = 2;
+const COL_DOWNLOADS = 3;
+const COL_LIKES = 4;
+const COL_UPDATED = 5;
+const COL_GET = 6;
+
+const OrderCtx = struct { items: []const st_mod.HFRepo, col: i64, asc: bool };
+
+/// Less-than over *display order* (indices into `dl_results`), per the active
+/// sort. We sort an index array rather than `dl_results` itself so row indices
+/// stay stable — `dl_filepick_idx` and incoming size events both key off them.
+fn orderLess(ctx: OrderCtx, ia: usize, ib: usize) bool {
+    const a = ctx.items[ia];
+    const b = ctx.items[ib];
+    return switch (ctx.col) {
+        COL_SIZE => blk: {
+            // Repos whose size hasn't loaded yet always sink to the bottom.
+            if (a.size_loaded != b.size_loaded) break :blk a.size_loaded;
+            if (!a.size_loaded or a.size_min == b.size_min) break :blk false;
+            break :blk if (ctx.asc) a.size_min < b.size_min else a.size_min > b.size_min;
+        },
+        COL_DOWNLOADS => ordI64(a.downloads, b.downloads, ctx.asc),
+        COL_LIKES => ordI64(a.likes, b.likes, ctx.asc),
+        COL_UPDATED => ordI64(a.last_modified, b.last_modified, ctx.asc),
+        else => false,
+    };
+}
+
+fn ordI64(a: i64, b: i64, asc: bool) bool {
+    if (a == b) return false;
+    return if (asc) a < b else a > b;
+}
+
+// --- cell formatting --------------------------------------------------------
+
+/// "6.0 GB–80 GB" once the repo's quants have been measured, a single value if
+/// all quants are the same size, or "…" while the background fetch is pending.
+fn sizeRangeText(repo: st_mod.HFRepo) []const u8 {
+    if (!repo.size_loaded) return "…";
+    var b1: [32]u8 = undefined;
+    var b2: [32]u8 = undefined;
+    if (repo.size_min == repo.size_max) return w.fmt("{s}", .{models.humanSize(&b1, repo.size_min)});
+    return w.fmt("{s}–{s}", .{ models.humanSize(&b1, repo.size_min), models.humanSize(&b2, repo.size_max) });
+}
+
+/// Compact count: 980, 12.3k, 4.1M.
+fn countText(n: i64) []const u8 {
+    if (n < 1000) return w.fmt("{d}", .{n});
+    const f: f64 = @floatFromInt(n);
+    if (n < 1_000_000) return w.fmt("{d:.1}k", .{f / 1000.0});
+    return w.fmt("{d:.1}M", .{f / 1_000_000.0});
+}
+
+/// The last-modified date as "YYYY-MM-DD" (or "—" when unknown). Absolute rather
+/// than relative so it needs no wall-clock; sorting still uses the raw epoch.
+fn dateText(epoch: i64) []const u8 {
+    if (epoch <= 0) return "—";
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(epoch) };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    return w.fmt("{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), @as(u16, md.day_index) + 1 });
+}
+
+fn nameCell(repo: st_mod.HFRepo) zigui.View {
     const th = w.t();
+    return zigui.VStack(.{
+        zigui.Text(repo.name()).font(.subheadline).truncated(),
+        zigui.Text(repo.author()).font(.caption2).foreground(th.colors.tertiary_label).truncated(),
+    }).spacing(2).alignment(zigui.Alignment.leading);
+}
 
+fn numCell(s: []const u8) zigui.View {
+    return zigui.Text(s).font(.caption).foreground(w.t().colors.secondary_label);
+}
+
+/// True when a repo already lives in one of the scanned model folders (app dir or
+/// any Settings folder). Downloads land in `…/<author>/<name>/`, so we match a
+/// scanned model whose folder is `<name>` inside an `<author>` folder — robust to
+/// path separators and the kind subfolder.
+fn isDownloaded(st: *AppState, repo: st_mod.HFRepo) bool {
+    const name = repo.name();
+    const author = repo.author();
+    if (name.len == 0 or author.len == 0) return false;
+    for (st.model_list.items.items) |m| {
+        if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(m.dir), name)) continue;
+        const parent = std.fs.path.dirname(m.dir) orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.fs.path.basename(parent), author)) return true;
+    }
+    return false;
+}
+
+/// The trailing action for a row: an "Installed" badge when the repo is already
+/// downloaded, otherwise the "Get" button (with the quant popover on the active
+/// row). `orig` is the index into `dl_results` (stable across sorting).
+fn getCell(st: *AppState, orig: usize, installed: bool) zigui.View {
+    const th = w.t();
+    if (installed) {
+        return zigui.HStack(.{
+            zigui.Icon(.check, 13, w.green()),
+            zigui.Text("Installed").font(.callout).foreground(th.colors.secondary_label),
+        }).spacing(4)
+            .paddingInsets(.{ .top = 5, .leading = 9, .bottom = 5, .trailing = 9 });
+    }
     const dl_btn = zigui.HStack(.{
-        zigui.Icon(.download, 14, th.colors.on_accent),
+        zigui.Icon(.download, 13, th.colors.on_accent),
         zigui.Text("Get").font(.callout).foreground(th.colors.on_accent),
-        zigui.Icon(.chevron_down, 13, th.colors.on_accent),
-    }).spacing(5)
-        .paddingInsets(.{ .top = 6, .leading = 11, .bottom = 6, .trailing = 9 })
+        zigui.Icon(.chevron_down, 12, th.colors.on_accent),
+    }).spacing(4)
+        .paddingInsets(.{ .top = 5, .leading = 9, .bottom = 5, .trailing = 7 })
         .background(th.colors.accent)
-        .cornerRadius(8)
-        .onTap(.{ .ctx = rowCtx(st, index), .func = onOpenFiles });
-    // Attach the quant popover only to the row that opened it.
-    const trailing = if (st.dl_filepick_idx == @as(i64, @intCast(index)))
-        dl_btn.popover(st.dl_filepick_open.binding(), quantPopover(st))
-    else
-        dl_btn;
+        .cornerRadius(7)
+        .onTap(.{ .ctx = rowCtx(st, orig), .func = onOpenFiles });
+    if (st.dl_filepick_idx == @as(i64, @intCast(orig)))
+        return dl_btn.popover(st.dl_filepick_open.binding(), quantPopover(st));
+    return dl_btn;
+}
 
-    return zigui.HStack(.{
-        mb.kindBadge(repo.kind),
-        zigui.VStack(.{
-            zigui.Text(repo.name()).font(.subheadline),
-            zigui.HStack(.{
-                zigui.Text(repo.author()).font(.caption2).foreground(th.colors.tertiary_label),
-                zigui.Icon(.download, 11, th.colors.tertiary_label),
-                zigui.Text(w.fmt("{d}", .{repo.downloads})).font(.caption2).foreground(th.colors.tertiary_label),
-                zigui.Icon(.heart, 11, th.colors.tertiary_label),
-                zigui.Text(w.fmt("{d}", .{repo.likes})).font(.caption2).foreground(th.colors.tertiary_label),
-            }).spacing(5),
-        }).spacing(3),
-        zigui.Spacer(),
-        trailing,
-    }).spacing(10).frameMaxWidth();
+/// The sortable results table: one row per repo in the current sort order.
+fn resultsTable(st: *AppState) zigui.View {
+    const fa = st.frame_arena.allocator();
+    const n = st.dl_results.items.len;
+
+    // Display order: indices into dl_results, sorted per dl_sort (index < 0 keeps
+    // the HF API's download-ranked order).
+    const order = fa.alloc(usize, n) catch return zigui.Text("Out of memory");
+    for (order, 0..) |*o, i| o.* = i;
+    const sort = st.dl_sort.get();
+    if (sort.index >= 0 and n > 1) {
+        std.mem.sort(usize, order, OrderCtx{
+            .items = st.dl_results.items,
+            .col = sort.index,
+            .asc = sort.dir == .ascending,
+        }, orderLess);
+    }
+
+    const rows = fa.alloc([]const zigui.View, n) catch return zigui.Text("Out of memory");
+    for (order, 0..) |orig, p| {
+        const repo = st.dl_results.items[orig];
+        const cells = fa.alloc(zigui.View, 7) catch return zigui.Text("Out of memory");
+        cells[COL_TYPE] = mb.kindBadge(repo.kind);
+        cells[COL_NAME] = nameCell(repo);
+        cells[COL_SIZE] = numCell(sizeRangeText(repo));
+        cells[COL_DOWNLOADS] = numCell(countText(repo.downloads));
+        cells[COL_LIKES] = numCell(countText(repo.likes));
+        cells[COL_UPDATED] = numCell(dateText(repo.last_modified));
+        cells[COL_GET] = getCell(st, orig, isDownloaded(st, repo));
+        rows[p] = cells;
+    }
+
+    const columns = [_]zigui.DataColumn{
+        .{ .title = "", .width = 58 },
+        .{ .title = "Name" },
+        .{ .title = "Size", .width = 108, .sortable = true, .trailing = true },
+        .{ .title = "Downloads", .width = 78, .sortable = true, .trailing = true },
+        .{ .title = "Likes", .width = 54, .sortable = true, .trailing = true },
+        .{ .title = "Updated", .width = 74, .sortable = true, .trailing = true },
+        .{ .title = "", .width = 84, .trailing = true },
+    };
+    return zigui.DataTable(&columns, rows, st.dl_sort.binding(), &st.dl_scroll);
 }
 
 // --- active download --------------------------------------------------------
@@ -222,28 +363,20 @@ pub fn view(st: *AppState) zigui.View {
         w.primaryButton(.search, "Search", zigui.actionCtx(AppState, st, onSearch)),
     }).spacing(8).frameMaxWidth();
 
-    // Results list.
-    var rows: std.ArrayList(zigui.View) = .empty;
-    if (st.dl_results.items.len == 0) {
-        rows.append(fa, w.emptyState(
+    // Results: an empty-state prompt, or the sortable table.
+    const results = if (st.dl_results.items.len == 0)
+        w.emptyState(
             .download,
             "Search HuggingFace for GGUF models",
             "Type a name (e.g. \"qwen\", \"llama\", \"flux\") and press Search.",
-        )) catch {};
-    } else {
-        for (st.dl_results.items, 0..) |repo, i| {
-            rows.append(fa, resultRow(st, i, repo)) catch {};
-            if (i + 1 < st.dl_results.items.len) rows.append(fa, zigui.Divider()) catch {};
-        }
-    }
-    const list = zigui.ScrollViewState(&st.dl_scroll, zigui.VStack(rows.items).spacing(8).frameMaxWidth())
-        .frameMaxWidth()
-        .frameMaxHeight();
+        )
+    else
+        resultsTable(st);
 
     var col: std.ArrayList(zigui.View) = .empty;
     col.append(fa, search_bar) catch {};
     if (st.downloader.isBusy() or st.dl_active != null) col.append(fa, activeRow(st)) catch {};
-    col.append(fa, w.card(list).frameMaxHeight()) catch {};
+    col.append(fa, w.card(results).frameMaxHeight()) catch {};
 
     return zigui.VStack(col.items).spacing(12).frameMaxWidth().frameMaxHeight();
 }

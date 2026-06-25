@@ -51,16 +51,24 @@ fn leftPanel(st: *AppState) zigui.View {
     return w.card(zigui.VStack(rows.items).spacing(10)).frameWidth(340);
 }
 
+fn onOpenFolder(st: *AppState) void {
+    st.openOutputsFolder();
+}
+
 fn rightPanel(st: *AppState) zigui.View {
     if (st.vid_result) |frames| {
         if (frames.len > 0) {
             const idx = if (st.vid_play_idx < frames.len) st.vid_play_idx else 0;
             const th = w.t();
             return w.card(zigui.VStack(.{
-                zigui.Image(frames[idx]).frameMaxWidth().frameMaxHeight(),
-                zigui.Text(w.fmt("frame {d}/{d} · {d} fps", .{ idx + 1, frames.len, st.vid_fps }))
-                    .font(.caption).foreground(th.colors.secondary_label).frameMaxWidth(),
-            }).spacing(8)).frameMaxWidth().frameMaxHeight();
+                zigui.Image(frames[idx]).scaledToFit().frameMaxWidth().frameMaxHeight(),
+                zigui.HStack(.{
+                    zigui.Text(w.fmt("frame {d}/{d} · {d} fps", .{ idx + 1, frames.len, st.vid_fps }))
+                        .font(.caption).foreground(th.colors.secondary_label),
+                    zigui.Spacer(),
+                    w.secondaryButton(.folder, "Open folder", zigui.actionCtx(AppState, st, onOpenFolder)),
+                }).spacing(8).frameMaxWidth(),
+            }).spacing(8).frameMaxWidth().frameMaxHeight()).frameMaxWidth().frameMaxHeight();
         }
     }
     return w.card(w.emptyState(.film, "No video yet", "Enter a prompt and press Generate."))
