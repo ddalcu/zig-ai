@@ -9,6 +9,7 @@ const mb = @import("model_browser.zig");
 const st_mod = @import("../state.zig");
 const models = @import("../models.zig");
 const manifest = @import("../manifest.zig");
+const downloader = @import("../backends/downloader.zig");
 const AppState = st_mod.AppState;
 
 fn onSearch(st: *AppState) void {
@@ -312,13 +313,18 @@ fn activeRow(st: *AppState) zigui.View {
     var spbuf: [32]u8 = undefined;
     const fidx = st.downloader.file_index.load(.acquire);
     const fcount = st.downloader.file_count.load(.acquire);
+    const retry = st.downloader.retry_attempt.load(.acquire);
     const model = st.dl_active orelse "Downloading…";
 
-    // Current file line: "umt5-xxl.gguf (2 of 4)".
-    const file_line = if (st.dl_active_file) |f|
+    // Current file line: "umt5-xxl.gguf (2 of 4)", or a reconnect status while
+    // retrying a dropped connection.
+    const file_line = if (retry > 0)
+        w.fmt("Reconnecting… ({d}/{d})", .{ retry, downloader.Backend.max_stalls })
+    else if (st.dl_active_file) |f|
         if (fcount > 1) w.fmt("{s}  ({d} of {d})", .{ f, fidx, fcount }) else w.fmt("{s}", .{f})
     else
         "Preparing…";
+    const file_color = if (retry > 0) th.colors.accent else th.colors.tertiary_label;
 
     return w.card(zigui.VStack(.{
         zigui.HStack(.{
@@ -327,7 +333,7 @@ fn activeRow(st: *AppState) zigui.View {
             zigui.Spacer(),
             w.tintedButton(.close, "Cancel", th.colors.destructive, zigui.actionCtx(AppState, st, onCancel)),
         }).spacing(8).frameMaxWidth(),
-        zigui.Text(file_line).font(.caption2).foreground(th.colors.tertiary_label).frameMaxWidth(),
+        zigui.Text(file_line).font(.caption2).foreground(file_color).frameMaxWidth(),
         zigui.ProgressView(frac).frameMaxWidth(),
         zigui.Text(w.fmt("{d}% · {s} / {s} · {s}/s", .{
             pct,
@@ -359,7 +365,7 @@ pub fn view(st: *AppState) zigui.View {
     const search_bar = zigui.HStack(.{
         search_field,
         zigui.Picker(st.dl_category.binding(), &[_][]const u8{ "All", "Chat", "Image", "Video", "TTS" })
-            .frameWidth(280),
+            .frameWidth(360),
         w.primaryButton(.search, "Search", zigui.actionCtx(AppState, st, onSearch)),
     }).spacing(8).frameMaxWidth();
 

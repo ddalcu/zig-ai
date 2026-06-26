@@ -406,6 +406,9 @@ pub const AppState = struct {
     alert_present: zigui.State(bool),
     alert_buf: [512]u8 = undefined,
     alert_len: usize = 0,
+    /// Modal title — defaults to the error wording; `alertOk` swaps in a neutral
+    /// one for success notices. Points at a static string (no buffer needed).
+    alert_title: []const u8 = "Something went wrong",
 
     /// Delete-model confirmation overlay. `delete_path` is the file or folder that
     /// will be removed; `delete_is_folder` picks deleteTree vs deleteFile.
@@ -1370,6 +1373,10 @@ pub const AppState = struct {
             .progress => {}, // read live from downloader atomics in the view
             .done => |path| {
                 self.logf("download: saved into {s}", .{path});
+                if (self.dl_active) |repo|
+                    self.alertOk("Download complete", "{s} downloaded successfully.", .{repo})
+                else
+                    self.alertOk("Download complete", "Model downloaded successfully.", .{});
                 self.clearDlActive();
                 self.gpa.free(path);
                 self.rescanModels();
@@ -1393,6 +1400,7 @@ pub const AppState = struct {
     /// failed model load, missing model, generation failure — instead of quietly
     /// switching to the Logs screen.
     pub fn alert(self: *AppState, text: []const u8) void {
+        self.alert_title = "Something went wrong"; // restore the error title
         const n = @min(text.len, self.alert_buf.len);
         @memcpy(self.alert_buf[0..n], text[0..n]);
         self.alert_len = n;
@@ -1404,6 +1412,18 @@ pub const AppState = struct {
         var buf: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, f, args) catch return;
         self.alert(line);
+    }
+
+    /// A non-error modal (e.g. "Download complete") with a custom `title`.
+    pub fn alertOk(self: *AppState, title: []const u8, comptime f: []const u8, args: anytype) void {
+        var buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, f, args) catch return;
+        const n = @min(line.len, self.alert_buf.len);
+        @memcpy(self.alert_buf[0..n], line[0..n]);
+        self.alert_len = n;
+        self.alert_title = title;
+        self.alert_present.set(true);
+        self.logs.append(line);
     }
 
     pub fn alertText(self: *AppState) []const u8 {
