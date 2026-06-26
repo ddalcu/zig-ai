@@ -114,7 +114,16 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.shutdown.store(true, .release);
-        if (self.thread) |th| th.join(); // accept loop polls the flag every 1s
+        // Wake the blocked `accept` with a throwaway loopback connection so the
+        // loop sees `shutdown` and exits (replaces the old poll timeout).
+        if (self.net) |n| {
+            const ip: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = self.cfg.port } };
+            if (ip.connect(n.io(), .{ .mode = .stream })) |s| {
+                var stream = s;
+                stream.close(n.io());
+            } else |_| {}
+        }
+        if (self.thread) |th| th.join();
         self.backend.deinit();
         if (self.net) |n| {
             n.threaded.deinit();
@@ -132,14 +141,17 @@ pub const Server = struct {
         defer server.deinit(io);
         std.debug.print("api: OpenAI-compatible server on http://{s}:{d}/v1\n", .{ self.cfg.host, self.cfg.port });
 
-        var poll_fds = [_]std.posix.pollfd{.{ .fd = server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        // Blocking accept loop. `deinit` stops it by setting `shutdown` and making
+        // one throwaway local connection to wake a blocked `accept`. (Portable:
+        // `std.posix.poll`'s pollfd type isn't defined for Windows in Zig 0.16.)
         while (!self.shutdown.load(.acquire)) {
-            const r = std.posix.poll(&poll_fds, 1000) catch break;
-            if (r == 0) continue; // timeout → re-check shutdown
-            if (self.shutdown.load(.acquire)) break;
-            const stream = server.accept(io) catch continue;
+            const stream = server.accept(io) catch break;
             var conn: Conn = undefined;
             conn.init(stream, io);
+            if (self.shutdown.load(.acquire)) {
+                conn.close(); // the wake-up connection from deinit
+                break;
+            }
             self.handleConn(&conn) catch {};
             conn.close();
         }
