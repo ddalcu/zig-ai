@@ -170,26 +170,41 @@ jobs:
         run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix -Dcuda=true
 
       - name: Package
+        # Split into a small base bundle and an optional CUDA add-on. The CUDA
+        # runtime (esp. libcublasLt, ~0.5 GB) dwarfs everything else, and most
+        # users don't need it — NVIDIA cards still accelerate via Vulkan in the
+        # base. Because ggml loads backend modules from the binary's directory at
+        # runtime, the add-on is literally "extract these files next to the
+        # binary" with no separate install. Each asset stays well under GitHub's
+        # 2 GiB/file release limit; the add-on uses xz -9 (cublasLt is code and
+        # compresses ~2x).
         run: |
-          mkdir dist
-          cp zig-out/bin/zig-ai dist/
-          # Bundle every shared lib next to the binary (rpath is $ORIGIN): the AI
-          # libs + ggml core + the ggml backend modules (cpu/vulkan/cuda). ggml
-          # scans this dir at runtime and picks the best device, falling back
-          # CUDA → Vulkan → CPU when a GPU/driver/ICD is absent.
-          cp -P build-deps/lib/*.so* dist/
-          cp sdl3-prefix/lib/libSDL3.so.0* dist/
-          cp /usr/lib/x86_64-linux-gnu/libvulkan.so.1* dist/
-          # CUDA runtime so the CUDA module loads without the full toolkit present.
-          for lib in libcudart libcublas libcublasLt; do
-            find "${CUDA_PATH:-/usr/local/cuda}/lib64" -name "${lib}.so*" -exec cp -P {} dist/ \; 2>/dev/null || true
+          mkdir base cuda
+          cp zig-out/bin/zig-ai base/
+          # ggml backend modules: the CUDA one goes in the add-on, the rest (cpu,
+          # vulkan, core ggml, llama/sd/tts) in the base.
+          for f in build-deps/lib/*.so*; do
+            case "$(basename "$f")" in
+              *ggml-cuda*) cp -P "$f" cuda/ ;;
+              *)           cp -P "$f" base/ ;;
+            esac
           done
-          tar -czf zig-ai-linux-x86_64.tar.gz -C dist .
+          cp -P sdl3-prefix/lib/libSDL3.so.0* base/
+          cp /usr/lib/x86_64-linux-gnu/libvulkan.so.1* base/
+          # NVIDIA runtime -> add-on so the CUDA module loads without the toolkit.
+          for lib in libcudart libcublas libcublasLt; do
+            find "${CUDA_PATH:-/usr/local/cuda}/lib64" -name "${lib}.so*" -exec cp -P {} cuda/ \; 2>/dev/null || true
+          done
+          tar -czf zig-ai-linux-x86_64.tar.gz -C base .
+          tar -cJf zig-ai-linux-x86_64-cuda.tar.xz -C cuda .
+          ls -la zig-ai-linux-x86_64*.tar.*
 
       - uses: actions/upload-artifact@v4
         with:
           name: zig-ai-linux-x86_64
-          path: zig-ai-linux-x86_64.tar.gz
+          path: |
+            zig-ai-linux-x86_64.tar.gz
+            zig-ai-linux-x86_64-cuda.tar.xz
 
   build-windows:
     runs-on: windows-latest # x86_64
@@ -278,28 +293,41 @@ jobs:
 
       - name: Package
         shell: bash
+        # Split into a small base bundle and an optional CUDA add-on. The CUDA
+        # runtime (esp. cublasLt64, ~0.5 GB) dwarfs everything else and most
+        # users don't need it — NVIDIA cards still accelerate via Vulkan in the
+        # base. ggml loads backend modules from the exe's directory at runtime,
+        # so the add-on is just "extract these DLLs next to zig-ai.exe". Each zip
+        # stays well under GitHub's 2 GiB/file release limit; the add-on uses
+        # 7z -mx=9 (cublasLt is code and compresses ~2x).
         run: |
-          mkdir dist
-          cp zig-out/bin/zig-ai.exe dist/
-          cp sdl3-prefix/bin/SDL3.dll dist/
-          # All AI shared libs + ggml core + the ggml backend modules
-          # (ggml-cpu/-vulkan/-cuda DLLs). ggml loads the modules from the exe's
-          # directory at runtime and selects the best device (CUDA→Vulkan→CPU).
-          cp build-deps/bin/*.dll dist/
-          # CUDA runtime redistributables so the CUDA module loads without the
-          # full toolkit installed on the user's machine. CUDA 12.x keeps these
-          # in bin/, CUDA 13.x in bin/x64/ — search both.
+          mkdir base cuda
+          cp zig-out/bin/zig-ai.exe base/
+          cp sdl3-prefix/bin/SDL3.dll base/
+          # ggml backend modules: CUDA one -> add-on, the rest (cpu, vulkan, core
+          # ggml, llama/sd/tts) -> base.
+          for f in build-deps/bin/*.dll; do
+            case "$(basename "$f")" in
+              ggml-cuda*) cp "$f" cuda/ ;;
+              *)          cp "$f" base/ ;;
+            esac
+          done
+          # NVIDIA runtime redistributables -> add-on (CUDA 12.x: bin/, 13.x: bin/x64/).
           for dir in "$CUDA_PATH/bin" "$CUDA_PATH/bin/x64"; do
             for pat in cudart64_ cublas64_ cublasLt64_; do
-              find "$dir" -name "${pat}*.dll" -exec cp {} dist/ \; 2>/dev/null || true
+              find "$dir" -name "${pat}*.dll" -exec cp {} cuda/ \; 2>/dev/null || true
             done
           done
-          cd dist && 7z a ../zig-ai-windows-x86_64.zip .
+          (cd base && 7z a ../zig-ai-windows-x86_64.zip .)
+          (cd cuda && 7z a -mx=9 ../zig-ai-windows-x86_64-cuda.zip .)
+          ls -la zig-ai-windows-x86_64*.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: zig-ai-windows-x86_64
-          path: zig-ai-windows-x86_64.zip
+          path: |
+            zig-ai-windows-x86_64.zip
+            zig-ai-windows-x86_64-cuda.zip
 
   release:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -317,3 +345,12 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+          append_body: true
+          body: |
+            ### NVIDIA CUDA (optional)
+            The base download runs on CPU and any GPU via Vulkan (including NVIDIA).
+            For maximum performance on an NVIDIA GPU, also download the matching
+            `*-cuda` add-on and extract it **into the same folder** as the app
+            (next to `zig-ai` / `zig-ai.exe`). ggml then loads the CUDA backend
+            automatically and falls back to Vulkan/CPU if it's absent. macOS uses
+            Metal and needs no add-on.
