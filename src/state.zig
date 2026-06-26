@@ -14,6 +14,7 @@ const mcp = @import("mcp.zig");
 const agent = @import("agent.zig");
 const manifest = @import("manifest.zig");
 const chat_client = @import("backends/chat_client.zig");
+const accel = @import("backends/accel.zig");
 const sd = @import("backends/sd.zig");
 const tts = @import("backends/tts.zig");
 const video = @import("backends/video.zig");
@@ -249,6 +250,12 @@ pub const AppState = struct {
     loaded_sd: ?[]u8 = null,
     loaded_video: ?[]u8 = null,
     loaded_tts: ?[]u8 = null,
+
+    /// Active compute backend + its memory, shown in the sidebar footer. Cached
+    /// and refreshed every ~30 frames (and until backends finish loading) so the
+    /// per-frame footer render doesn't poll the driver on every frame.
+    accel_info: accel.Info = .{},
+    accel_poll: u32 = 0,
     loaded_size_llm: u64 = 0,
     loaded_size_sd: u64 = 0,
     loaded_size_video: u64 = 0,
@@ -390,10 +397,8 @@ pub const AppState = struct {
     /// The result row whose quant popover is active (-1 = none).
     dl_filepick_idx: i64 = -1,
     dl_filepick_open: zigui.State(bool),
-    /// Name of the model currently downloading (owned), or null when idle.
-    dl_active: ?[]u8 = null,
-    /// Name of the individual file within the set in flight (owned), or null.
-    dl_active_file: ?[]u8 = null,
+    // Per-download progress lives in `downloader.jobs` (one `DlJob` each), so
+    // several models can download in parallel — each with its own progress card.
 
     // --- logs -------------------------------------------------------------
     logs: LogRing,
@@ -546,8 +551,6 @@ pub const AppState = struct {
         self.clearDlResults();
         self.dl_results.deinit(self.gpa);
         self.clearDlFiles();
-        if (self.dl_active) |a| self.gpa.free(a);
-        if (self.dl_active_file) |a| self.gpa.free(a);
         self.logs.deinit();
         self.show_settings.deinit();
         self.alert_present.deinit();
@@ -1235,6 +1238,15 @@ pub const AppState = struct {
         return total;
     }
 
+    /// Active accelerator + memory for the footer indicator. Polls the driver
+    /// ~twice a second (every 30 frames), and keeps retrying until backends have
+    /// loaded, so the value appears as soon as the device registry is ready.
+    pub fn acceleratorInfo(self: *AppState) accel.Info {
+        if (!self.accel_info.ok or self.accel_poll % 30 == 0) self.accel_info = accel.query();
+        self.accel_poll +%= 1;
+        return self.accel_info;
+    }
+
     // --- downloader -------------------------------------------------------
 
     fn clearDlResults(self: *AppState) void {
@@ -1245,13 +1257,6 @@ pub const AppState = struct {
     fn clearDlFiles(self: *AppState) void {
         if (self.dl_files) |f| downloader.freeFiles(self.gpa, f);
         self.dl_files = null;
-    }
-
-    fn clearDlActive(self: *AppState) void {
-        if (self.dl_active) |a| self.gpa.free(a);
-        self.dl_active = null;
-        if (self.dl_active_file) |a| self.gpa.free(a);
-        self.dl_active_file = null;
     }
 
     /// Map the `dl_category` Picker index to a model Kind (null = "All").
@@ -1321,19 +1326,16 @@ pub const AppState = struct {
         };
         defer self.gpa.free(models_root);
 
-        if (self.dl_active) |a| self.gpa.free(a);
-        self.dl_active = self.gpa.dupe(u8, repo.name()) catch null;
-        if (self.dl_active_file) |a| self.gpa.free(a);
-        self.dl_active_file = null;
         self.dl_filepick_open.set(false);
         // For split models (FLUX/Wan), also pull the cross-repo VAE/encoder into
-        // the same folder so the model is runnable on arrival.
-        self.downloader.download(models_root, repo.id, list.items, repo.kind, manifest.sidecarsFor(repo.id));
+        // the same folder so the model is runnable on arrival. The downloader
+        // tracks each model as its own job, so this can run alongside others.
+        self.downloader.download(repo.name(), models_root, repo.id, list.items, repo.kind, manifest.sidecarsFor(repo.id));
     }
 
-    /// Cancel the in-flight download (if any).
-    pub fn dlCancel(self: *AppState) void {
-        self.downloader.job.requestCancel();
+    /// Cancel one in-flight download by its job id.
+    pub fn dlCancel(self: *AppState, job_id: u64) void {
+        self.downloader.cancelJob(job_id);
     }
 
     /// Drain downloader events: results/files replace their buffers, progress is
@@ -1366,25 +1368,35 @@ pub const AppState = struct {
                 self.clearDlFiles();
                 self.dl_files = f;
             },
-            .file => |name| {
-                if (self.dl_active_file) |a| self.gpa.free(a);
-                self.dl_active_file = name; // take ownership
+            .file => |fe| {
+                // Route the new current-file name to its job (UI thread owns it).
+                if (self.downloader.jobById(fe.job)) |j| {
+                    if (j.cur_file) |a| self.gpa.free(a);
+                    j.cur_file = fe.name; // take ownership
+                } else self.gpa.free(fe.name); // job already reaped
             },
-            .progress => {}, // read live from downloader atomics in the view
-            .done => |path| {
-                self.logf("download: saved into {s}", .{path});
-                if (self.dl_active) |repo|
-                    self.alertOk("Download complete", "{s} downloaded successfully.", .{repo})
+            .progress => {}, // read live from each job's atomics in the view
+            .done => |de| {
+                self.logf("download: saved into {s}", .{de.folder});
+                if (self.downloader.jobById(de.job)) |j|
+                    self.alertOk("Download complete", "{s} downloaded successfully.", .{j.name})
                 else
                     self.alertOk("Download complete", "Model downloaded successfully.", .{});
-                self.clearDlActive();
-                self.gpa.free(path);
+                self.gpa.free(de.folder);
+                self.downloader.finishJob(de.job);
                 self.rescanModels();
+            },
+            .job_err => |je| {
+                self.alert(je.msg);
+                self.gpa.free(je.msg);
+                self.downloader.finishJob(je.job);
+            },
+            .canceled => |id| {
+                self.downloader.finishJob(id);
             },
             .err => |e| {
                 self.alert(e);
                 self.gpa.free(e);
-                self.clearDlActive();
             },
         };
     }

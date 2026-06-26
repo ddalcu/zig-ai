@@ -89,6 +89,32 @@ fn sidebar(st: *AppState) zigui.View {
 
     rows.append(fa, zigui.Spacer()) catch {};
 
+    // Compute indicator: memory (VRAM / unified / RAM) on top, then which ggml
+    // backend is actually in use. Hidden until the device registry has loaded.
+    const ai = st.acceleratorInfo();
+    if (ai.ok) {
+        const giB: f64 = 1024.0 * 1024.0 * 1024.0;
+        const mem_kind = if (!ai.is_gpu) "RAM" else if (ai.unified) "Unified" else "VRAM";
+        const mem_text = std.fmt.allocPrint(fa, "{s} {d:.1} / {d:.1} GB", .{
+            mem_kind,
+            @as(f64, @floatFromInt(ai.mem_used)) / giB,
+            @as(f64, @floatFromInt(ai.mem_total)) / giB,
+        }) catch "";
+        rows.append(fa, zigui.HStack(.{
+            zigui.Icon(.hard_drive, 14, th.colors.tertiary_label),
+            zigui.Text(mem_text).font(.caption2).foreground(th.colors.tertiary_label),
+            zigui.Spacer(),
+        }).spacing(7).frameMaxWidth().paddingInsets(.{ .top = 4, .leading = 10, .bottom = 0, .trailing = 8 })) catch {};
+
+        const accel_text = std.fmt.allocPrint(fa, "Running on {s}", .{ai.label}) catch "";
+        const accel_col = if (ai.is_gpu) w.green() else th.colors.tertiary_label;
+        rows.append(fa, zigui.HStack(.{
+            zigui.Icon(.zap, 14, accel_col),
+            zigui.Text(accel_text).font(.caption2).foreground(th.colors.tertiary_label),
+            zigui.Spacer(),
+        }).spacing(7).frameMaxWidth().paddingInsets(.{ .top = 2, .leading = 10, .bottom = 0, .trailing = 8 })) catch {};
+    }
+
     // Trust footer: a quiet, persistent reminder that nothing leaves the device.
     rows.append(fa, zigui.HStack(.{
         zigui.Icon(.shield_check, 14, w.green()),
