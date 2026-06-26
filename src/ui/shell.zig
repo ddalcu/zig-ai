@@ -196,7 +196,7 @@ fn onDismissAlert(st: *AppState) void {
 fn alertCard(st: *AppState) zigui.View {
     const th = w.t();
     return zigui.VStack(.{
-        zigui.Text("Something went wrong").font(.headline).frameMaxWidth(),
+        zigui.Text(st.alert_title).font(.headline).frameMaxWidth(),
         zigui.WrappedText(st.alertText())
             .font(.callout)
             .foreground(th.colors.secondary_label)

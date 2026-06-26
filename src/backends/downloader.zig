@@ -116,6 +116,10 @@ pub const Backend = struct {
     /// "File i of N" position within the current multi-file download.
     file_index: std.atomic.Value(u32) = .init(0),
     file_count: std.atomic.Value(u32) = .init(0),
+    /// Consecutive retry attempt for the current file (0 = streaming normally,
+    /// >0 = reconnecting after a dropped/failed connection). Drives the UI's
+    /// "Reconnecting… (n/N)" status. See `downloadOne`.
+    retry_attempt: std.atomic.Value(u32) = .init(0),
 
     /// Bumped on every search so a still-running background size-enrichment pass
     /// (from an earlier search) stops as soon as a newer search starts.
@@ -509,6 +513,7 @@ pub const Backend = struct {
             self.gpa.free(repo_id);
             for (set) |f| self.gpa.free(f.path);
             self.gpa.free(set);
+            self.retry_attempt.store(0, .release);
             self.job.endJob();
         }
         const net = self.ensureNet() orelse {
@@ -516,7 +521,8 @@ pub const Backend = struct {
             return;
         };
         self.runAll(net, models_root, repo_id, set, kind, sidecars) catch |e| {
-            if (e == error.Canceled) return;
+            // Aborted = the retry loop already reported a detailed failure.
+            if (e == error.Canceled or e == error.Aborted) return;
             self.emitErr("download failed: {s}", .{@errorName(e)});
         };
     }
@@ -560,6 +566,7 @@ pub const Backend = struct {
             self.events.push(.{ .file = gpa.dupe(u8, shown) catch return error.OutOfMemory });
             const written = self.downloadOne(net, dir, sc.repo, sc.file, sc.dest, base_done) catch |e| {
                 if (e == error.Canceled) return e;
+                if (e == error.Aborted) continue; // already reported; sidecars are optional
                 // A missing/renamed sidecar shouldn't abort the whole model.
                 self.emitErr("sidecar {s} failed: {s}", .{ sc.label, @errorName(e) });
                 continue;
@@ -576,6 +583,12 @@ pub const Backend = struct {
     /// Download a single file into `dir` (saved as `dest_name`, or the file's
     /// basename), from `repo_id`, reporting overall progress as `base_done +
     /// <bytes of this file>`. Returns this file's total size.
+    /// Max *consecutive* reconnect attempts that download nothing before a file is
+    /// declared failed. Because the counter resets whenever an attempt makes
+    /// progress, a download survives an unlimited number of dropped connections
+    /// (HuggingFace's specialty) as long as each reconnect transfers some bytes.
+    pub const max_stalls: u32 = 20;
+
     fn downloadOne(self: *Backend, net: *Net, dir: []const u8, repo_id: []const u8, file: []const u8, dest_name: ?[]const u8, base_done: u64) !u64 {
         const gpa = self.gpa;
         const io = net.io();
@@ -592,7 +605,44 @@ pub const Backend = struct {
             return sz;
         } else |_| {}
 
-        // Resume support: if a .partial already exists, request the remainder.
+        // Reconnect-and-resume loop. On a transient failure we sleep (exponential
+        // backoff) and retry, resuming from the .partial. `error.Aborted` means a
+        // failure was already surfaced to the user via `emitErr`.
+        self.retry_attempt.store(0, .release);
+        var stalls: u32 = 0;
+        while (true) {
+            const have_before = partialSize(io, partial);
+            const written = self.downloadAttempt(net, dest, partial, repo_id, file, base_done) catch |e| {
+                if (e == error.Canceled) return e;
+                if (e == error.NotAvailable) {
+                    self.emitErr("download failed: {s} is not available on HuggingFace", .{std.fs.path.basename(file)});
+                    return error.Aborted;
+                }
+                // Retryable (dropped connection, 5xx, range reset, read error…).
+                if (partialSize(io, partial) > have_before) stalls = 0 else stalls += 1;
+                if (stalls >= max_stalls) {
+                    self.emitErr("download failed after {d} retries: {s}", .{ max_stalls, @errorName(e) });
+                    return error.Aborted;
+                }
+                self.retry_attempt.store(stalls, .release);
+                self.events.push(.progress); // refresh the "Reconnecting…" status
+                if (self.sleepOrCancel(io, backoffMs(stalls))) return error.Canceled;
+                continue;
+            };
+            self.retry_attempt.store(0, .release);
+            return written;
+        }
+    }
+
+    /// A single download attempt: open/resume the .partial, GET (with a Range
+    /// header when resuming), stream to disk, and rename into place. Returns the
+    /// file's total size, or a (mostly retryable) error. `error.NotAvailable` =
+    /// permanent (4xx); everything else the caller may retry.
+    fn downloadAttempt(self: *Backend, net: *Net, dest: []const u8, partial: []const u8, repo_id: []const u8, file: []const u8, base_done: u64) !u64 {
+        const gpa = self.gpa;
+        const io = net.io();
+
+        // Resume: if a .partial already exists, request the remainder.
         var have: u64 = 0;
         if (Io.Dir.openFileAbsolute(io, partial, .{})) |existing| {
             if (existing.stat(io)) |s| have = s.size else |_| {}
@@ -616,9 +666,24 @@ pub const Backend = struct {
 
         var redirect_buf: [8 * 1024]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
+        const status = response.head.status;
 
-        // 206 => server honored Range (append); anything else => start over.
-        const resumed = response.head.status == .partial_content and have > 0;
+        // Requested range is past EOF (stale/oversized .partial) → reset and retry
+        // from scratch on the next attempt.
+        if (status == .range_not_satisfiable) {
+            if (Io.Dir.createFileAbsolute(io, partial, .{ .truncate = true })) |f| f.close(io) else |_| {}
+            return error.RangeReset;
+        }
+        if (status != .ok and status != .partial_content) {
+            const code = @intFromEnum(status);
+            if (code >= 400 and code < 500) return error.NotAvailable; // 404/401/403 — won't fix
+            return error.ServerError; // 5xx etc. — transient
+        }
+        // Connection (re)established — clear any "Reconnecting…" status.
+        self.retry_attempt.store(0, .release);
+
+        // 206 => server honored Range (append); 200 => full file (start over).
+        const resumed = status == .partial_content and have > 0;
         const start_at: u64 = if (resumed) have else 0;
 
         var out_file = if (resumed)
@@ -644,7 +709,10 @@ pub const Backend = struct {
                 fw.interface.flush() catch {};
                 return error.Canceled;
             }
-            const n = reader.readSliceShort(&chunk) catch return error.ReadFailed;
+            const n = reader.readSliceShort(&chunk) catch {
+                fw.interface.flush() catch {}; // keep what we got so the retry resumes
+                return error.ReadFailed;
+            };
             if (n == 0) break; // EOF
             try fw.interface.writeAll(chunk[0..n]);
             done += n;
@@ -664,6 +732,35 @@ pub const Backend = struct {
 
         try Io.Dir.renameAbsolute(partial, dest, io);
         return done;
+    }
+
+    /// Current size of a .partial file (0 if absent) — used to tell whether a
+    /// failed attempt made any progress.
+    fn partialSize(io: Io, path: []const u8) u64 {
+        if (Io.Dir.openFileAbsolute(io, path, .{})) |f| {
+            defer f.close(io);
+            if (f.stat(io)) |s| return s.size else |_| {}
+        } else |_| {}
+        return 0;
+    }
+
+    /// Exponential backoff (1s, 2s, 4s, 8s, 16s, then capped at 30s) for the
+    /// `n`-th consecutive stalled attempt (n ≥ 1).
+    fn backoffMs(n: u32) u64 {
+        const shift: u6 = @intCast(@min(n -| 1, 5));
+        return @min(@as(u64, 30_000), @as(u64, 1000) << shift);
+    }
+
+    /// Sleep `ms`, but wake early (returning true) if the download is canceled.
+    fn sleepOrCancel(self: *Backend, io: Io, ms: u64) bool {
+        var slept: u64 = 0;
+        while (slept < ms) {
+            if (self.job.cancelRequested()) return true;
+            const step = @min(ms - slept, 200);
+            Io.sleep(io, Io.Duration.fromMilliseconds(step), .awake) catch return true;
+            slept += step;
+        }
+        return false;
     }
 
     // --- shared HTTP ----------------------------------------------------------

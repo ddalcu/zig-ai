@@ -996,6 +996,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .title = "zig-ai",
         .width = 1000,
         .height = 700,
+        .min_width = 850,
+        .min_height = 450,
         .theme = theme,
         .hide_on_close = true,
     }, shell.body);
