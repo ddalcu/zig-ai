@@ -15,10 +15,17 @@
 #     bundled next to the binary; the rpath is $ORIGIN). Windows: the upstream
 #     prebuilt VC devel package (SDL3.dll zipped next to the exe).
 #
-# The Windows job builds the C++ deps with `zig cc` (mingw/libc++ toolchain)
-# so the archives match the ABI of the zig-linked exe. It is marked
-# continue-on-error: it has not been exercised yet and llama.cpp/MSVC-isms may
-# need follow-up; mac/linux releases shouldn't be held hostage to it.
+# Linux/Windows build the C++ deps as SHARED libraries with ggml's dynamic
+# backend loader (GGML_BACKEND_DL): the CPU, Vulkan and CUDA backends become
+# loadable modules bundled next to the binary, and ggml picks the best available
+# device at runtime (CUDA → Vulkan → CPU). This lets the CUDA backend be compiled
+# with the native toolchain (nvcc + gcc/MSVC — nvcc cannot use zig cc as host),
+# while the zig exe links everything over ggml's C ABI. The deps therefore build
+# with the native compiler (gcc on Linux, MSVC on Windows), NOT `zig cc`.
+#
+# NOTE: GitHub-hosted runners have no NVIDIA GPU, so the CUDA backend is BUILT and
+# packaged here but cannot be functionally run-tested in CI (same limitation as
+# upstream llama.cpp). Verify CUDA execution on real NVIDIA hardware.
 
 name: release
 
@@ -122,6 +129,19 @@ jobs:
             libdbus-1-dev libudev-dev libusb-1.0-0-dev \
             libvulkan-dev glslc glslang-tools spirv-headers
 
+      - name: Install CUDA Toolkit
+        # The ggml CUDA backend is built with nvcc (host compiler = gcc, which
+        # build-essential provides). It ships as a loadable ggml backend module
+        # bundled next to the binary; ggml loads it at runtime when an NVIDIA GPU
+        # is present and falls back to Vulkan/CPU otherwise. Bump the version as
+        # newer CUDA toolkits land. (Hosted runners have no GPU, so this BUILDS
+        # but cannot run-test CUDA — like upstream llama.cpp's CUDA CI.)
+        uses: Jimver/cuda-toolkit@v0.2.24
+        id: cuda-toolkit
+        with:
+          cuda: '13.2.0'
+          linux-local-args: '["--toolkit"]'
+
       - name: Cache SDL3
         id: cache-sdl3
         uses: actions/cache@v4
@@ -141,24 +161,29 @@ jobs:
           cmake --install sdl3-build
 
       - name: Build
-        # The C++ deps compile with zig cc (libc++) so they ABI-match the
-        # zig-linked exe — linking g++/libstdc++ archives with zig's lld
-        # leaves std::__cxx11 symbols undefined. SDL3 above is plain C, so
-        # building it with gcc is fine.
-        env:
-          CC: zig cc
-          CXX: zig c++
-        run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix
+        # Shared-library build with dynamic ggml backends (GGML_BACKEND_DL): the
+        # deps compile natively with gcc (which is also nvcc's CUDA host) into
+        # .so libraries the zig exe links over their C ABI. The CPU/Vulkan/CUDA
+        # backends are separate modules ggml loads at runtime. -Dcuda builds the
+        # CUDA module; -Dcuda-arch is left at ggml's portable default (the runner
+        # has no GPU, so "native" is not an option here).
+        run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix -Dcuda=true
 
       - name: Package
         run: |
           mkdir dist
           cp zig-out/bin/zig-ai dist/
-          # Bundle the shared libs; the binary's rpath is $ORIGIN. The Vulkan
-          # loader comes along so machines without libvulkan1 still start
-          # (no ICD just means ggml sees zero Vulkan devices → CPU).
+          # Bundle every shared lib next to the binary (rpath is $ORIGIN): the AI
+          # libs + ggml core + the ggml backend modules (cpu/vulkan/cuda). ggml
+          # scans this dir at runtime and picks the best device, falling back
+          # CUDA → Vulkan → CPU when a GPU/driver/ICD is absent.
+          cp -P build-deps/lib/*.so* dist/
           cp sdl3-prefix/lib/libSDL3.so.0* dist/
           cp /usr/lib/x86_64-linux-gnu/libvulkan.so.1* dist/
+          # CUDA runtime so the CUDA module loads without the full toolkit present.
+          for lib in libcudart libcublas libcublasLt; do
+            find "${CUDA_PATH:-/usr/local/cuda}/lib64" -name "${lib}.so*" -exec cp -P {} dist/ \; 2>/dev/null || true
+          done
           tar -czf zig-ai-linux-x86_64.tar.gz -C dist .
 
       - uses: actions/upload-artifact@v4
@@ -194,11 +219,34 @@ jobs:
       - name: Install ninja
         run: choco install -y ninja
 
+      - name: Set up MSVC (cl.exe) environment
+        # The C++ deps now build natively with MSVC (and nvcc for the CUDA module
+        # — nvcc's host compiler on Windows must be MSVC, not zig cc). This sets
+        # cl.exe / INCLUDE / LIB for every later step, so the CMake invoked by
+        # `zig build` finds them. The zig exe itself is still built by zig
+        # (windows-gnu) and links the resulting DLLs over their C ABI.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1.5.5
         with:
           cache: true
           stripdown: true
+
+      - name: Install CUDA Toolkit
+        # Builds the ggml CUDA backend module (nvcc + MSVC host). Bundled next to
+        # the exe and loaded at runtime when an NVIDIA GPU is present; otherwise
+        # ggml falls back to Vulkan/CPU. Hosted runners have no GPU, so this
+        # BUILDS but cannot run-test CUDA. Heavy: multi-arch CUDA compiles are
+        # slow — bump the version as newer toolkits land.
+        uses: Jimver/cuda-toolkit@v0.2.24
+        id: cuda-toolkit
+        with:
+          cuda: '13.2.0'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+          method: 'network'
 
       - name: Fetch SDL3 (prebuilt mingw devel package)
         shell: bash
@@ -215,29 +263,18 @@ jobs:
           # gnu import libraries fine regardless of extension).
           cp sdl3-prefix/lib/libSDL3.dll.a sdl3-prefix/lib/SDL3.lib
 
-      - name: Set up zig cc as the CMake toolchain
-        shell: bash
-        # The C++ deps must share an ABI/stdlib with the zig-linked exe
-        # (windows-gnu + LLVM libc++), so CMake compiles them with zig cc
-        # rather than MSVC. CMake parses flags out of the CC/CXX env vars and
-        # zig is on PATH, so no wrapper scripts (whose POSIX-style paths CMake
-        # on Windows can't resolve) are needed. build.zig's cmake step
-        # inherits CC/CXX.
-        run: |
-          echo 'CC=zig cc -target x86_64-windows-gnu'   >> "$GITHUB_ENV"
-          echo 'CXX=zig c++ -target x86_64-windows-gnu' >> "$GITHUB_ENV"
-
       - name: Build C++ deps
         shell: bash
-        # Separate step so the archive names CMake actually produced are
-        # visible in the log (Windows naming has differed from lib<x>.a).
+        # Separate step so CMake's configure (MSVC + CUDA detection) and the DLL
+        # names it produced are visible in the log. CC/CXX are NOT set: CMake
+        # auto-detects cl.exe from the MSVC environment above and nvcc for CUDA.
         run: |
-          zig build deps
-          ls -la build-deps/lib
+          zig build deps -Dtarget=x86_64-windows-gnu "-Dvulkan-prefix=$VULKAN_SDK" -Dcuda=true -Dcuda-arch="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
+          ls -la build-deps/bin
 
       - name: Build
         shell: bash
-        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix "-Dvulkan-prefix=$VULKAN_SDK"
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix "-Dvulkan-prefix=$VULKAN_SDK" -Dcuda=true -Dcuda-arch="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
 
       - name: Package
         shell: bash
@@ -245,6 +282,18 @@ jobs:
           mkdir dist
           cp zig-out/bin/zig-ai.exe dist/
           cp sdl3-prefix/bin/SDL3.dll dist/
+          # All AI shared libs + ggml core + the ggml backend modules
+          # (ggml-cpu/-vulkan/-cuda DLLs). ggml loads the modules from the exe's
+          # directory at runtime and selects the best device (CUDA→Vulkan→CPU).
+          cp build-deps/bin/*.dll dist/
+          # CUDA runtime redistributables so the CUDA module loads without the
+          # full toolkit installed on the user's machine. CUDA 12.x keeps these
+          # in bin/, CUDA 13.x in bin/x64/ — search both.
+          for dir in "$CUDA_PATH/bin" "$CUDA_PATH/bin/x64"; do
+            for pat in cudart64_ cublas64_ cublasLt64_; do
+              find "$dir" -name "${pat}*.dll" -exec cp {} dist/ \; 2>/dev/null || true
+            done
+          done
           cd dist && 7z a ../zig-ai-windows-x86_64.zip .
 
       - uses: actions/upload-artifact@v4

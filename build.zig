@@ -31,7 +31,19 @@ pub fn build(b: *std.Build) void {
         (target.result.os.tag != .macos);
     // Where to find the Vulkan import library at link time (Windows: the SDK
     // root, providing Lib/vulkan-1.lib). Linux finds libvulkan via system paths.
+    // Only used by the macOS-style static link; in the shared/DL build the
+    // ggml-vulkan module links Vulkan itself and the SDK is found via the
+    // VULKAN_SDK env at CMake-configure time.
     const vulkan_prefix = b.option([]const u8, "vulkan-prefix", "Vulkan SDK prefix (Windows link)");
+
+    // ggml CUDA backend (NVIDIA). Linux/Windows only, and only in the shared/DL
+    // build: it is compiled with the native toolchain (nvcc + MSVC/gcc — nvcc
+    // cannot use zig cc as host) and loaded at runtime as a ggml backend module,
+    // so it never links into the exe. Requires the CUDA Toolkit at build time.
+    const use_cuda = b.option(bool, "cuda", "Build the ggml CUDA backend (Linux/Windows; needs CUDA Toolkit + native MSVC/gcc)") orelse false;
+    // CMAKE_CUDA_ARCHITECTURES override (e.g. "native", "120", "75;80;86;89;90").
+    // Default: ggml's own portable architecture list.
+    const cuda_arch = b.option([]const u8, "cuda-arch", "CMAKE_CUDA_ARCHITECTURES (default: ggml's portable list)");
 
     // ---- zigui core module (mirror zigui/build.zig) -----------------------
     const zigui = b.addModule("zigui", .{
@@ -111,9 +123,13 @@ pub fn build(b: *std.Build) void {
     // Build the AI backends (llama/sd/qwen3-tts) from the deps/ submodules via
     // CMake, then link the resulting archives. cmake_build is the step the exe
     // must wait on before linking.
+    // macOS links the static archives straight into the exe (one shared libc++);
+    // Linux/Windows build shared libraries with dynamic ggml backends and link
+    // them over their C ABI (see CMakeLists.txt and linkAiBackends).
+    const shared = target.result.os.tag != .macos;
     const cmake_build: ?*std.Build.Step = if (link_llama or link_sd or link_tts) blk: {
-        const step = cmakeBuildStep(b, use_vulkan);
-        linkAiBackends(b, exe_mod, target, link_llama, link_sd, link_tts, use_vulkan, vulkan_prefix);
+        const step = cmakeBuildStep(b, target, use_vulkan, use_cuda, cuda_arch, shared);
+        linkAiBackends(b, exe_mod, target, link_llama, link_sd, link_tts, use_vulkan, vulkan_prefix, shared);
         break :blk step;
     } else null;
 
@@ -131,12 +147,32 @@ pub fn build(b: *std.Build) void {
 /// qwen3-tts.cpp) via our top-level CMakeLists.txt. Returns the build step the
 /// final link must depend on. CMake/Ninja are incremental, so re-running this on
 /// every `zig build` is cheap when the C++ sources are unchanged.
-fn cmakeBuildStep(b: *std.Build, use_vulkan: bool) *std.Build.Step {
+fn cmakeBuildStep(b: *std.Build, target: std.Build.ResolvedTarget, use_vulkan: bool, use_cuda: bool, cuda_arch: ?[]const u8, shared: bool) *std.Build.Step {
     const configure = b.addSystemCommand(&.{
         "cmake", "-S", ".", "-B", "build-deps", "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
-        if (use_vulkan) "-DGGML_VULKAN=ON" else "-DGGML_VULKAN=OFF",
     });
+    // macOS: static archives linked into the exe. Linux/Windows: shared libraries
+    // with dynamically-loaded ggml backends (GGML_BACKEND_DL) so the CUDA backend
+    // can be built by the native toolchain and loaded at runtime.
+    if (shared) {
+        configure.addArgs(&.{ "-DBUILD_SHARED_LIBS=ON", "-DGGML_BACKEND_DL=ON" });
+    } else {
+        configure.addArg("-DBUILD_SHARED_LIBS=OFF");
+    }
+    // On Windows the deps build with MSVC (cl.exe) — it's nvcc's required host
+    // compiler and the only toolchain that produces clean export DLLs here. Pin
+    // it explicitly so a stray CC/CXX env var (e.g. a leftover `zig cc` from the
+    // old static workflow) can't steer CMake to the wrong compiler, which would
+    // drag in MinGW's windres for resource compilation and break the CUDA link.
+    if (shared and target.result.os.tag == .windows) {
+        configure.addArgs(&.{ "-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl" });
+    }
+    configure.addArg(if (use_vulkan) "-DGGML_VULKAN=ON" else "-DGGML_VULKAN=OFF");
+    if (use_cuda) {
+        configure.addArg("-DGGML_CUDA=ON");
+        if (cuda_arch) |arch| configure.addArg(b.fmt("-DCMAKE_CUDA_ARCHITECTURES={s}", .{arch}));
+    }
     const compile = b.addSystemCommand(&.{ "cmake", "--build", "build-deps", "-j" });
     compile.step.dependOn(&configure.step);
 
@@ -156,11 +192,16 @@ fn cmakeBuildStep(b: *std.Build, use_vulkan: bool) *std.Build.Step {
 /// macOS (AppleClang) and Windows (zig cc in CI) both use LLVM libc++, which
 /// `link_libcpp` provides; Linux CMake builds with g++ against libstdc++, so
 /// there we link the system libstdc++ instead.
-fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget, llama: bool, sd: bool, tts: bool, vulkan: bool, vulkan_prefix: ?[]const u8) void {
+fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget, llama: bool, sd: bool, tts: bool, vulkan: bool, vulkan_prefix: ?[]const u8, shared: bool) void {
     m.addIncludePath(b.path("deps/llama.cpp/include")); // llama.h
     m.addIncludePath(b.path("deps/llama.cpp/ggml/include")); // ggml*.h
     m.addIncludePath(b.path("deps/stable-diffusion.cpp/include")); // stable-diffusion.h
     m.addIncludePath(b.path("deps/qwen3-tts.cpp/src")); // qwen3tts_c_api.h
+
+    if (shared) {
+        linkAiBackendsShared(m, target, llama, sd, tts);
+        return;
+    }
 
     const L = "build-deps/lib/";
     if (llama) m.addObjectFile(.{ .cwd_relative = L ++ "libllama.a" });
@@ -199,6 +240,36 @@ fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.Resolve
         };
         for (frameworks) |f| m.linkFramework(f, .{});
     }
+}
+
+/// Link the AI backends as SHARED libraries (Linux/Windows). The exe links only
+/// the C-ABI surface — llama, stable-diffusion, qwen3_tts and core ggml/ggml-base
+/// — over their import libraries. The compute backends (ggml-cpu, ggml-vulkan,
+/// ggml-cuda) are GGML_BACKEND_DL modules NOT linked here: ggml loads them at
+/// runtime from the executable's directory and selects the best available
+/// (CUDA → Vulkan → CPU). This C-ABI boundary is what lets the CUDA module be
+/// compiled with a different toolchain (nvcc + MSVC/gcc) than the zig exe.
+///
+/// The shared libraries are placed next to the binary at package time; the rpath
+/// ($ORIGIN on Linux, implicit same-dir search on Windows) finds them at runtime.
+fn linkAiBackendsShared(m: *std.Build.Module, target: std.Build.ResolvedTarget, llama: bool, sd: bool, tts: bool) void {
+    m.addLibraryPath(.{ .cwd_relative = "build-deps/lib" });
+    if (llama) m.linkSystemLibrary("llama", .{});
+    if (sd) m.linkSystemLibrary("stable-diffusion", .{});
+    if (tts) m.linkSystemLibrary("qwen3_tts", .{});
+    // Core ggml: `ggml` (registry/umbrella) plus `ggml-base` (which exports the
+    // gguf_* / ggml_* symbols the exe itself references via gguf.h / ggml.h).
+    m.linkSystemLibrary("ggml", .{});
+    m.linkSystemLibrary("ggml-base", .{});
+
+    // Find the co-located shared libs at runtime. On Windows the loader already
+    // searches the executable's own directory, so no rpath is needed there.
+    if (target.result.os.tag == .linux) m.addRPath(.{ .cwd_relative = "$ORIGIN" });
+
+    // The exe still compiles its own C++ (vendored Jinja); give it a C++ runtime.
+    // The deps' C++ runtime lives inside their shared libs and never crosses the
+    // C-ABI boundary, so it need not match the exe's.
+    m.link_libcpp = true;
 }
 
 /// Wire up SDL3 headers/libs. `-Dsdl3=<prefix>` points at an install tree with
