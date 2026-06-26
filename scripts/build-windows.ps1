@@ -11,6 +11,7 @@
       * Zig 0.16.0 .................. direct download from ziglang.org -> .tools\zig
       * CMake ...................... winget  Kitware.CMake
       * Ninja ...................... winget  Ninja-build.Ninja
+      * ccache (optional) .......... winget  Ccache.Ccache   (caches C/C++/nvcc; -NoCcache to skip)
       * VS 2022 Build Tools (MSVC) . winget  Microsoft.VisualStudio.2022.BuildTools
       * Vulkan SDK (GPU build) ..... winget  KhronosGroup.VulkanSDK   (skip with -NoVulkan)
       * CUDA Toolkit (NVIDIA GPU) .. winget  Nvidia.CUDA              (skip with -NoCuda)
@@ -69,6 +70,7 @@
 param(
     [switch]$NoVulkan,
     [switch]$NoCuda,
+    [switch]$NoCcache,
     [string]$CudaArch = 'native',
     [switch]$CheckOnly,
     [switch]$SkipBuild,
@@ -88,6 +90,7 @@ $ZIGUI_REPO  = 'https://github.com/ddalcu/zigui.git'
 $TARGET      = 'x86_64-windows-gnu'
 $Vulkan      = -not $NoVulkan
 $Cuda        = -not $NoCuda
+$Ccache      = -not $NoCcache
 
 # ---- locate the repo root (this script lives in <repo>\scripts\) -------------
 $RepoRoot = $PSScriptRoot
@@ -296,6 +299,29 @@ if (-not $NinjaExe) {
 if ($NinjaExe) { Ok "ninja -> $NinjaExe"; Record 'ninja' 'present' $NinjaExe }
 
 # =============================================================================
+# 3b. ccache (optional) — caches compiled objects so rebuilds are near-instant.
+# ggml enables it automatically (GGML_CCACHE=ON) when ccache is on PATH at
+# configure time, and applies it to C, C++ AND nvcc/CUDA compiles, which is the
+# slowest part of a clean build. Skipped with -NoCcache; never fatal if absent.
+# =============================================================================
+$CcacheExe = $null
+if ($Ccache) {
+    Section 'ccache (optional)'
+    $ccacheGlobs = @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\ccache.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ccache.Ccache_*\ccache-*\ccache.exe"
+    )
+    $CcacheExe = Find-Exe 'ccache' $ccacheGlobs
+    if (-not $CcacheExe) {
+        if ($CheckOnly) { Miss 'ccache (winget Ccache.Ccache) — optional, speeds up rebuilds'; Record 'ccache' 'optional' 'winget Ccache.Ccache' }
+        else { Install-Winget 'Ccache.Ccache'; $CcacheExe = Find-Exe 'ccache' $ccacheGlobs }
+    }
+    if ($CcacheExe) { Ok "ccache -> $CcacheExe"; Record 'ccache' 'present' $CcacheExe }
+    else { Record 'ccache' 'optional' 'not installed (rebuilds slower)' }
+}
+else { Record 'ccache' 'skipped' '-NoCcache' }
+
+# =============================================================================
 # 4. MSVC (VS 2022 Build Tools) — the C++ deps and the CUDA host compile use it
 # =============================================================================
 Section 'MSVC (VS 2022 Build Tools)'
@@ -475,9 +501,18 @@ Section "Build (zig build, $Optimize, $gpu)"
 Import-VcVars $VcVars
 
 $buildDirs = @($ZigDir, (Split-Path -Parent $CMakeExe), (Split-Path -Parent $NinjaExe))
-if ($Vulkan) { $buildDirs += (Join-Path $VulkanSdk 'Bin') }
-if ($Cuda)   { $buildDirs += (Join-Path $CudaPath 'bin') }
+if ($Vulkan)    { $buildDirs += (Join-Path $VulkanSdk 'Bin') }
+if ($Cuda)      { $buildDirs += (Join-Path $CudaPath 'bin') }
+if ($CcacheExe) { $buildDirs += (Split-Path -Parent $CcacheExe) }
 $env:Path = (($buildDirs | Where-Object { $_ }) -join ';') + ';' + $env:Path
+
+# ggml caches its ccache probe in CMakeCache. If build-deps was configured
+# before ccache existed, a one-time clean reconfigure is needed to engage it.
+$cacheFile = Join-Path $RepoRoot 'build-deps\CMakeCache.txt'
+if ($CcacheExe -and (Test-Path $cacheFile) -and -not (Select-String -Path $cacheFile -Pattern 'GGML_CCACHE_FOUND.*[\\/]ccache' -Quiet)) {
+    Info 'ccache is installed but build-deps was configured without it.'
+    Info 'Delete build-deps once to engage caching:  Remove-Item -Recurse -Force build-deps'
+}
 
 # NOTE: deliberately NOT setting CC/CXX to `zig cc`. The deps build natively with
 # MSVC (and nvcc for CUDA); the zig exe links the resulting shared libraries over
