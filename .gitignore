@@ -3,3 +3,10 @@ zig-out/
 .DS_Store
 build-deps/
 zig-ai-b4-gui
+
+# scripts/build-windows.ps1 setup artifacts
+.tools/
+zigui-src/
+sdl3-prefix/
+sdl3.zip
+SDL3-3.4.10/

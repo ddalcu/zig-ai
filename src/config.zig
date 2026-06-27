@@ -103,14 +103,23 @@ pub fn ensureDir(gpa: std.mem.Allocator, dir: []const u8) void {
 /// outside the unreserved set (so spaces in "Application Support" don't break the
 /// OS handler). Keeps `/` intact. Caller owns the result.
 pub fn fileUrlAlloc(gpa: std.mem.Allocator, path: []const u8) ?[:0]u8 {
+    const is_windows = builtin.os.tag == .windows;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     out.appendSlice(gpa, "file://") catch return null;
+    // Windows paths are "C:\…": the file URI needs a leading slash before the
+    // drive ("file:///C:/…") and forward slashes, or the shell can't open it.
+    if (is_windows) out.append(gpa, '/') catch return null;
     const hex = "0123456789ABCDEF";
-    for (path) |ch| {
+    for (path) |ch0| {
+        // Normalize backslashes to forward slashes on Windows.
+        const ch: u8 = if (is_windows and ch0 == '\\') '/' else ch0;
         const keep = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or
             (ch >= '0' and ch <= '9') or ch == '-' or ch == '_' or ch == '.' or
-            ch == '~' or ch == '/';
+            ch == '~' or ch == '/' or
+            // Keep the drive-letter colon literal (C:/…) — encoding it to %3A
+            // breaks the file URI for some Windows handlers.
+            (is_windows and ch == ':');
         if (keep) {
             out.append(gpa, ch) catch return null;
         } else {

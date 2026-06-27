@@ -1,4 +1,10 @@
-# zig-ai
+<p align="center">
+  <img src="assets/icon.png" alt="zig-ai" width="180" />
+</p>
+
+<h1 align="center">zig-ai</h1>
+
+<p align="center"><b>Local AI, in one native app — chat, image, video & voice, all on-device.</b></p>
 
 A cross-platform desktop app that runs local AI models **in-process** — chat
 (llama.cpp), image generation (stable-diffusion.cpp), video (Wan / LTX via

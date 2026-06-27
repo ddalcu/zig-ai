@@ -82,6 +82,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zigui_app", .module = app_mod },
         },
     });
+    // The app icon, embedded so the exe is self-contained (decoded at startup
+    // and set via SDL_SetWindowIcon — see main.zig / zigui Config.icon).
+    exe_mod.addAnonymousImport("app_icon", .{ .root_source_file = b.path("assets/icon.png") });
+    // Windows exe resource icon (Explorer / desktop / taskbar). Compiled by
+    // Zig's own resource compiler (resinator) — independent of the MinGW windres
+    // the CUDA-deps note avoids. Ignored on non-COFF (non-Windows) targets.
+    exe_mod.addWin32ResourceFile(.{ .file = b.path("assets/icon.rc") });
     // The exe itself talks to SDL (audio subsystem for TTS playback).
     linkSdl3(exe_mod, target, sdl3_prefix);
     const build_opts = b.addOptions();
@@ -94,6 +101,9 @@ pub fn build(b: *std.Build) void {
     // straight into the exe. minih264 (CC0) + minimp4 (public domain) + a pure-C
     // stb_image_write copy all live self-contained in deps/codecs.
     exe_mod.addIncludePath(b.path("deps/codecs"));
+    // stb_image.h (decode) for the video init-frame loader — reuse the copy
+    // vendored in the stable-diffusion.cpp submodule rather than duplicating it.
+    exe_mod.addIncludePath(b.path("deps/stable-diffusion.cpp/thirdparty"));
     exe_mod.addCSourceFiles(.{
         .files = &.{
             "src/codecs/codecs.c",

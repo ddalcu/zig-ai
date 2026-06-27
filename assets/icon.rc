@@ -1,0 +1,5 @@
+// Windows executable icon (shown in Explorer, the desktop and the taskbar).
+// Compiled by Zig's built-in resource compiler (resinator) via build.zig's
+// addWin32ResourceFile — no MinGW windres dependency. Icon id 1 is the lowest,
+// so Windows uses it as the application's display icon.
+1 ICON "icon.ico"

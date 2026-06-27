@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const st_mod = @import("state.zig");
+const models = @import("models.zig");
 const AppState = st_mod.AppState;
 
 const app_dir = "zig-ai";
@@ -33,13 +34,18 @@ const Persisted = struct {
     chat_top_p: f32 = 0.95,
     chat_top_k: i64 = 40,
     chat_n_ctx: i64 = 16384,
-    chat_model: []const u8 = "", // path of the last-used chat model (re-selected on startup)
+    // Paths of the last-used model per task, re-selected on startup so each
+    // screen stays sticky across runs.
+    chat_model: []const u8 = "",
+    image_model: []const u8 = "",
+    video_model: []const u8 = "",
+    tts_model: []const u8 = "",
     model_dirs: []const []const u8 = &.{},
 };
 
 /// A cheap fingerprint of the persisted fields, used to skip writes when nothing
 /// changed. The last value written is remembered so `maybeSave` can compare.
-const Sig = struct { theme: i64, family: i64, threads: i64, gpu: bool, agent: bool, temp: f32, top_p: f32, top_k: i64, nctx: i64, model: u64, dirs: u64 };
+const Sig = struct { theme: i64, family: i64, threads: i64, gpu: bool, agent: bool, temp: f32, top_p: f32, top_k: i64, nctx: i64, model: u64, image: u64, video: u64, tts: u64, dirs: u64 };
 var last_sig: ?Sig = null;
 
 fn hashDirs(dirs: []const []const u8) u64 {
@@ -62,14 +68,31 @@ fn signature(st: *AppState) Sig {
         .top_p = st.chat_top_p.get(),
         .top_k = st.chat_top_k.get(),
         .nctx = st.chat_n_ctx.get(),
-        .model = std.hash.Wyhash.hash(0, chatModelPath(st)),
+        .model = std.hash.Wyhash.hash(0, modelPath(st, .text)),
+        .image = std.hash.Wyhash.hash(0, modelPath(st, .image)),
+        .video = std.hash.Wyhash.hash(0, modelPath(st, .video)),
+        .tts = std.hash.Wyhash.hash(0, modelPath(st, .tts)),
         .dirs = hashDirs(st.model_dirs.items),
     };
 }
 
-/// Path of the currently-selected chat model (empty if none).
-fn chatModelPath(st: *AppState) []const u8 {
-    const m = st.selectedModel(st.sel_llm.get()) orelse return "";
+/// Stash a persisted model path into a `startup_*` slot (owned copy), replacing
+/// any prior value. Empty paths leave the slot null.
+fn stash(st: *AppState, slot: *?[]u8, path: []const u8) void {
+    if (path.len == 0) return;
+    if (slot.*) |old| st.gpa.free(old);
+    slot.* = st.gpa.dupe(u8, path) catch null;
+}
+
+/// Path of the currently-selected model for `kind` (empty if none).
+fn modelPath(st: *AppState, kind: models.Kind) []const u8 {
+    const sel = switch (kind) {
+        .text => st.sel_llm.get(),
+        .image => st.sel_sd.get(),
+        .video => st.sel_video.get(),
+        .tts => st.sel_tts.get(),
+    };
+    const m = st.selectedModel(sel) orelse return "";
     return m.path;
 }
 
@@ -120,12 +143,12 @@ pub fn load(st: *AppState) void {
     st.chat_top_p.set(p.chat_top_p);
     st.chat_top_k.set(p.chat_top_k);
     st.chat_n_ctx.set(p.chat_n_ctx);
-    // Stash the last chat model's path; `resolveStartupChatModel` selects it once
-    // the model list is scanned (load runs before the scan).
-    if (p.chat_model.len > 0) {
-        if (st.startup_chat_model) |old| gpa.free(old);
-        st.startup_chat_model = gpa.dupe(u8, p.chat_model) catch null;
-    }
+    // Stash each task's last model path; `rescanModels` re-selects them (by path)
+    // once the model list is scanned (load runs before the first scan).
+    stash(st, &st.startup_chat_model, p.chat_model);
+    stash(st, &st.startup_sd_model, p.image_model);
+    stash(st, &st.startup_video_model, p.video_model);
+    stash(st, &st.startup_tts_model, p.tts_model);
 
     // Replace the added-folder list with the persisted one (owned copies).
     for (st.model_dirs.items) |d| gpa.free(d);
@@ -175,7 +198,10 @@ fn save(st: *AppState) void {
         .chat_top_p = st.chat_top_p.get(),
         .chat_top_k = st.chat_top_k.get(),
         .chat_n_ctx = st.chat_n_ctx.get(),
-        .chat_model = chatModelPath(st),
+        .chat_model = modelPath(st, .text),
+        .image_model = modelPath(st, .image),
+        .video_model = modelPath(st, .video),
+        .tts_model = modelPath(st, .tts),
         .model_dirs = st.model_dirs.items,
     };
     const bytes = std.json.Stringify.valueAlloc(gpa, persisted, .{ .whitespace = .indent_2 }) catch return;

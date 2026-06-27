@@ -16,6 +16,7 @@ const widgets = @import("ui/widgets.zig");
 const api = @import("server/api.zig");
 const launcher = @import("launcher.zig");
 const log_capture = @import("log_capture.zig");
+const codecs = @import("codecs/codecs.zig");
 
 // libc stdio for the headless BMP writer (--screenshot), matching the llm-chat
 // example's dev tooling.
@@ -42,7 +43,9 @@ const csock = if (builtin.os.tag == .windows) struct {} else @cImport({
 
 // --- system tray -------------------------------------------------------------
 
-const tray_icon_px: u32 = 22;
+const tray_icon_px: u32 = 32; // a touch larger so the logo reads clearly
+/// The app logo, reused for the tray icon (downscaled per `statusIconRGBA`).
+const tray_logo_png = @embedFile("app_icon");
 var g_tray: ?app.Tray = null;
 var g_app: ?*AppState = null;
 
@@ -62,16 +65,85 @@ var g_e_hideclose: ?app.TrayEntry = null;
 const TrayStatus = enum { idle, loaded, busy };
 var g_last_status: ?TrayStatus = null;
 
+/// The tray icon: the app logo downscaled to `size`, with a small status dot in
+/// the bottom-right corner (`color` = idle/loaded/busy) so state is visible at a
+/// glance. Returns owned RGBA8 (`size*size*4`); the caller frees it (the tray
+/// copies the surface).
 fn statusIconRGBA(gpa: std.mem.Allocator, size: u32, color: zigui.Color) ![]u8 {
-    var canvas = zigui.Canvas.init(gpa);
-    defer canvas.deinit();
-    const s: f32 = @floatFromInt(size);
-    try canvas.fillCircle(.{ .x = s / 2, .y = s / 2 }, s / 2 - 2, color);
-    var fb = try zigui.Framebuffer.init(gpa, size, size);
-    defer fb.deinit();
-    fb.clear(zigui.Color.transparent);
-    try zigui.raster.render(gpa, &fb, canvas.commands.items);
-    return fb.toRgba8Alloc(gpa);
+    const out = try gpa.alloc(u8, size * size * 4);
+    errdefer gpa.free(out);
+    @memset(out, 0); // transparent background
+
+    // Box-average downscale the embedded logo into `out`.
+    if (codecs.loadImageMem(tray_logo_png)) |dec| {
+        defer codecs.freeImage(dec);
+        const sw: u32 = dec.width;
+        const sh: u32 = dec.height;
+        var y: u32 = 0;
+        while (y < size) : (y += 1) {
+            const sy0 = y * sh / size;
+            const sy1 = @max(sy0 + 1, (y + 1) * sh / size);
+            var x: u32 = 0;
+            while (x < size) : (x += 1) {
+                const sx0 = x * sw / size;
+                const sx1 = @max(sx0 + 1, (x + 1) * sw / size);
+                var r: u32 = 0;
+                var g: u32 = 0;
+                var b: u32 = 0;
+                var al: u32 = 0;
+                var n: u32 = 0;
+                var sy = sy0;
+                while (sy < sy1) : (sy += 1) {
+                    var sx = sx0;
+                    while (sx < sx1) : (sx += 1) {
+                        const si = (sy * sw + sx) * 4;
+                        r += dec.pixels[si];
+                        g += dec.pixels[si + 1];
+                        b += dec.pixels[si + 2];
+                        al += dec.pixels[si + 3];
+                        n += 1;
+                    }
+                }
+                const di = (y * size + x) * 4;
+                out[di] = @intCast(r / n);
+                out[di + 1] = @intCast(g / n);
+                out[di + 2] = @intCast(b / n);
+                out[di + 3] = @intCast(al / n);
+            }
+        }
+    }
+
+    // Status dot (bottom-right), with a thin dark ring for contrast.
+    const fs: f32 = @floatFromInt(size);
+    const cr = fs * 0.24;
+    const cx = fs - cr - 1;
+    const cy = fs - cr - 1;
+    const dr: u8 = @intFromFloat(@round(std.math.clamp(color.r, 0, 1) * 255));
+    const dg: u8 = @intFromFloat(@round(std.math.clamp(color.g, 0, 1) * 255));
+    const db: u8 = @intFromFloat(@round(std.math.clamp(color.b, 0, 1) * 255));
+    var py: u32 = 0;
+    while (py < size) : (py += 1) {
+        var px: u32 = 0;
+        while (px < size) : (px += 1) {
+            const ddx = @as(f32, @floatFromInt(px)) + 0.5 - cx;
+            const ddy = @as(f32, @floatFromInt(py)) + 0.5 - cy;
+            const dist = @sqrt(ddx * ddx + ddy * ddy);
+            if (dist > cr) continue;
+            const di = (py * size + px) * 4;
+            if (dist >= cr - 1.3) {
+                out[di] = 20;
+                out[di + 1] = 22;
+                out[di + 2] = 26;
+                out[di + 3] = 255;
+            } else {
+                out[di] = dr;
+                out[di + 1] = dg;
+                out[di + 2] = db;
+                out[di + 3] = 255;
+            }
+        }
+    }
+    return out;
 }
 
 fn gotoChat(st: *AppState) void {
@@ -702,39 +774,59 @@ fn runVideoSmoke(
     prompt: []const u8,
     out: []const u8,
     params: video.Params,
+    runs: u32,
+    init_path: ?[]const u8,
 ) !void {
     var be = video.Backend.init(gpa);
     defer be.deinit();
     try be.start();
-    try be.submit(spec, prompt, "", params);
+
+    // Optional image-to-video start frame (tests the VAE-encoder path + reload).
+    var decoded: ?codecs.DecodedImage = null;
+    defer if (decoded) |d| codecs.freeImage(d);
+    var init_img: ?video.InitImage = null;
+    if (init_path) |p| {
+        const pz = try gpa.dupeZ(u8, p);
+        defer gpa.free(pz);
+        if (codecs.loadImage(pz)) |img| {
+            decoded = img;
+            init_img = .{ .width = img.width, .height = img.height, .rgba = img.pixels[0 .. @as(usize, img.width) * @as(usize, img.height) * 4] };
+            std.debug.print("init image: {d}x{d}\n", .{ img.width, img.height });
+        } else std.debug.print("could not decode init image: {s}\n", .{p});
+    }
 
     const prefix = out[0 .. std.mem.lastIndexOfScalar(u8, out, '.') orelse out.len];
-    var done = false;
-    while (!done) {
-        var tmp: std.ArrayList(video.Event) = .empty;
-        defer tmp.deinit(gpa);
-        be.events.drain(&tmp);
-        for (tmp.items) |ev| switch (ev) {
-            .progress => |p| std.debug.print("\rstep {d}/{d}   ", .{ p.step, p.total }),
-            .frames => |f| {
-                std.debug.print("\n[{d} frames @ {d} fps]\n", .{ f.images.len, f.fps });
-                for (f.images, 0..) |img, i| {
-                    var buf: [512]u8 = undefined;
-                    const path = std.fmt.bufPrint(&buf, "{s}-{d:0>3}.ppm", .{ prefix, i }) catch continue;
-                    writePpm(path, img);
-                    std.debug.print("  wrote {s} ({d}x{d})\n", .{ path, img.width, img.height });
-                    gpa.free(@constCast(img.pixels));
-                }
-                gpa.free(f.images);
-                done = true;
-            },
-            .err => |e| {
-                std.debug.print("[error: {s}]\n", .{e});
-                gpa.free(e);
-                done = true;
-            },
-        };
-        if (!done and tmp.items.len == 0) app.c.SDL_Delay(50);
+    var run: u32 = 0;
+    while (run < runs) : (run += 1) {
+        std.debug.print("=== run {d}/{d} ===\n", .{ run + 1, runs });
+        try be.submit(spec, prompt, "", params, init_img);
+        var done = false;
+        while (!done) {
+            var tmp: std.ArrayList(video.Event) = .empty;
+            defer tmp.deinit(gpa);
+            be.events.drain(&tmp);
+            for (tmp.items) |ev| switch (ev) {
+                .progress => |p| std.debug.print("\rstep {d}/{d}   ", .{ p.step, p.total }),
+                .frames => |f| {
+                    std.debug.print("\n[{d} frames @ {d} fps]\n", .{ f.images.len, f.fps });
+                    for (f.images, 0..) |img, i| {
+                        var buf: [512]u8 = undefined;
+                        const path = std.fmt.bufPrint(&buf, "{s}-r{d}-{d:0>3}.ppm", .{ prefix, run, i }) catch continue;
+                        writePpm(path, img);
+                        gpa.free(@constCast(img.pixels));
+                    }
+                    std.debug.print("  wrote {d} frames ({d}x{d})\n", .{ f.images.len, f.images[0].width, f.images[0].height });
+                    gpa.free(f.images);
+                    done = true;
+                },
+                .err => |e| {
+                    std.debug.print("[error: {s}]\n", .{e});
+                    gpa.free(e);
+                    done = true;
+                },
+            };
+            if (!done and tmp.items.len == 0) app.c.SDL_Delay(50);
+        }
     }
 }
 
@@ -767,6 +859,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var llm_path: ?[]const u8 = null;
     var audio_vae_path: ?[]const u8 = null;
     var connectors_path: ?[]const u8 = null;
+    var vruns: u32 = 1;
+    var init_image_path: ?[]const u8 = null;
     var vparams: video.Params = .{ .steps = 8, .width = 256, .height = 256, .frames = 5, .n_threads = 10 };
     var out_path: []const u8 = "/tmp/zigai_out.ppm";
     var model_path: ?[]const u8 = null;
@@ -820,6 +914,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (arg_it.next()) |p| vparams.frames = std.fmt.parseInt(i32, p, 10) catch vparams.frames;
         } else if (std.mem.eql(u8, a, "--vsteps")) {
             if (arg_it.next()) |p| vparams.steps = std.fmt.parseInt(i32, p, 10) catch vparams.steps;
+        } else if (std.mem.eql(u8, a, "--vruns")) {
+            if (arg_it.next()) |p| vruns = std.fmt.parseInt(u32, p, 10) catch vruns;
+        } else if (std.mem.eql(u8, a, "--init-image")) {
+            if (arg_it.next()) |p| init_image_path = p;
         } else if (std.mem.eql(u8, a, "--out")) {
             if (arg_it.next()) |p| out_path = p;
         } else if (std.mem.eql(u8, a, "--model")) {
@@ -919,7 +1017,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .llm = llm_path,
             .audio_vae = audio_vae_path,
             .connectors = connectors_path,
-        }, prompt, out_path, vparams);
+        }, prompt, out_path, vparams, vruns, init_image_path);
         return;
     }
 
@@ -1025,6 +1123,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     app.setFrameHook(&refreshTray);
     defer if (g_tray) |*tr| tr.deinit();
 
+    // Decode the embedded app icon (set on the window via SDL_SetWindowIcon).
+    // SDL copies the surface inside `run`, so freeing after `run` returns is fine.
+    const app_icon_png = @embedFile("app_icon");
+    const icon = codecs.loadImageMem(app_icon_png);
+    defer if (icon) |im| codecs.freeImage(im);
+    const window_icon: ?app.WindowIcon = if (icon) |im| .{
+        .rgba = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
+        .w = @intCast(im.width),
+        .h = @intCast(im.height),
+    } else null;
+
     try app.run(gpa, AppState, &st, .{
         .title = "zig-ai",
         .width = 1000,
@@ -1032,6 +1141,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .min_width = 850,
         .min_height = 450,
         .theme = theme,
+        .icon = window_icon,
         .hide_on_close = true,
         // Supersample 2× so text is crisp on a standard 100%/96-dpi monitor
         // (capped internally to ≤2× total device pixels on HiDPI displays).

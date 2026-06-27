@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const zigui = @import("zigui");
+const app = @import("zigui_app");
 const w = @import("widgets.zig");
 const mb = @import("model_browser.zig");
 const st_mod = @import("../state.zig");
@@ -16,14 +17,11 @@ fn onSearch(st: *AppState) void {
     st.dlSearch();
 }
 
-fn onCancel(st: *AppState) void {
-    st.dlCancel();
-}
-
-// --- per-row / per-file contexts --------------------------------------------
+// --- per-row / per-file / per-job contexts ----------------------------------
 
 const RowCtx = struct { st: *AppState, index: usize };
 const FileCtx = struct { st: *AppState, path: []const u8 };
+const JobCtx = struct { st: *AppState, id: u64 };
 
 fn rowCtx(st: *AppState, index: usize) *RowCtx {
     const cx = st.frame_arena.allocator().create(RowCtx) catch unreachable;
@@ -37,6 +35,12 @@ fn fileCtx(st: *AppState, path: []const u8) *FileCtx {
     return cx;
 }
 
+fn jobCtx(st: *AppState, id: u64) *JobCtx {
+    const cx = st.frame_arena.allocator().create(JobCtx) catch unreachable;
+    cx.* = .{ .st = st, .id = id };
+    return cx;
+}
+
 fn onOpenFiles(p: ?*anyopaque) void {
     const cx: *RowCtx = @ptrCast(@alignCast(p.?));
     cx.st.dlOpenFiles(cx.index);
@@ -45,6 +49,24 @@ fn onOpenFiles(p: ?*anyopaque) void {
 fn onPickFile(p: ?*anyopaque) void {
     const cx: *FileCtx = @ptrCast(@alignCast(p.?));
     cx.st.dlStart(cx.path);
+}
+
+fn onCancelJob(p: ?*anyopaque) void {
+    const cx: *JobCtx = @ptrCast(@alignCast(p.?));
+    cx.st.dlCancel(cx.id);
+}
+
+const RecCtx = struct { st: *AppState, index: usize };
+
+fn recCtx(st: *AppState, index: usize) *RecCtx {
+    const cx = st.frame_arena.allocator().create(RecCtx) catch unreachable;
+    cx.* = .{ .st = st, .index = index };
+    return cx;
+}
+
+fn onGetRecommended(p: ?*anyopaque) void {
+    const cx: *RecCtx = @ptrCast(@alignCast(p.?));
+    cx.st.dlGetRecommended(cx.index);
 }
 
 // --- quant popover ----------------------------------------------------------
@@ -209,41 +231,52 @@ fn numCell(s: []const u8) zigui.View {
     return zigui.Text(s).font(.caption).foreground(w.t().colors.secondary_label);
 }
 
-/// True when a repo already lives in one of the scanned model folders (app dir or
+/// How far along a repo's local install is. `incomplete` = the folder exists but
+/// an earlier download was interrupted (a leftover `.partial` or a missing
+/// curated sidecar — e.g. a FLUX VAE), so the user can resume it.
+const Install = enum { none, incomplete, installed };
+
+/// Whether a repo already lives in one of the scanned model folders (app dir or
 /// any Settings folder). Downloads land in `…/<author>/<name>/`, so we match a
 /// scanned model whose folder is `<name>` inside an `<author>` folder — robust to
-/// path separators and the kind subfolder.
-fn isDownloaded(st: *AppState, repo: st_mod.HFRepo) bool {
+/// path separators and the kind subfolder. Completeness is read from
+/// `ModelInfo.complete` (computed at scan time, not per frame).
+fn installState(st: *AppState, repo: st_mod.HFRepo) Install {
     const name = repo.name();
     const author = repo.author();
-    if (name.len == 0 or author.len == 0) return false;
+    if (name.len == 0 or author.len == 0) return .none;
     for (st.model_list.items.items) |m| {
         if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(m.dir), name)) continue;
         const parent = std.fs.path.dirname(m.dir) orelse continue;
-        if (std.ascii.eqlIgnoreCase(std.fs.path.basename(parent), author)) return true;
+        if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(parent), author)) continue;
+        return if (m.complete) .installed else .incomplete;
     }
-    return false;
+    return .none;
 }
 
-/// The trailing action for a row: an "Installed" badge when the repo is already
-/// downloaded, otherwise the "Get" button (with the quant popover on the active
-/// row). `orig` is the index into `dl_results` (stable across sorting).
-fn getCell(st: *AppState, orig: usize, installed: bool) zigui.View {
+/// The trailing action for a row: an "Installed" badge when the repo is fully
+/// downloaded; a "Resume" button when an earlier download was interrupted; the
+/// "Get" button otherwise (with the quant popover on the active row). Resume and
+/// Get share the same flow — re-running the download skips finished files,
+/// resumes any `.partial`, and fetches missing sidecars. `orig` is the index
+/// into `dl_results` (stable across sorting).
+fn getCell(st: *AppState, orig: usize, state: Install) zigui.View {
     const th = w.t();
-    if (installed) {
+    if (state == .installed) {
         return zigui.HStack(.{
             zigui.Icon(.check, 13, w.green()),
             zigui.Text("Installed").font(.callout).foreground(th.colors.secondary_label),
         }).spacing(4)
             .paddingInsets(.{ .top = 5, .leading = 9, .bottom = 5, .trailing = 9 });
     }
+    const is_resume = state == .incomplete;
     const dl_btn = zigui.HStack(.{
-        zigui.Icon(.download, 13, th.colors.on_accent),
-        zigui.Text("Get").font(.callout).foreground(th.colors.on_accent),
+        zigui.Icon(if (is_resume) .refresh else .download, 13, th.colors.on_accent),
+        zigui.Text(if (is_resume) "Resume" else "Get").font(.callout).foreground(th.colors.on_accent),
         zigui.Icon(.chevron_down, 12, th.colors.on_accent),
     }).spacing(4)
         .paddingInsets(.{ .top = 5, .leading = 9, .bottom = 5, .trailing = 7 })
-        .background(th.colors.accent)
+        .background(if (is_resume) w.orange() else th.colors.accent)
         .cornerRadius(7)
         .onTap(.{ .ctx = rowCtx(st, orig), .func = onOpenFiles });
     if (st.dl_filepick_idx == @as(i64, @intCast(orig)))
@@ -279,7 +312,7 @@ fn resultsTable(st: *AppState) zigui.View {
         cells[COL_DOWNLOADS] = numCell(countText(repo.downloads));
         cells[COL_LIKES] = numCell(countText(repo.likes));
         cells[COL_UPDATED] = numCell(dateText(repo.last_modified));
-        cells[COL_GET] = getCell(st, orig, isDownloaded(st, repo));
+        cells[COL_GET] = getCell(st, orig, installState(st, repo));
         rows[p] = cells;
     }
 
@@ -297,11 +330,13 @@ fn resultsTable(st: *AppState) zigui.View {
 
 // --- active download --------------------------------------------------------
 
-fn activeRow(st: *AppState) zigui.View {
+/// A progress card for one in-flight download (`job`). Several render stacked
+/// when multiple models download at once.
+fn jobCard(st: *AppState, job: *downloader.DlJob) zigui.View {
     const th = w.t();
-    const done = st.downloader.bytes_done.load(.acquire);
-    const total = st.downloader.bytes_total.load(.acquire);
-    const speed = st.downloader.speed_bps.load(.acquire);
+    const done = job.bytes_done.load(.acquire);
+    const total = job.bytes_total.load(.acquire);
+    const speed = job.speed_bps.load(.acquire);
     const frac: f32 = if (total > 0)
         std.math.clamp(@as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(total)), 0, 1)
     else
@@ -311,16 +346,15 @@ fn activeRow(st: *AppState) zigui.View {
     var dbuf: [32]u8 = undefined;
     var tbuf: [32]u8 = undefined;
     var spbuf: [32]u8 = undefined;
-    const fidx = st.downloader.file_index.load(.acquire);
-    const fcount = st.downloader.file_count.load(.acquire);
-    const retry = st.downloader.retry_attempt.load(.acquire);
-    const model = st.dl_active orelse "Downloading…";
+    const fidx = job.file_index.load(.acquire);
+    const fcount = job.file_count.load(.acquire);
+    const retry = job.retry_attempt.load(.acquire);
 
     // Current file line: "umt5-xxl.gguf (2 of 4)", or a reconnect status while
     // retrying a dropped connection.
     const file_line = if (retry > 0)
         w.fmt("Reconnecting… ({d}/{d})", .{ retry, downloader.Backend.max_stalls })
-    else if (st.dl_active_file) |f|
+    else if (job.cur_file) |f|
         if (fcount > 1) w.fmt("{s}  ({d} of {d})", .{ f, fidx, fcount }) else w.fmt("{s}", .{f})
     else
         "Preparing…";
@@ -329,9 +363,9 @@ fn activeRow(st: *AppState) zigui.View {
     return w.card(zigui.VStack(.{
         zigui.HStack(.{
             zigui.Icon(.download, 16, th.colors.accent),
-            zigui.Text(model).font(.subheadline),
+            zigui.Text(job.name).font(.subheadline),
             zigui.Spacer(),
-            w.tintedButton(.close, "Cancel", th.colors.destructive, zigui.actionCtx(AppState, st, onCancel)),
+            w.tintedButton(.close, "Cancel", th.colors.destructive, .{ .ctx = jobCtx(st, job.id), .func = onCancelJob }),
         }).spacing(8).frameMaxWidth(),
         zigui.Text(file_line).font(.caption2).foreground(file_color).frameMaxWidth(),
         zigui.ProgressView(frac).frameMaxWidth(),
@@ -342,6 +376,98 @@ fn activeRow(st: *AppState) zigui.View {
             models.humanSize(&spbuf, speed),
         })).font(.caption).foreground(th.colors.secondary_label),
     }).spacing(8));
+}
+
+/// Centered animated indicator shown while a HuggingFace search is in flight.
+fn searchingState() zigui.View {
+    const th = w.t();
+    return zigui.VStack(.{
+        zigui.Spacer(),
+        zigui.LoadingDots(app.c.SDL_GetTicks(), th.colors.secondary_label).frameMaxWidth(),
+        zigui.Text("Searching HuggingFace…")
+            .font(.callout).foreground(th.colors.secondary_label).frameMaxWidth(),
+        zigui.Spacer(),
+    }).spacing(14).frameMaxWidth().frameMaxHeight();
+}
+
+// --- recommended bundles ----------------------------------------------------
+
+/// Install state of a curated bundle, matched by its primary repo ("author/name")
+/// against the scanned models (same folder convention as `installState`).
+fn recInstalled(st: *AppState, repo: []const u8) Install {
+    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return .none;
+    const author = repo[0..slash];
+    const name = repo[slash + 1 ..];
+    for (st.model_list.items.items) |m| {
+        if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(m.dir), name)) continue;
+        const parent = std.fs.path.dirname(m.dir) orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(parent), author)) continue;
+        return if (m.complete) .installed else .incomplete;
+    }
+    return .none;
+}
+
+/// One row for a curated bundle: icon · title/note · Get|Resume|Installed.
+fn recommendedRow(st: *AppState, index: usize) zigui.View {
+    const th = w.t();
+    const rec = manifest.recommended[index];
+    const state = recInstalled(st, rec.repo);
+
+    const action: zigui.View = switch (state) {
+        .installed => zigui.HStack(.{
+            zigui.Icon(.check, 13, w.green()),
+            zigui.Text("Installed").font(.callout).foreground(th.colors.secondary_label),
+        }).spacing(4).paddingInsets(.{ .top = 5, .leading = 9, .bottom = 5, .trailing = 9 }),
+        else => zigui.HStack(.{
+            zigui.Icon(if (state == .incomplete) .refresh else .download, 13, th.colors.on_accent),
+            zigui.Text(if (state == .incomplete) "Resume" else "Get")
+                .font(.callout).foreground(th.colors.on_accent),
+        }).spacing(4)
+            .paddingInsets(.{ .top = 5, .leading = 10, .bottom = 5, .trailing = 10 })
+            .background(if (state == .incomplete) w.orange() else th.colors.accent)
+            .cornerRadius(7)
+            .onTap(.{ .ctx = recCtx(st, index), .func = onGetRecommended }),
+    };
+
+    return zigui.HStack(.{
+        mb.kindBadge(rec.kind),
+        zigui.VStack(.{
+            zigui.Text(rec.title).font(.subheadline),
+            zigui.Text(rec.note).font(.caption2).foreground(th.colors.tertiary_label).truncated(),
+        }).spacing(2).alignment(zigui.Alignment.leading),
+        zigui.Spacer(),
+        action,
+    }).spacing(10).frameMaxWidth();
+}
+
+/// The "Recommended" card listing curated bundles for the picked category (all
+/// categories when "All"). Returns null when none match, so callers can skip it.
+fn recommendedSection(st: *AppState) ?zigui.View {
+    const fa = st.frame_arena.allocator();
+    const th = w.t();
+    const cat: ?models.Kind = switch (st.dl_category.get()) {
+        1 => .text,
+        2 => .image,
+        3 => .video,
+        4 => .tts,
+        else => null,
+    };
+
+    var rows: std.ArrayList(zigui.View) = .empty;
+    var n: usize = 0;
+    for (manifest.recommended, 0..) |rec, i| {
+        if (cat) |k| if (rec.kind != k) continue;
+        if (n > 0) rows.append(fa, zigui.Divider()) catch {};
+        rows.append(fa, recommendedRow(st, i)) catch {};
+        n += 1;
+    }
+    if (n == 0) return null;
+
+    var col: std.ArrayList(zigui.View) = .empty;
+    col.append(fa, zigui.Text("Recommended")
+        .font(.caption).foreground(th.colors.secondary_label).frameMaxWidth()) catch {};
+    col.appendSlice(fa, rows.items) catch {};
+    return w.card(zigui.VStack(col.items).spacing(8).frameMaxWidth());
 }
 
 // --- view -------------------------------------------------------------------
@@ -369,8 +495,11 @@ pub fn view(st: *AppState) zigui.View {
         w.primaryButton(.search, "Search", zigui.actionCtx(AppState, st, onSearch)),
     }).spacing(8).frameMaxWidth();
 
-    // Results: an empty-state prompt, or the sortable table.
-    const results = if (st.dl_results.items.len == 0)
+    // Results: a loading indicator while searching, then an empty-state prompt
+    // or the sortable table.
+    const results = if (st.dl_searching)
+        searchingState()
+    else if (st.dl_results.items.len == 0)
         w.emptyState(
             .download,
             "Search HuggingFace for GGUF models",
@@ -381,7 +510,28 @@ pub fn view(st: *AppState) zigui.View {
 
     var col: std.ArrayList(zigui.View) = .empty;
     col.append(fa, search_bar) catch {};
-    if (st.downloader.isBusy() or st.dl_active != null) col.append(fa, activeRow(st)) catch {};
+    // One progress card per in-flight download (parallel downloads each get one),
+    // inside a bounded scroll area: a handful show at once and the rest scroll,
+    // so many concurrent downloads never push the results table off-screen.
+    const njobs = st.downloader.jobs.items.len;
+    if (njobs > 0) {
+        var cards: std.ArrayList(zigui.View) = .empty;
+        for (st.downloader.jobs.items) |job| cards.append(fa, jobCard(st, job)) catch {};
+        const stack = zigui.VStack(cards.items).spacing(12).frameMaxWidth();
+        // Show up to `max_cards` cards before scrolling; size the viewport to fit
+        // exactly that many so a single download doesn't reserve dead space.
+        const max_cards: usize = 3;
+        const card_h: f32 = 112; // approx. height of one progress card
+        const gap: f32 = 12;
+        const shown: f32 = @floatFromInt(@min(njobs, max_cards));
+        const h = shown * card_h + (shown - 1) * gap;
+        col.append(fa, zigui.ScrollViewState(&st.dl_jobs_scroll, stack).frameMaxWidth().frameHeight(h)) catch {};
+    }
+    // Curated one-tap bundles (e.g. LTX) for the picked category, unless a search
+    // is in progress.
+    if (!st.dl_searching) {
+        if (recommendedSection(st)) |rec| col.append(fa, rec) catch {};
+    }
     col.append(fa, w.card(results).frameMaxHeight()) catch {};
 
     return zigui.VStack(col.items).spacing(12).frameMaxWidth().frameMaxHeight();

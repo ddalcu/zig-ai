@@ -17,6 +17,20 @@ const gguf = @cImport({
     @cInclude("gguf.h");
 });
 
+const builtin = @import("builtin");
+
+// On Windows (mingw) the default `struct stat` / `stat()` carry a 32-bit
+// `st_size`, so `stat()` fails with EOVERFLOW on files ≥2 GB — which silently
+// hid multi-GB GGUF models from the scan. The `_stat64` variant has a 64-bit
+// size and works for any file. Elsewhere the plain `stat` is already 64-bit.
+const Stat = if (builtin.os.tag == .windows) c.struct__stat64 else c.struct_stat;
+
+/// Stat `path` into `out`. Returns false on error. 64-bit-size-safe everywhere.
+fn statPath(path: [*:0]const u8, out: *Stat) bool {
+    const rc = if (builtin.os.tag == .windows) c._stat64(path, out) else c.stat(path, out);
+    return rc == 0;
+}
+
 /// Read a model's training context length from GGUF metadata
 /// (`<arch>.context_length`) without loading tensors. Null if unavailable.
 pub fn readCtxCap(gpa: std.mem.Allocator, path: []const u8) ?u32 {
@@ -103,6 +117,11 @@ pub const ModelInfo = struct {
     size: u64,
     /// Which root this model was discovered under (defaults to non-owned).
     source: Source = .custom,
+    /// False when the model's folder still has an interrupted download — a
+    /// leftover `.partial` file or a missing curated sidecar. Computed after the
+    /// scan (see `AppState.rescanModels`); only meaningful for owned models.
+    /// Drives the Model Browser's "Resume" affordance instead of "Installed".
+    complete: bool = true,
 };
 
 pub const ModelList = struct {
@@ -161,6 +180,7 @@ pub fn classifyName(basename: []const u8) ?Kind {
         std.mem.indexOf(u8, lower, "text-encoder") != null or
         std.mem.indexOf(u8, lower, "text_encoder") != null or
         std.mem.indexOf(u8, lower, "encoder") != null or
+        std.mem.indexOf(u8, lower, "tokenizer") != null or // codec/audio tokenizer sidecar
         std.mem.indexOf(u8, lower, "clip_vision") != null or
         std.mem.indexOf(u8, lower, "clip-vision") != null) return null;
     if (std.mem.indexOf(u8, lower, "tts") != null) return .tts;
@@ -202,8 +222,8 @@ fn folderStatsDepth(gpa: std.mem.Allocator, root: []const u8, depth: usize, s: *
         defer gpa.free(full);
         const full_z = gpa.dupeZ(u8, full) catch continue;
         defer gpa.free(full_z);
-        var st: c.struct_stat = undefined;
-        if (c.stat(full_z.ptr, &st) != 0) continue;
+        var st: Stat = undefined;
+        if (!statPath(full_z.ptr, &st)) continue;
         if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
             folderStatsDepth(gpa, full, depth + 1, s);
         } else {
@@ -238,8 +258,8 @@ fn scanDirDepth(list: *ModelList, root: []const u8, depth: usize, source: Source
         };
         defer list.gpa.free(full_z);
 
-        var stat: c.struct_stat = undefined;
-        if (c.stat(full_z.ptr, &stat) != 0) {
+        var stat: Stat = undefined;
+        if (!statPath(full_z.ptr, &stat)) {
             list.gpa.free(full);
             continue;
         }
@@ -298,6 +318,44 @@ pub fn scanDefaults(list: *ModelList, home: ?[]const u8, extra: []const []const 
     for (extra) |d| scanDir(list, d, .custom);
 }
 
+/// True if `dir` (recursively) contains any `*.partial` file — the marker an
+/// in-progress/interrupted download leaves behind. Used to flag a model folder
+/// as an incomplete install.
+pub fn hasPartial(gpa: std.mem.Allocator, dir: []const u8) bool {
+    return hasPartialDepth(gpa, dir, 0);
+}
+
+fn hasPartialDepth(gpa: std.mem.Allocator, root: []const u8, depth: usize) bool {
+    if (depth > max_depth) return false;
+    const root_z = gpa.dupeZ(u8, root) catch return false;
+    defer gpa.free(root_z);
+    const dir = c.opendir(root_z.ptr) orelse return false;
+    defer _ = c.closedir(dir);
+    while (c.readdir(dir)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (std.mem.endsWith(u8, name, ".partial")) return true;
+        const full = std.fs.path.join(gpa, &.{ root, name }) catch continue;
+        defer gpa.free(full);
+        const full_z = gpa.dupeZ(u8, full) catch continue;
+        defer gpa.free(full_z);
+        var st: Stat = undefined;
+        if (!statPath(full_z.ptr, &st)) continue;
+        if ((st.st_mode & c.S_IFMT) == c.S_IFDIR and hasPartialDepth(gpa, full, depth + 1)) return true;
+    }
+    return false;
+}
+
+/// True if a file named `name` exists directly inside `dir`.
+pub fn fileExistsIn(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) bool {
+    const full = std.fs.path.join(gpa, &.{ dir, name }) catch return false;
+    defer gpa.free(full);
+    const full_z = gpa.dupeZ(u8, full) catch return false;
+    defer gpa.free(full_z);
+    var st: Stat = undefined;
+    return statPath(full_z.ptr, &st);
+}
+
 /// Recursively search `root` for the first file whose lowercased basename
 /// contains any of `needles` and ends with any of `exts`. Returns an owned path
 /// (caller frees) or null. Used to locate a Wan model's VAE / text-encoder
@@ -325,8 +383,8 @@ fn findSupportDepth(gpa: std.mem.Allocator, root: []const u8, needles: []const [
         };
         defer gpa.free(full_z);
 
-        var stat: c.struct_stat = undefined;
-        if (c.stat(full_z.ptr, &stat) != 0) {
+        var stat: Stat = undefined;
+        if (!statPath(full_z.ptr, &stat)) {
             gpa.free(full);
             continue;
         }

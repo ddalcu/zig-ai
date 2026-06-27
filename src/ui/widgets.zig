@@ -159,6 +159,19 @@ fn onTogglePicker(st: *AppState) void {
     st.model_picker_open.set(!st.model_picker_open.get());
 }
 
+const BrowseCtx = struct { st: *AppState, kind: models.Kind };
+
+fn browseCtx(st: *AppState, kind: models.Kind) *BrowseCtx {
+    const cx = st.frame_arena.allocator().create(BrowseCtx) catch unreachable;
+    cx.* = .{ .st = st, .kind = kind };
+    return cx;
+}
+
+fn onBrowse(p: ?*anyopaque) void {
+    const cx: *BrowseCtx = @ptrCast(@alignCast(p.?));
+    cx.st.browseDownloads(cx.kind);
+}
+
 fn selectionFor(st: *AppState, kind: models.Kind) i64 {
     return switch (kind) {
         .text => st.sel_llm.get(),
@@ -185,6 +198,24 @@ pub fn modelPicker(st: *AppState, kind: models.Kind) zigui.View {
     const fa = st.frame_arena.allocator();
     const sel = selectionFor(st, kind);
     const selected = st.selectedModel(sel);
+
+    // No models of this kind on disk: offer a one-tap path to download one
+    // instead of an empty picker. (When at least one exists it's auto-selected,
+    // so the pill below shows its name.)
+    var any = false;
+    for (st.model_list.items.items) |m| {
+        if (m.kind == kind) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return primaryButton(
+            .download,
+            fmt("Browse {s} models", .{kind.label()}),
+            .{ .ctx = browseCtx(st, kind), .func = onBrowse },
+        );
+    }
 
     const name = if (selected) |m| m.name else "Select model";
     const name_col = if (selected != null) th.colors.label else th.colors.secondary_label;
@@ -225,10 +256,6 @@ pub fn modelPicker(st: *AppState, kind: models.Kind) zigui.View {
             .onTap(.{ .ctx = pickCtx(st, i), .func = onPickModel });
         rows.append(fa, row) catch {};
         shown += 1;
-    }
-    if (shown == 0) {
-        rows.append(fa, zigui.Text("No models — use the Models › Download tab.")
-            .font(.caption).foreground(th.colors.secondary_label).padding(6)) catch {};
     }
 
     // The popover already paints a frosted panel (background, border, rounded

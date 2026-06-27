@@ -227,9 +227,13 @@ pub const AppState = struct {
     /// Selected chat model's training context cap (read from GGUF, cached by path).
     chat_ctx_cap: u32 = 32768,
     chat_ctx_cap_path: ?[]u8 = null,
-    /// The chat model path persisted from a previous run, resolved to `sel_llm`
-    /// after the first model scan (see `resolveStartupChatModel`).
+    /// Model paths persisted from a previous run, resolved to the matching
+    /// `sel_*` on the first model scan (see `rescanModels`). One per task so each
+    /// screen's selection is sticky across runs.
     startup_chat_model: ?[]u8 = null,
+    startup_sd_model: ?[]u8 = null,
+    startup_video_model: ?[]u8 = null,
+    startup_tts_model: ?[]u8 = null,
     /// Extra user-added scan directories (owned strings).
     model_dirs: std.ArrayList([]u8) = .empty,
     /// Selected model index into `model_list.items` (-1 = none) per task.
@@ -330,8 +334,16 @@ pub const AppState = struct {
 
     // --- video (Wan) ------------------------------------------------------
     vid_prompt: zigui.TextFieldState,
+    vid_negative: zigui.TextFieldState,
+    vid_neg_scroll: zigui.ScrollState = .{},
     vid_steps: zigui.State(f32),
+    vid_cfg: zigui.State(f32),
     vid_frames_n: zigui.State(i64),
+    /// Output size, split into two compact pickers (a single 5-way picker is too
+    /// wide for the panel): orientation 0=landscape/1=portrait/2=square and
+    /// quality 0=480p/1=720p. Combined by `videoSize`.
+    vid_orient: zigui.State(i64),
+    vid_quality: zigui.State(i64),
     vid_scroll: zigui.ScrollState = .{},
     /// Decoded frames of the last generation; cycled for playback in the view.
     vid_result: ?[]zigui.canvas.Image = null,
@@ -339,6 +351,11 @@ pub const AppState = struct {
     /// Frame currently shown; advanced each frame for simple playback.
     vid_play_idx: usize = 0,
     vid_play_tick: u32 = 0,
+    /// Optional starting frame for image-to-video (Wan TI2V), decoded to RGBA8
+    /// (owned by stb_image; freed via `codecs.freeImage`). `vid_image_pending`
+    /// guards collecting the file-dialog result in `pumpVideo`.
+    vid_init_image: ?codecs.DecodedImage = null,
+    vid_image_pending: bool = false,
     video: video.Backend,
 
     // --- audio / tts ------------------------------------------------------
@@ -391,6 +408,12 @@ pub const AppState = struct {
     /// Files of the repo whose quant popover was last opened (owned), or null.
     dl_files: ?downloader.Files = null,
     dl_scroll: zigui.ScrollState = .{},
+    /// Scroll offset for the stacked active-download progress cards (so many
+    /// parallel downloads scroll within a bounded area instead of clipping).
+    dl_jobs_scroll: zigui.ScrollState = .{},
+    /// True while a HuggingFace search is in flight (drives the loading
+    /// indicator); cleared when results or an error arrive.
+    dl_searching: bool = false,
     /// Which column the results table is sorted by (index = -1 keeps the HF API's
     /// own download-ranked order until the user clicks a header).
     dl_sort: zigui.State(zigui.SortColumn),
@@ -457,8 +480,12 @@ pub const AppState = struct {
             .img_advanced = zigui.State(bool).init(gpa, false),
             .sd = sd.Backend.init(gpa),
             .vid_prompt = zigui.TextFieldState.init(gpa),
-            .vid_steps = zigui.State(f32).init(gpa, 20),
-            .vid_frames_n = zigui.State(i64).init(gpa, 33),
+            .vid_negative = zigui.TextFieldState.init(gpa),
+            .vid_steps = zigui.State(f32).init(gpa, 30),
+            .vid_cfg = zigui.State(f32).init(gpa, 5.0),
+            .vid_frames_n = zigui.State(i64).init(gpa, 49),
+            .vid_orient = zigui.State(i64).init(gpa, 0),
+            .vid_quality = zigui.State(i64).init(gpa, 0),
             .video = video.Backend.init(gpa),
             .tts = tts.Backend.init(gpa),
             .tts_text = zigui.TextFieldState.init(gpa),
@@ -492,6 +519,9 @@ pub const AppState = struct {
         self.model_list.deinit();
         if (self.chat_ctx_cap_path) |p| self.gpa.free(p);
         if (self.startup_chat_model) |p| self.gpa.free(p);
+        if (self.startup_sd_model) |p| self.gpa.free(p);
+        if (self.startup_video_model) |p| self.gpa.free(p);
+        if (self.startup_tts_model) |p| self.gpa.free(p);
         for (self.model_dirs.items) |d| self.gpa.free(d);
         self.model_dirs.deinit(self.gpa);
         self.sel_llm.deinit();
@@ -526,9 +556,14 @@ pub const AppState = struct {
         self.img_advanced.deinit();
         if (self.img_result) |img| self.gpa.free(@constCast(img.pixels));
         self.vid_prompt.deinit();
+        self.vid_negative.deinit();
         self.vid_steps.deinit();
+        self.vid_cfg.deinit();
         self.vid_frames_n.deinit();
+        self.vid_orient.deinit();
+        self.vid_quality.deinit();
         self.freeVideoResult();
+        self.clearVideoImage();
         self.video.deinit();
         self.tts_text.deinit();
         self.tts_temperature.deinit();
@@ -561,11 +596,96 @@ pub const AppState = struct {
 
     /// Rescan all model directories into `model_list`. Guarded so the HTTP API
     /// server (another thread) can safely read the selected model's path.
+    ///
+    /// Selections are stored as indices into `model_list`, which the rescan
+    /// reshuffles — so we snapshot each task's selected *path* first, rebuild the
+    /// list, then re-resolve every selection by path (`reselect`). That keeps the
+    /// current pick sticky across rescans (e.g. after a download) and, when a task
+    /// has no valid selection, auto-picks the first model of that kind.
     pub fn rescanModels(self: *AppState) void {
         self.model_list_lock.lock();
         defer self.model_list_lock.unlock();
+
+        // Snapshot current selections by path before the indices go stale.
+        var kept: [4]?[]u8 = .{ null, null, null, null };
+        const kinds = [4]models.Kind{ .text, .image, .video, .tts };
+        for (kinds, 0..) |k, i| {
+            if (self.selectedModelOfKind(k)) |m| kept[i] = self.gpa.dupe(u8, m.path) catch null;
+        }
+        defer for (kept) |p| {
+            if (p) |s| self.gpa.free(s);
+        };
+
         self.model_list.clear();
         models.scanDefaults(&self.model_list, self.home, self.model_dirs.items);
+        for (self.model_list.items.items) |*m| m.complete = self.modelComplete(m.*);
+
+        self.reselect(.text, &self.sel_llm, kept[0], &self.startup_chat_model);
+        self.reselect(.image, &self.sel_sd, kept[1], &self.startup_sd_model);
+        self.reselect(.video, &self.sel_video, kept[2], &self.startup_video_model);
+        self.reselect(.tts, &self.sel_tts, kept[3], &self.startup_tts_model);
+    }
+
+    /// The selected model for `kind` (validated to actually be that kind), or null.
+    fn selectedModelOfKind(self: *AppState, kind: models.Kind) ?models.ModelInfo {
+        const sel: i64 = switch (kind) {
+            .text => self.sel_llm.get(),
+            .image => self.sel_sd.get(),
+            .video => self.sel_video.get(),
+            .tts => self.sel_tts.get(),
+        };
+        const m = self.selectedModel(sel) orelse return null;
+        return if (m.kind == kind) m else null;
+    }
+
+    /// Re-point one task's selection after a rescan: prefer the path it had before
+    /// (`kept`), then the persisted startup path, then auto-select the first model
+    /// of `kind`. The startup slot is consumed (freed) on the first scan.
+    fn reselect(self: *AppState, kind: models.Kind, sel: *zigui.State(i64), kept: ?[]const u8, startup: *?[]u8) void {
+        sel.set(-1);
+        const want: ?[]const u8 = kept orelse startup.*;
+        if (want) |p| {
+            for (self.model_list.items.items, 0..) |m, i| {
+                if (m.kind == kind and std.mem.eql(u8, m.path, p)) {
+                    sel.set(@intCast(i));
+                    break;
+                }
+            }
+        }
+        if (startup.*) |s| {
+            self.gpa.free(s);
+            startup.* = null;
+        }
+        // Auto-select the first model of this kind if nothing resolved.
+        if (sel.get() < 0) {
+            for (self.model_list.items.items, 0..) |m, i| {
+                if (m.kind == kind) {
+                    sel.set(@intCast(i));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Decide whether an owned model's folder is a finished download: no leftover
+    /// `.partial` file, and every curated sidecar the repo needs is present.
+    /// Non-owned models (LM Studio, etc.) are always treated as complete. Runs
+    /// once per rescan so the per-frame UI just reads `ModelInfo.complete`.
+    fn modelComplete(self: *AppState, m: models.ModelInfo) bool {
+        if (m.source != .zig_ai) return true;
+        if (models.hasPartial(self.gpa, m.dir)) return false;
+        // Reconstruct the repo id ("author/name") from the folder layout
+        // (<models>/<kind>/<author>/<name>) to look up its expected sidecars.
+        const name = std.fs.path.basename(m.dir);
+        const parent = std.fs.path.dirname(m.dir) orelse return true;
+        const author = std.fs.path.basename(parent);
+        const repo_id = std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ author, name }) catch return true;
+        defer self.gpa.free(repo_id);
+        for (manifest.sidecarsFor(repo_id)) |sc| {
+            const dest = sc.dest orelse std.fs.path.basename(sc.file);
+            if (!models.fileExistsIn(self.gpa, m.dir, dest)) return false;
+        }
+        return true;
     }
 
     /// Copy the currently-selected chat model's path into `out` (thread-safe; for
@@ -600,20 +720,6 @@ pub const AppState = struct {
             self.chat_ctx_cap = models.readCtxCap(self.gpa, m.path) orelse 32768;
         }
         return self.chat_ctx_cap;
-    }
-
-    /// After the first scan, select the chat model used in the previous session
-    /// (matched by path) so it's ready without re-picking.
-    pub fn resolveStartupChatModel(self: *AppState) void {
-        const want = self.startup_chat_model orelse return;
-        for (self.model_list.items.items, 0..) |m, i| {
-            if (m.kind == .text and std.mem.eql(u8, m.path, want)) {
-                self.sel_llm.set(@intCast(i));
-                break;
-            }
-        }
-        self.gpa.free(want);
-        self.startup_chat_model = null;
     }
 
     /// Start a fresh conversation (after any in-flight generation is cancelled).
@@ -912,22 +1018,96 @@ pub const AppState = struct {
             spec.t5xxl = t5;
         }
 
-        self.logf("video: generating with {s} (Metal)…", .{model.name});
+        const res = self.videoSize();
+        // Wan needs a real frame size (it's trained at ~480–720p); tiny sizes give
+        // mush. flow_shift follows Wan's guidance: 5 at 720p, 3 at 480p.
+        const flow_shift: f32 = if (@max(res.w, res.h) >= 720) 5.0 else 3.0;
+        // A negative prompt matters a lot for Wan quality; fall back to a sensible
+        // default when the user left the field empty.
+        const neg_in = std.mem.trim(u8, self.vid_negative.text(), " \t\n");
+        const neg = if (neg_in.len > 0) neg_in else default_video_negative;
+
+        self.logf("video: generating with {s} ({d}x{d})…", .{ model.name, res.w, res.h });
         self.rememberLoaded(&self.loaded_video, &self.loaded_size_video, model);
+        // Optional image-to-video starting frame (Wan TI2V).
+        const init_img: ?video.InitImage = if (self.vid_init_image) |im| .{
+            .width = im.width,
+            .height = im.height,
+            .rgba = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
+        } else null;
         self.video.start() catch {};
-        self.video.submit(spec, prompt, "", .{
+        self.video.submit(spec, prompt, neg, .{
             .steps = @intFromFloat(self.vid_steps.get()),
+            .cfg = self.vid_cfg.get(),
+            .flow_shift = flow_shift,
             .frames = @intCast(self.vid_frames_n.get()),
-            .width = 256,
-            .height = 256,
+            .width = res.w,
+            .height = res.h,
             .seed = -1,
             .n_threads = @intCast(self.threads.get()),
-        }) catch {};
+        }, init_img) catch {};
+    }
+
+    /// Output frame size from the orientation + quality pickers. Wan TI2V-5B is
+    /// trained around 480–720p; 480p landscape is the default (a good 16 GB
+    /// balance — 720p is heavier and may not fit on smaller cards).
+    pub fn videoSize(self: *AppState) struct { w: i32, h: i32 } {
+        const hd = self.vid_quality.get() == 1;
+        return switch (self.vid_orient.get()) {
+            1 => if (hd) .{ .w = 704, .h = 1280 } else .{ .w = 480, .h = 832 }, // portrait
+            2 => if (hd) .{ .w = 960, .h = 960 } else .{ .w = 640, .h = 640 }, // square
+            else => if (hd) .{ .w = 1280, .h = 704 } else .{ .w = 832, .h = 480 }, // landscape
+        };
+    }
+
+    /// Default negative prompt for video (Wan's standard quality-suppression list).
+    /// Used when the user leaves the negative field blank.
+    pub const default_video_negative =
+        "low quality, worst quality, blurry, jpeg artifacts, overexposed, static, " ++
+        "still image, watermark, subtitles, text, deformed, disfigured, extra limbs, " ++
+        "fused fingers, messy background, ugly";
+
+    /// Filters for the video init-frame picker (kept static — SDL holds the
+    /// pointer until the async dialog is dismissed).
+    const image_filters = [_]app.FileFilter{
+        .{ .name = "Images", .pattern = "png;jpg;jpeg;webp;bmp" },
+    };
+
+    /// Open the native dialog to pick a starting image for image-to-video. The
+    /// result is collected (and decoded) in `pumpVideo`.
+    pub fn chooseVideoImage(self: *AppState) void {
+        self.vid_image_pending = true;
+        _ = app.openFileDialog(&image_filters, null);
+    }
+
+    /// Drop the image-to-video starting frame.
+    pub fn clearVideoImage(self: *AppState) void {
+        if (self.vid_init_image) |im| codecs.freeImage(im);
+        self.vid_init_image = null;
     }
 
     /// Drain video events: progress drives the bar (atomics); final frames replace
     /// the playback buffer. Call once per frame.
     pub fn pumpVideo(self: *AppState) void {
+        // Collect the init-frame file pick (only when we opened that dialog, so we
+        // don't steal the TTS reference-WAV pick that `pumpAudio` handles).
+        if (self.vid_image_pending) {
+            switch (app.takeFileDialogResult(self.gpa)) {
+                .none => {}, // dialog still open; keep waiting
+                .canceled => self.vid_image_pending = false,
+                .picked => |p| {
+                    defer self.gpa.free(p);
+                    self.vid_image_pending = false;
+                    const pz = self.gpa.dupeZ(u8, p) catch return;
+                    defer self.gpa.free(pz);
+                    if (codecs.loadImage(pz)) |img| {
+                        self.clearVideoImage();
+                        self.vid_init_image = img;
+                        self.logf("video: start frame {d}x{d} from {s}", .{ img.width, img.height, p });
+                    } else self.alert("Could not decode that image.");
+                },
+            }
+        }
         var tmp: std.ArrayList(video.Event) = .empty;
         defer tmp.deinit(self.gpa);
         self.video.events.drain(&tmp);
@@ -1270,11 +1450,26 @@ pub const AppState = struct {
         };
     }
 
+    /// Jump to the Models › Download tab pre-filtered to `kind` and kick off a
+    /// search, so an empty per-type tab can offer a one-tap path to get models.
+    pub fn browseDownloads(self: *AppState, kind: models.Kind) void {
+        self.screen.set(@intFromEnum(Screen.models)); // jump to the Models screen…
+        self.models_tab.set(4); // …Download tab
+        self.dl_category.set(switch (kind) {
+            .text => 1,
+            .image => 2,
+            .video => 3,
+            .tts => 4,
+        });
+        self.dlSearch();
+    }
+
     /// Run a HuggingFace search from the current query + category.
     pub fn dlSearch(self: *AppState) void {
         const q = std.mem.trim(u8, self.dl_search.text(), " \t\n");
         self.dl_filepick_open.set(false);
         self.dl_filepick_idx = -1;
+        self.dl_searching = true;
         self.downloader.search(q, self.dlCategory());
     }
 
@@ -1333,6 +1528,27 @@ pub const AppState = struct {
         self.downloader.download(repo.name(), models_root, repo.id, list.items, repo.kind, manifest.sidecarsFor(repo.id));
     }
 
+    /// Download a curated bundle (`manifest.recommended[index]`): its exact files
+    /// plus cross-repo sidecars, into one folder, so a multi-repo model like LTX
+    /// is runnable in one tap.
+    pub fn dlGetRecommended(self: *AppState, index: usize) void {
+        if (index >= manifest.recommended.len) return;
+        const rec = manifest.recommended[index];
+        const home = self.home orelse {
+            self.alert("No home directory; cannot choose a download folder.");
+            return;
+        };
+        const models_root = config.modelsDirAlloc(self.gpa, home) orelse {
+            self.alert("Could not resolve the models directory.");
+            return;
+        };
+        defer self.gpa.free(models_root);
+
+        // Every bundle file is a sidecar (carries its own repo + optional rename),
+        // so the primary file set is empty; the folder is named after `rec.repo`.
+        self.downloader.download(rec.title, models_root, rec.repo, &[_]RepoFile{}, rec.kind, rec.items);
+    }
+
     /// Cancel one in-flight download by its job id.
     pub fn dlCancel(self: *AppState, job_id: u64) void {
         self.downloader.cancelJob(job_id);
@@ -1346,6 +1562,7 @@ pub const AppState = struct {
         self.downloader.events.drain(&tmp);
         for (tmp.items) |ev| switch (ev) {
             .results => |repos| {
+                self.dl_searching = false;
                 self.clearDlResults();
                 self.dl_results.appendSlice(self.gpa, repos) catch {};
                 self.gpa.free(repos); // ids now owned by dl_results
@@ -1395,6 +1612,7 @@ pub const AppState = struct {
                 self.downloader.finishJob(id);
             },
             .err => |e| {
+                self.dl_searching = false;
                 self.alert(e);
                 self.gpa.free(e);
             },

@@ -16,6 +16,14 @@ fn onGenerate(st: *AppState) void {
     st.generateVideo();
 }
 
+fn onChooseImage(st: *AppState) void {
+    st.chooseVideoImage();
+}
+
+fn onClearImage(st: *AppState) void {
+    st.clearVideoImage();
+}
+
 fn leftPanel(st: *AppState) zigui.View {
     const th = w.t();
     const fa = st.frame_arena.allocator();
@@ -23,6 +31,7 @@ fn leftPanel(st: *AppState) zigui.View {
     var rows: std.ArrayList(zigui.View) = .empty;
     rows.append(fa, w.sectionHeader("Prompt")) catch {};
     rows.append(fa, zigui.TextEditor(&st.vid_prompt, &st.vid_scroll, false)
+        .softWrap()
         .frameHeight(90)
         .padding(8)
         .background(th.colors.control_background)
@@ -30,11 +39,38 @@ fn leftPanel(st: *AppState) zigui.View {
         .border(th.colors.separator, th.metrics.hairline)
         .frameMaxWidth()) catch {};
 
-    rows.append(fa, w.settingRow(w.fmt("Steps: {d:.0}", .{st.vid_steps.get()}), zigui.Slider(st.vid_steps.binding(), 1, 40).frameWidth(160))) catch {};
-    rows.append(fa, w.settingRow("Frames", zigui.Stepper(w.fmt("{d}", .{st.vid_frames_n.get()}), st.vid_frames_n.binding(), 5, 81, 4))) catch {};
+    // Negative prompt is hidden for now — generateVideo always passes the default
+    // Wan negative (st.vid_negative stays empty → default in generateVideo).
 
-    rows.append(fa, zigui.Text("Metal · 256×256")
-        .font(.caption2).foreground(th.colors.secondary_label).frameMaxWidth()) catch {};
+    // Output size, split into two compact pickers (Wan needs a real frame size —
+    // tiny sizes give mush; a single 5-way picker is too wide for the panel).
+    rows.append(fa, zigui.Picker(st.vid_orient.binding(), &[_][]const u8{ "Landscape", "Portrait", "Square" }).frameMaxWidth()) catch {};
+    const sz = st.videoSize();
+    rows.append(fa, w.settingRow(
+        w.fmt("Quality · {d}×{d}", .{ sz.w, sz.h }),
+        zigui.Picker(st.vid_quality.binding(), &[_][]const u8{ "480p", "720p" }).frameWidth(120),
+    )) catch {};
+    rows.append(fa, w.settingRow(w.fmt("Steps: {d:.0}", .{st.vid_steps.get()}), zigui.Slider(st.vid_steps.binding(), 1, 50).frameWidth(160))) catch {};
+    rows.append(fa, w.settingRow(w.fmt("CFG: {d:.1}", .{st.vid_cfg.get()}), zigui.Slider(st.vid_cfg.binding(), 1, 10).frameWidth(160))) catch {};
+    rows.append(fa, w.settingRow("Frames", zigui.Stepper(w.fmt("{d}", .{st.vid_frames_n.get()}), st.vid_frames_n.binding(), 5, 121, 4))) catch {};
+
+    // Optional start frame (image-to-video, Wan TI2V).
+    rows.append(fa, w.sectionHeader("Start frame (optional)")) catch {};
+    if (st.vid_init_image) |im| {
+        const thumb: zigui.canvas.Image = .{
+            .width = im.width,
+            .height = im.height,
+            .pixels = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
+        };
+        rows.append(fa, zigui.Image(thumb).scaledToFit().frameMaxWidth().frameHeight(120)
+            .cornerRadius(6)) catch {};
+        rows.append(fa, zigui.HStack(.{
+            w.secondaryButton(.image, "Change", zigui.actionCtx(AppState, st, onChooseImage)),
+            w.tintedButton(.close, "Remove", th.colors.destructive, zigui.actionCtx(AppState, st, onClearImage)),
+        }).spacing(8)) catch {};
+    } else {
+        rows.append(fa, w.secondaryButton(.image, "Add start image", zigui.actionCtx(AppState, st, onChooseImage))) catch {};
+    }
 
     const busy = st.video.isBusy();
     if (busy) {

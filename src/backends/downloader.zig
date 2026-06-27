@@ -67,17 +67,64 @@ pub const Event = union(enum) {
     results: []HFRepo, // search complete; UI takes ownership
     repo_size: RepoSize, // a repo's quant size range resolved; UI takes ownership of `id`
     files: Files, // tree listing complete; UI takes ownership
-    file: []u8, // a new file in the set started downloading (owned basename)
-    progress, // a download tick (UI reads the byte atomics)
-    done: []u8, // whole set finished; final folder (owned)
-    err: []u8, // owned message
+    file: FileEv, // a new file in a job's set started downloading
+    progress: u64, // a download tick for job `id` (UI reads that job's atomics)
+    done: DoneEv, // a job finished; carries its final folder (owned)
+    job_err: JobErr, // a job failed; carries an owned message
+    canceled: u64, // a job was canceled by the user (job id)
+    err: []u8, // global (search / tree) error; owned message
 };
+
+/// A download job reported a new current file (owned basename).
+pub const FileEv = struct { job: u64, name: []u8 };
+/// A download job finished; `folder` is the owned destination directory.
+pub const DoneEv = struct { job: u64, folder: []u8 };
+/// A download job failed; `msg` is an owned, user-facing message.
+pub const JobErr = struct { job: u64, msg: []u8 };
 
 /// One queued file in a multi-file download (the chosen quant + its support
 /// files). `path` is owned; `size` (from the tree API) drives overall progress.
 pub const DlFile = struct {
     path: []u8,
     size: u64,
+};
+
+/// One in-flight (or just-finished) download. Created on the UI thread by
+/// `download`, mutated by its worker thread (atomics only), and rendered by the
+/// UI every frame. The UI thread owns the whole struct's lifetime: it appends
+/// the job to `Backend.jobs` at start and frees it (via `finishJob`) when the
+/// worker pushes a terminal event — by which point the worker no longer touches
+/// it. `cur_file` is written only by the UI thread (on a `.file` event).
+pub const DlJob = struct {
+    id: u64,
+    /// Display name for the progress card (owned), e.g. the repo's "name".
+    name: []u8,
+    /// "author/name" (owned) — used to build URLs and to dedupe re-starts.
+    repo_id: []u8,
+    /// App models root (owned).
+    models_root: []u8,
+    /// The chosen quant + support files (owned; each `.path` owned).
+    set: []DlFile,
+    kind: models.Kind,
+    /// Curated cross-repo sidecars — point into static `manifest.entries`, so the
+    /// slice needs no freeing.
+    sidecars: []const manifest.Sidecar,
+    /// Basename of the file currently downloading (owned, UI-thread only).
+    cur_file: ?[]u8 = null,
+    /// First fatal error message hit by the worker (owned); promoted to a
+    /// `.job_err` event when the worker exits.
+    fail_msg: ?[]u8 = null,
+
+    ctl: channel.JobState = .{},
+    bytes_done: std.atomic.Value(u64) = .init(0),
+    bytes_total: std.atomic.Value(u64) = .init(0),
+    speed_bps: std.atomic.Value(u64) = .init(0),
+    /// "File i of N" position within this multi-file download.
+    file_index: std.atomic.Value(u32) = .init(0),
+    file_count: std.atomic.Value(u32) = .init(0),
+    /// Consecutive retry attempt for the current file (0 = streaming normally,
+    /// >0 = reconnecting). Drives the "Reconnecting… (n/N)" status.
+    retry_attempt: std.atomic.Value(u32) = .init(0),
 };
 
 pub fn freeRepos(gpa: std.mem.Allocator, repos: []HFRepo) void {
@@ -106,20 +153,14 @@ const Net = struct {
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     events: channel.Channel(Event),
-    job: channel.JobState = .{},
 
-    /// Live download progress (bytes can exceed i32, so these live outside
-    /// JobState which is step/total i32). Read by the UI every frame.
-    bytes_done: std.atomic.Value(u64) = .init(0),
-    bytes_total: std.atomic.Value(u64) = .init(0),
-    speed_bps: std.atomic.Value(u64) = .init(0),
-    /// "File i of N" position within the current multi-file download.
-    file_index: std.atomic.Value(u32) = .init(0),
-    file_count: std.atomic.Value(u32) = .init(0),
-    /// Consecutive retry attempt for the current file (0 = streaming normally,
-    /// >0 = reconnecting after a dropped/failed connection). Drives the UI's
-    /// "Reconnecting… (n/N)" status. See `downloadOne`.
-    retry_attempt: std.atomic.Value(u32) = .init(0),
+    /// Active (and just-finished-but-not-yet-reaped) download jobs. Owned and
+    /// mutated only by the UI thread (appended in `download`, freed in
+    /// `finishJob`); worker threads mutate only the *contents* of a `*DlJob`
+    /// (atomics), never the list. So rendering and list edits need no lock.
+    jobs: std.ArrayList(*DlJob) = .empty,
+    /// Monotonic id source for new jobs (never reused, so stale events are inert).
+    next_job_id: u64 = 1,
 
     /// Bumped on every search so a still-running background size-enrichment pass
     /// (from an earlier search) stops as soon as a newer search starts.
@@ -156,8 +197,11 @@ pub const Backend = struct {
         // std's cancellation path.
         self.shutting_down.store(true, .release);
         _ = self.search_gen.fetchAdd(1, .monotonic); // halt the enrichment loop
-        self.job.requestCancel(); // abort an active download
+        for (self.jobs.items) |j| j.ctl.requestCancel(); // abort active downloads
         while (self.active_workers.load(.acquire) > 0) std.Thread.yield() catch {};
+
+        for (self.jobs.items) |j| self.freeJob(j);
+        self.jobs.deinit(self.gpa);
 
         for (self.http_cache.items) |e| {
             self.gpa.free(e.url);
@@ -193,13 +237,57 @@ pub const Backend = struct {
         return n;
     }
 
+    /// True when any download job is present (active or awaiting reaping). Used by
+    /// the app's "stay awake / has work" check.
     pub fn isBusy(self: *Backend) bool {
-        return self.job.isRunning();
+        return self.jobs.items.len > 0;
+    }
+
+    /// Find a live job by id (UI thread). Null if it has already been reaped.
+    pub fn jobById(self: *Backend, id: u64) ?*DlJob {
+        for (self.jobs.items) |j| {
+            if (j.id == id) return j;
+        }
+        return null;
+    }
+
+    /// Request cancellation of one job (UI thread). The worker tears it down and
+    /// pushes `.canceled`, after which `finishJob` reaps it.
+    pub fn cancelJob(self: *Backend, id: u64) void {
+        if (self.jobById(id)) |j| j.ctl.requestCancel();
+    }
+
+    /// Remove a finished/failed/canceled job from the list and free it (UI thread,
+    /// in response to a terminal event — the worker no longer touches it).
+    pub fn finishJob(self: *Backend, id: u64) void {
+        for (self.jobs.items, 0..) |j, i| {
+            if (j.id != id) continue;
+            _ = self.jobs.swapRemove(i);
+            self.freeJob(j);
+            return;
+        }
+    }
+
+    fn freeJob(self: *Backend, j: *DlJob) void {
+        self.gpa.free(j.name);
+        self.gpa.free(j.repo_id);
+        self.gpa.free(j.models_root);
+        for (j.set) |f| self.gpa.free(f.path);
+        self.gpa.free(j.set);
+        if (j.cur_file) |c| self.gpa.free(c);
+        if (j.fail_msg) |m| self.gpa.free(m);
+        self.gpa.destroy(j);
     }
 
     fn emitErr(self: *Backend, comptime f: []const u8, args: anytype) void {
         const msg = std.fmt.allocPrint(self.gpa, f, args) catch return;
         self.events.push(.{ .err = msg });
+    }
+
+    /// Record the first fatal error for a job (later promoted to `.job_err`).
+    fn setFail(self: *Backend, job: *DlJob, comptime f: []const u8, args: anytype) void {
+        if (job.fail_msg != null) return; // keep the first, most specific message
+        job.fail_msg = std.fmt.allocPrint(self.gpa, f, args) catch null;
     }
 
     // --- search ---------------------------------------------------------------
@@ -227,20 +315,20 @@ pub const Backend = struct {
             return;
         };
 
-        // Bias the search term toward the category's known model families; the
-        // post-filter on classified Kind does the real narrowing.
-        const bias: []const u8 = switch (category orelse return self.runSearch(net, query, null, gen)) {
+        // Bias *only an empty* query toward the category's popular families so the
+        // first view isn't dominated by chat models. Once the user types something
+        // (e.g. "ltx"), search it verbatim — appending a family word like "wan"
+        // would otherwise hide other models of the same kind. The post-filter on
+        // classified Kind still narrows results to the category either way.
+        const cat = category orelse return self.runSearch(net, query, null, gen);
+        if (std.mem.trim(u8, query, " \t\n").len > 0) return self.runSearch(net, query, cat, gen);
+        const bias: []const u8 = switch (cat) {
             .text => "",
-            .image => " flux",
-            .video => " wan",
-            .tts => " tts",
+            .image => "flux",
+            .video => "wan",
+            .tts => "tts",
         };
-        const term = std.fmt.allocPrint(self.gpa, "{s}{s}", .{ query, bias }) catch {
-            self.emitErr("downloader: out of memory", .{});
-            return;
-        };
-        defer self.gpa.free(term);
-        self.runSearch(net, term, category, gen);
+        self.runSearch(net, bias, cat, gen);
     }
 
     fn runSearch(self: *Backend, net: *Net, term: []const u8, category: ?models.Kind, gen: u64) void {
@@ -351,6 +439,10 @@ pub const Backend = struct {
             const nm = lastSegment(id);
             const kind = models.classifyName(nm) orelse continue;
             if (category) |want| if (kind != want) continue;
+            // Hard allowlist: only surface results the in-app backends can
+            // actually load (see `backendSupports`). Keeps image/video/audio from
+            // listing the many incompatible GGUFs HuggingFace returns.
+            if (!backendSupports(kind, id)) continue;
             const id_dup = try self.gpa.dupe(u8, id);
             out.append(self.gpa, .{
                 .id = id_dup,
@@ -458,18 +550,35 @@ pub const Backend = struct {
     /// cross-platform models dir (see `config.modelsDirAlloc`). Overall progress
     /// streams through the byte atomics + `.progress`; each file start pushes
     /// `.file`; the set finishing pushes `.done` with the folder.
-    pub fn download(self: *Backend, models_root: []const u8, repo_id: []const u8, files: []const RepoFile, kind: models.Kind, sidecars: []const manifest.Sidecar) void {
-        if (self.isBusy()) return;
-        if (files.len == 0) return;
-        const h = self.gpa.dupe(u8, models_root) catch return;
+    pub fn download(self: *Backend, name: []const u8, models_root: []const u8, repo_id: []const u8, files: []const RepoFile, kind: models.Kind, sidecars: []const manifest.Sidecar) void {
+        if (files.len == 0 and sidecars.len == 0) return; // nothing to fetch
+        // Ignore a duplicate request for a repo that's already downloading.
+        for (self.jobs.items) |j| {
+            if (std.mem.eql(u8, j.repo_id, repo_id)) return;
+        }
+
+        const job = self.gpa.create(DlJob) catch return;
+        const nm = self.gpa.dupe(u8, name) catch {
+            self.gpa.destroy(job);
+            return;
+        };
+        const h = self.gpa.dupe(u8, models_root) catch {
+            self.gpa.free(nm);
+            self.gpa.destroy(job);
+            return;
+        };
         const id = self.gpa.dupe(u8, repo_id) catch {
             self.gpa.free(h);
+            self.gpa.free(nm);
+            self.gpa.destroy(job);
             return;
         };
         // Dupe the file set on the UI thread (callers' slices are transient).
         const set = self.gpa.alloc(DlFile, files.len) catch {
-            self.gpa.free(h);
             self.gpa.free(id);
+            self.gpa.free(h);
+            self.gpa.free(nm);
+            self.gpa.destroy(job);
             return;
         };
         var n: usize = 0;
@@ -477,59 +586,95 @@ pub const Backend = struct {
             const p = self.gpa.dupe(u8, files[n].path) catch {
                 for (set[0..n]) |f| self.gpa.free(f.path);
                 self.gpa.free(set);
-                self.gpa.free(h);
                 self.gpa.free(id);
+                self.gpa.free(h);
+                self.gpa.free(nm);
+                self.gpa.destroy(job);
                 return;
             };
             set[n] = .{ .path = p, .size = files[n].size };
         }
 
-        self.job.beginJob();
-        self.bytes_done.store(0, .release);
-        self.bytes_total.store(0, .release);
-        self.speed_bps.store(0, .release);
-        self.file_index.store(0, .release);
-        self.file_count.store(@intCast(files.len + sidecars.len), .release);
-
         // `sidecars` point into the static `manifest.entries`, so the slice is
-        // safe to hand to the worker thread without copying.
-        const th = std.Thread.spawn(.{}, downloadWorker, .{ self, h, id, set, kind, sidecars }) catch {
-            for (set) |f| self.gpa.free(f.path);
-            self.gpa.free(set);
-            self.gpa.free(h);
-            self.gpa.free(id);
-            self.job.endJob();
+        // safe to hold without copying.
+        job.* = .{
+            .id = self.next_job_id,
+            .name = nm,
+            .repo_id = id,
+            .models_root = h,
+            .set = set,
+            .kind = kind,
+            .sidecars = sidecars,
+        };
+        job.ctl.beginJob();
+        job.file_count.store(@intCast(files.len + sidecars.len), .release);
+
+        self.jobs.append(self.gpa, job) catch {
+            self.freeJob(job);
+            return;
+        };
+        self.next_job_id += 1;
+
+        const th = std.Thread.spawn(.{}, downloadWorker, .{ self, job }) catch {
+            // Pull the job back off the list and free it; nothing was spawned.
+            _ = self.jobs.pop();
+            self.freeJob(job);
             self.emitErr("could not start download thread", .{});
             return;
         };
         th.detach();
     }
 
-    fn downloadWorker(self: *Backend, models_root: []u8, repo_id: []u8, set: []DlFile, kind: models.Kind, sidecars: []const manifest.Sidecar) void {
+    fn downloadWorker(self: *Backend, job: *DlJob) void {
         self.workerEnter();
         defer self.workerExit();
-        defer {
-            self.gpa.free(models_root);
-            self.gpa.free(repo_id);
-            for (set) |f| self.gpa.free(f.path);
-            self.gpa.free(set);
-            self.retry_attempt.store(0, .release);
-            self.job.endJob();
-        }
+
         const net = self.ensureNet() orelse {
-            self.emitErr("downloader: out of memory", .{});
+            self.setFail(job, "downloader: out of memory", .{});
+            self.finishWorker(job, null);
             return;
         };
-        self.runAll(net, models_root, repo_id, set, kind, sidecars) catch |e| {
-            // Aborted = the retry loop already reported a detailed failure.
-            if (e == error.Canceled or e == error.Aborted) return;
-            self.emitErr("download failed: {s}", .{@errorName(e)});
+        const folder = self.runAll(net, job) catch |e| {
+            self.finishWorker(job, e);
+            return;
         };
+        self.finishWorker(job, null);
+        // `runAll` returns the owned folder only on success.
+        self.events.push(.{ .done = .{ .job = job.id, .folder = folder } });
     }
 
-    fn runAll(self: *Backend, net: *Net, models_root: []u8, repo_id: []u8, set: []DlFile, kind: models.Kind, sidecars: []const manifest.Sidecar) !void {
+    /// End a job's worker: stop its control state, then push exactly one terminal
+    /// event (`canceled` / `job_err`) for the failure paths. The success path
+    /// pushes `.done` itself (it carries the folder). After the terminal event the
+    /// worker must not touch `job` again — the UI may free it on receipt.
+    fn finishWorker(self: *Backend, job: *DlJob, err: ?anyerror) void {
+        job.retry_attempt.store(0, .release);
+        job.ctl.endJob();
+        const e = err orelse return; // success: caller pushes `.done`
+        if (e == error.Canceled) {
+            self.events.push(.{ .canceled = job.id });
+            return;
+        }
+        // `Aborted` means a detailed message was already recorded via `setFail`.
+        const msg = if (job.fail_msg) |m| blk: {
+            job.fail_msg = null; // ownership moves into the event
+            break :blk m;
+        } else std.fmt.allocPrint(self.gpa, "download failed: {s}", .{@errorName(e)}) catch {
+            self.events.push(.{ .canceled = job.id }); // OOM: at least reap the job
+            return;
+        };
+        self.events.push(.{ .job_err = .{ .job = job.id, .msg = msg } });
+    }
+
+    fn runAll(self: *Backend, net: *Net, job: *DlJob) ![]u8 {
         const gpa = self.gpa;
         const io = net.io();
+
+        const models_root = job.models_root;
+        const repo_id = job.repo_id;
+        const set = job.set;
+        const kind = job.kind;
+        const sidecars = job.sidecars;
 
         const author = firstSegment(repo_id);
         const name = lastSegment(repo_id);
@@ -540,56 +685,56 @@ pub const Backend = struct {
             else => return e,
         };
 
-        // Overall total is the sum of the (tree-reported) file sizes; the bar
-        // tracks the running sum of completed bytes across all files.
-        var total: u64 = 0;
-        for (set) |f| total += f.size;
-        self.bytes_total.store(total, .release);
-
-        var base_done: u64 = 0;
+        // Progress is reported *per file*: the bar resets to that file's size at
+        // each step (the tree size up front, refined from the HTTP Content-Length),
+        // so "umt5 (2 of 4)" shows 0→100% for the file currently transferring
+        // rather than a running total across the whole set.
         for (set, 0..) |f, i| {
-            self.file_index.store(@intCast(i + 1), .release);
+            startFile(job, @intCast(i + 1), f.size);
             const base = std.fs.path.basename(f.path);
-            self.events.push(.{ .file = gpa.dupe(u8, base) catch return error.OutOfMemory });
-            const written = try self.downloadOne(net, dir, repo_id, f.path, null, base_done);
-            // Prefer the real byte count when the tree size was missing/wrong.
-            base_done += if (written > f.size) written else f.size;
-            self.bytes_done.store(base_done, .release);
+            self.events.push(.{ .file = .{ .job = job.id, .name = gpa.dupe(u8, base) catch return error.OutOfMemory } });
+            _ = try self.downloadOne(net, job, dir, repo_id, f.path, null);
         }
 
         // Curated cross-repo sidecars (FLUX VAE/encoder, Wan VAE/umt5) into the
-        // SAME folder, so the model is runnable. Their sizes are unknown up front,
-        // so they extend `bytes_total` as they download.
+        // SAME folder, so the model is runnable. Their sizes are unknown up front
+        // (no tree entry), so the bar fills once the Content-Length arrives.
         for (sidecars, 0..) |sc, i| {
-            self.file_index.store(@intCast(set.len + i + 1), .release);
+            startFile(job, @intCast(set.len + i + 1), 0);
             const shown = sc.dest orelse std.fs.path.basename(sc.file);
-            self.events.push(.{ .file = gpa.dupe(u8, shown) catch return error.OutOfMemory });
-            const written = self.downloadOne(net, dir, sc.repo, sc.file, sc.dest, base_done) catch |e| {
+            self.events.push(.{ .file = .{ .job = job.id, .name = gpa.dupe(u8, shown) catch return error.OutOfMemory } });
+            _ = self.downloadOne(net, job, dir, sc.repo, sc.file, sc.dest) catch |e| {
                 if (e == error.Canceled) return e;
                 if (e == error.Aborted) continue; // already reported; sidecars are optional
                 // A missing/renamed sidecar shouldn't abort the whole model.
                 self.emitErr("sidecar {s} failed: {s}", .{ sc.label, @errorName(e) });
                 continue;
             };
-            base_done += written;
-            self.bytes_total.store(base_done, .release);
-            self.bytes_done.store(base_done, .release);
         }
 
-        const folder = try gpa.dupe(u8, dir);
-        self.events.push(.{ .done = folder });
+        return gpa.dupe(u8, dir);
+    }
+
+    /// Reset the per-file progress atomics for the file at 1-based position
+    /// `index` whose (best-known) size is `size` bytes (0 = unknown until the
+    /// Content-Length lands). Clears the bar so it animates from 0 for each file.
+    fn startFile(job: *DlJob, index: u32, size: u64) void {
+        job.file_index.store(index, .release);
+        job.bytes_done.store(0, .release);
+        job.bytes_total.store(size, .release);
+        job.speed_bps.store(0, .release);
     }
 
     /// Download a single file into `dir` (saved as `dest_name`, or the file's
-    /// basename), from `repo_id`, reporting overall progress as `base_done +
-    /// <bytes of this file>`. Returns this file's total size.
+    /// basename), from `repo_id`, reporting this file's own 0→total progress via
+    /// the job's byte atomics. Returns this file's total size.
     /// Max *consecutive* reconnect attempts that download nothing before a file is
     /// declared failed. Because the counter resets whenever an attempt makes
     /// progress, a download survives an unlimited number of dropped connections
     /// (HuggingFace's specialty) as long as each reconnect transfers some bytes.
     pub const max_stalls: u32 = 20;
 
-    fn downloadOne(self: *Backend, net: *Net, dir: []const u8, repo_id: []const u8, file: []const u8, dest_name: ?[]const u8, base_done: u64) !u64 {
+    fn downloadOne(self: *Backend, net: *Net, job: *DlJob, dir: []const u8, repo_id: []const u8, file: []const u8, dest_name: ?[]const u8) !u64 {
         const gpa = self.gpa;
         const io = net.io();
 
@@ -598,38 +743,41 @@ pub const Backend = struct {
         const partial = try std.fmt.allocPrint(gpa, "{s}.partial", .{dest});
         defer gpa.free(partial);
 
-        // Skip files already present (e.g. a re-run after a partial set).
+        // Skip files already present (e.g. a re-run after a partial set): show the
+        // bar as full for this already-complete file.
         if (Io.Dir.openFileAbsolute(io, dest, .{})) |existing| {
             const sz = if (existing.stat(io)) |s| s.size else |_| 0;
             existing.close(io);
+            job.bytes_total.store(sz, .release);
+            job.bytes_done.store(sz, .release);
             return sz;
         } else |_| {}
 
         // Reconnect-and-resume loop. On a transient failure we sleep (exponential
         // backoff) and retry, resuming from the .partial. `error.Aborted` means a
-        // failure was already surfaced to the user via `emitErr`.
-        self.retry_attempt.store(0, .release);
+        // failure was already recorded for this job via `setFail`.
+        job.retry_attempt.store(0, .release);
         var stalls: u32 = 0;
         while (true) {
             const have_before = partialSize(io, partial);
-            const written = self.downloadAttempt(net, dest, partial, repo_id, file, base_done) catch |e| {
+            const written = self.downloadAttempt(net, job, dest, partial, repo_id, file) catch |e| {
                 if (e == error.Canceled) return e;
                 if (e == error.NotAvailable) {
-                    self.emitErr("download failed: {s} is not available on HuggingFace", .{std.fs.path.basename(file)});
+                    self.setFail(job, "download failed: {s} is not available on HuggingFace", .{std.fs.path.basename(file)});
                     return error.Aborted;
                 }
                 // Retryable (dropped connection, 5xx, range reset, read error…).
                 if (partialSize(io, partial) > have_before) stalls = 0 else stalls += 1;
                 if (stalls >= max_stalls) {
-                    self.emitErr("download failed after {d} retries: {s}", .{ max_stalls, @errorName(e) });
+                    self.setFail(job, "download failed after {d} retries: {s}", .{ max_stalls, @errorName(e) });
                     return error.Aborted;
                 }
-                self.retry_attempt.store(stalls, .release);
-                self.events.push(.progress); // refresh the "Reconnecting…" status
-                if (self.sleepOrCancel(io, backoffMs(stalls))) return error.Canceled;
+                job.retry_attempt.store(stalls, .release);
+                self.events.push(.{ .progress = job.id }); // refresh the "Reconnecting…" status
+                if (self.sleepOrCancel(job, io, backoffMs(stalls))) return error.Canceled;
                 continue;
             };
-            self.retry_attempt.store(0, .release);
+            job.retry_attempt.store(0, .release);
             return written;
         }
     }
@@ -638,7 +786,7 @@ pub const Backend = struct {
     /// header when resuming), stream to disk, and rename into place. Returns the
     /// file's total size, or a (mostly retryable) error. `error.NotAvailable` =
     /// permanent (4xx); everything else the caller may retry.
-    fn downloadAttempt(self: *Backend, net: *Net, dest: []const u8, partial: []const u8, repo_id: []const u8, file: []const u8, base_done: u64) !u64 {
+    fn downloadAttempt(self: *Backend, net: *Net, job: *DlJob, dest: []const u8, partial: []const u8, repo_id: []const u8, file: []const u8) !u64 {
         const gpa = self.gpa;
         const io = net.io();
 
@@ -680,11 +828,19 @@ pub const Backend = struct {
             return error.ServerError; // 5xx etc. — transient
         }
         // Connection (re)established — clear any "Reconnecting…" status.
-        self.retry_attempt.store(0, .release);
+        job.retry_attempt.store(0, .release);
 
         // 206 => server honored Range (append); 200 => full file (start over).
         const resumed = status == .partial_content and have > 0;
         const start_at: u64 = if (resumed) have else 0;
+
+        // Refine this file's total from the Content-Length now that we have it:
+        // for a 206 it's the remaining bytes, so add what we already have. This
+        // gives sidecars (no tree size) a real total and corrects a wrong one.
+        if (response.head.content_length) |cl| {
+            job.bytes_total.store(start_at + cl, .release);
+        }
+        job.bytes_done.store(start_at, .release);
 
         var out_file = if (resumed)
             try Io.Dir.openFileAbsolute(io, partial, .{ .mode = .write_only })
@@ -705,7 +861,7 @@ pub const Backend = struct {
         var done: u64 = start_at;
         var chunk: [64 * 1024]u8 = undefined;
         while (true) {
-            if (self.job.cancelRequested()) {
+            if (job.ctl.cancelRequested()) {
                 fw.interface.flush() catch {};
                 return error.Canceled;
             }
@@ -716,16 +872,16 @@ pub const Backend = struct {
             if (n == 0) break; // EOF
             try fw.interface.writeAll(chunk[0..n]);
             done += n;
-            self.bytes_done.store(base_done + done, .release);
+            job.bytes_done.store(done, .release);
 
             const now = (Io.Clock.awake).now(io);
             const elapsed_ns: i128 = @as(i128, now.nanoseconds) - @as(i128, t_start.nanoseconds);
             if (elapsed_ns > 0) {
                 const transferred = done - start_at;
                 const bps = @divTrunc(@as(i128, transferred) * std.time.ns_per_s, elapsed_ns);
-                self.speed_bps.store(@intCast(@max(0, bps)), .release);
+                job.speed_bps.store(@intCast(@max(0, bps)), .release);
             }
-            self.events.push(.progress);
+            self.events.push(.{ .progress = job.id });
         }
         try fw.interface.flush();
         out_file.close(io);
@@ -751,11 +907,12 @@ pub const Backend = struct {
         return @min(@as(u64, 30_000), @as(u64, 1000) << shift);
     }
 
-    /// Sleep `ms`, but wake early (returning true) if the download is canceled.
-    fn sleepOrCancel(self: *Backend, io: Io, ms: u64) bool {
+    /// Sleep `ms`, but wake early (returning true) if the job is canceled.
+    fn sleepOrCancel(self: *Backend, job: *DlJob, io: Io, ms: u64) bool {
+        _ = self;
         var slept: u64 = 0;
         while (slept < ms) {
-            if (self.job.cancelRequested()) return true;
+            if (job.ctl.cancelRequested()) return true;
             const step = @min(ms - slept, 200);
             Io.sleep(io, Io.Duration.fromMilliseconds(step), .awake) catch return true;
             slept += step;
@@ -871,6 +1028,39 @@ fn classifyTreeFile(path: []const u8) ?bool {
         if (std.mem.endsWith(u8, lower, ext)) return false;
     }
     return null;
+}
+
+/// Whether the app's bundled backend for `kind` can actually run a model with
+/// repo id `id` — a hard allowlist of known-compatible families, since a HF
+/// search returns many GGUFs these backends can't load:
+///   - chat:  llama.cpp loads essentially any chat GGUF → always true.
+///   - image: stable-diffusion.cpp → SD1.5 / SDXL / SD3, plus FLUX.2-klein
+///            (the only FLUX we ship cross-repo VAE+encoder sidecars for).
+///   - video: only Wan 2.2 and LTX run (and only with their sidecars).
+///   - tts:   only qwen3-tts.cpp's *own* GGUF conversion loads; those repos
+///            advertise ".cpp", which separates them from the many incompatible
+///            community qwen3-tts exports.
+/// Local models the user adds in Settings are unaffected — this gates search only.
+fn backendSupports(kind: models.Kind, id: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    const n = @min(id.len, buf.len);
+    const lower = std.ascii.lowerString(buf[0..n], id[0..n]);
+    const has = struct {
+        fn f(hay: []const u8, needle: []const u8) bool {
+            return std.mem.indexOf(u8, hay, needle) != null;
+        }
+    }.f;
+    return switch (kind) {
+        .text => true,
+        .image => has(lower, "stable-diffusion") or has(lower, "stable_diffusion") or
+            has(lower, "sdxl") or has(lower, "sd-xl") or has(lower, "sd_xl") or
+            has(lower, "sd1.5") or has(lower, "sd-1.5") or has(lower, "sd15") or has(lower, "v1-5") or
+            has(lower, "sd3") or has(lower, "sd-3") or
+            has(lower, "flux.2-klein") or has(lower, "flux2-klein") or has(lower, "flux-2-klein"),
+        .video => has(lower, "wan2.2") or has(lower, "wan-2.2") or has(lower, "wan2_2") or
+            has(lower, "wan_2.2") or has(lower, "ltx"),
+        .tts => (has(lower, "qwen3-tts") or has(lower, "qwen3tts")) and has(lower, "cpp"),
+    };
 }
 
 fn firstSegment(id: []const u8) []const u8 {

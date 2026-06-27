@@ -22,6 +22,7 @@ fn leftPanel(st: *AppState) zigui.View {
     var rows: std.ArrayList(zigui.View) = .empty;
     rows.append(fa, w.sectionHeader("Prompt")) catch {};
     rows.append(fa, zigui.TextEditor(&st.img_prompt, &st.img_scroll, false)
+        .softWrap()
         .frameHeight(90)
         .padding(8)
         .background(th.colors.control_background)

@@ -77,6 +77,7 @@ fn leftPanel(st: *AppState) zigui.View {
     return w.card(zigui.VStack(.{
         w.sectionHeader("Text"),
         zigui.TextEditor(&st.tts_text, &st.tts_scroll, false)
+            .softWrap()
             .frameHeight(140)
             .padding(8)
             .background(th.colors.control_background)

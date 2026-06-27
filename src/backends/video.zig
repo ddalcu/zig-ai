@@ -64,11 +64,16 @@ pub const Event = union(enum) {
     err: []u8,
 };
 
+/// An optional starting frame for image-to-video (Wan TI2V). `rgba` is owned
+/// (`width*height*4` bytes); the worker converts it to packed RGB for sd.cpp.
+pub const InitImage = struct { width: u32, height: u32, rgba: []u8 };
+
 const Request = struct {
     paths: ModelPaths,
     prompt: []u8,
     negative: []u8,
     params: Params,
+    init_image: ?InitImage = null,
 };
 
 /// The backend whose generation is currently running, so the global C progress
@@ -108,6 +113,10 @@ pub const Backend = struct {
     // Owned by the worker thread.
     ctx: ?*c.sd_ctx_t = null,
     loaded: ?ModelPaths = null,
+    /// Whether the loaded ctx has the VAE *encoder* (needed for image-to-video).
+    /// txt2vid loads decode-only; an init image needs encode, so the ctx is
+    /// rebuilt when this mode changes.
+    loaded_encode: bool = false,
 
     /// Set true once a model is loaded; read by the UI (tray status, RAM proxy).
     model_ready: std.atomic.Value(bool) = .init(false),
@@ -157,6 +166,7 @@ pub const Backend = struct {
         self.freePaths(req.paths);
         self.gpa.free(req.prompt);
         self.gpa.free(req.negative);
+        if (req.init_image) |im| self.gpa.free(im.rgba);
     }
 
     pub fn isBusy(self: *Backend) bool {
@@ -185,6 +195,7 @@ pub const Backend = struct {
         prompt: []const u8,
         negative: []const u8,
         params: Params,
+        init_image: ?InitImage, // borrowed; duped here
     ) !void {
         const paths = try self.dupePaths(spec);
         errdefer self.freePaths(paths);
@@ -192,11 +203,17 @@ pub const Backend = struct {
         errdefer self.gpa.free(pr);
         const ng = try self.gpa.dupe(u8, negative);
         errdefer self.gpa.free(ng);
+        const init_img: ?InitImage = if (init_image) |im| .{
+            .width = im.width,
+            .height = im.height,
+            .rgba = try self.gpa.dupe(u8, im.rgba),
+        } else null;
+        errdefer if (init_img) |im| self.gpa.free(im.rgba);
 
         _ = pt.pthread_mutex_lock(&self.mutex);
         defer _ = pt.pthread_mutex_unlock(&self.mutex);
         self.freeRequest(self.request);
-        self.request = .{ .paths = paths, .prompt = pr, .negative = ng, .params = params };
+        self.request = .{ .paths = paths, .prompt = pr, .negative = ng, .params = params, .init_image = init_img };
         self.has_request = true;
         self.job.beginJob();
         _ = pt.pthread_cond_signal(&self.cond);
@@ -264,9 +281,21 @@ pub const Backend = struct {
         };
     }
 
-    fn ensureCtx(self: *Backend, paths: ModelPaths, params: Params) bool {
+    /// Free the loaded sd context and its (leaked) VRAM. The next `ensureCtx`
+    /// reloads from disk. Safe to call when nothing is loaded.
+    fn freeCtx(self: *Backend) void {
+        if (self.ctx) |ctx| {
+            c.free_sd_ctx(ctx);
+            self.ctx = null;
+        }
+        self.freePaths(self.loaded);
+        self.loaded = null;
+        self.model_ready.store(false, .release);
+    }
+
+    fn ensureCtx(self: *Backend, paths: ModelPaths, params: Params, needs_encode: bool) bool {
         if (self.loaded) |lp| {
-            if (samePaths(lp, paths) and self.ctx != null) return true;
+            if (samePaths(lp, paths) and self.ctx != null and self.loaded_encode == needs_encode) return true;
         }
         if (self.ctx) |ctx| {
             c.free_sd_ctx(ctx);
@@ -296,7 +325,9 @@ pub const Backend = struct {
         if (paths.audio_vae) |s| cparams.audio_vae_path = zptr(a, s); // LTX audio VAE
         if (paths.connectors) |s| cparams.embeddings_connectors_path = zptr(a, s); // LTX
         cparams.n_threads = params.n_threads;
-        cparams.vae_decode_only = true; // txt2vid: we only decode latents to frames
+        // Image-to-video needs the VAE encoder for the init frame; txt2vid only
+        // decodes latents, so it can skip the encoder (less VRAM).
+        cparams.vae_decode_only = !needs_encode;
         cparams.diffusion_flash_attn = false;
         // Video runs entirely on the GPU (Metal). Two local ggml/sd.cpp patches
         // make this possible against upstream ggml-org's Metal backend:
@@ -312,12 +343,13 @@ pub const Backend = struct {
         }
         self.ctx = ctx;
         self.loaded = self.dupePaths(specOf(paths)) catch null;
+        self.loaded_encode = needs_encode;
         self.model_ready.store(true, .release);
         return true;
     }
 
     fn process(self: *Backend, req: Request) void {
-        if (!self.ensureCtx(req.paths, req.params)) return;
+        if (!self.ensureCtx(req.paths, req.params, req.init_image != null)) return;
         const ctx = self.ctx.?;
 
         const prompt_z = self.gpa.dupeZ(u8, req.prompt) catch return;
@@ -339,6 +371,28 @@ pub const Backend = struct {
         vp.sample_params.sample_method = c.EULER_SAMPLE_METHOD;
         vp.sample_params.flow_shift = req.params.flow_shift;
 
+        // Image-to-video: use the picked frame as the starting image. sd.cpp wants
+        // packed RGB (3 channels), so drop the alpha from our RGBA buffer.
+        var init_rgb: ?[]u8 = null;
+        defer if (init_rgb) |buf| self.gpa.free(buf);
+        if (req.init_image) |im| {
+            const px: usize = @as(usize, im.width) * @as(usize, im.height);
+            if (self.gpa.alloc(u8, px * 3)) |rgb| {
+                var si: usize = 0;
+                var di: usize = 0;
+                while (di + 3 <= rgb.len and si + 3 <= im.rgba.len) : ({
+                    si += 4;
+                    di += 3;
+                }) {
+                    rgb[di] = im.rgba[si];
+                    rgb[di + 1] = im.rgba[si + 1];
+                    rgb[di + 2] = im.rgba[si + 2];
+                }
+                vp.init_image = .{ .width = im.width, .height = im.height, .channel = 3, .data = rgb.ptr };
+                init_rgb = rgb;
+            } else |_| {}
+        }
+
         g_active = self;
         c.sd_set_log_callback(logCb, self);
         c.sd_set_progress_callback(progressCb, self);
@@ -349,6 +403,12 @@ pub const Backend = struct {
         var audio_ptr: [*c]c.sd_audio_t = null;
         const ok = c.generate_video(ctx, &vp, &frames_ptr, &num_frames, &audio_ptr);
         g_active = null;
+
+        // Free the context after every generation: sd.cpp does not release the
+        // diffusion compute buffer when reusing a ctx, so a second generate_video
+        // on the same ctx OOMs ("CUDA error" on the 2nd Generate). Releasing it
+        // here means the next run reloads fresh (a few seconds) but never leaks.
+        self.freeCtx();
 
         if (audio_ptr != null) c.free_sd_audio(audio_ptr); // Wan has no audio track
         if (!ok or frames_ptr == null or num_frames <= 0) {

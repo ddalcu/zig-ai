@@ -16,6 +16,19 @@ fn rowCtx(st: *AppState, index: usize) *RowCtx {
     return cx;
 }
 
+const KindCtx = struct { st: *AppState, kind: models.Kind };
+
+fn kindCtx(st: *AppState, kind: models.Kind) *KindCtx {
+    const cx = st.frame_arena.allocator().create(KindCtx) catch unreachable;
+    cx.* = .{ .st = st, .kind = kind };
+    return cx;
+}
+
+fn onBrowseDownloads(p: ?*anyopaque) void {
+    const cx: *KindCtx = @ptrCast(@alignCast(p.?));
+    cx.st.browseDownloads(cx.kind);
+}
+
 fn onUse(p: ?*anyopaque) void {
     const cx: *RowCtx = @ptrCast(@alignCast(p.?));
     const idx: i64 = @intCast(cx.index);
@@ -147,11 +160,22 @@ fn localList(st: *AppState, kind: models.Kind) zigui.View {
     }
 
     if (shown == 0) {
-        return w.card(w.emptyState(
-            kindIcon(kind),
-            w.fmt("No {s} models found", .{kind.label()}),
-            "Add a folder in Settings and Rescan, or use the Download tab.",
-        )).frameMaxHeight();
+        // Empty state with a one-tap path to the Download tab, pre-filtered to
+        // this kind and auto-searched.
+        return w.card(zigui.VStack(.{
+            zigui.Spacer(),
+            zigui.Icon(kindIcon(kind), 40, th.colors.tertiary_label).frameMaxWidth(),
+            zigui.Text(w.fmt("No {s} models found", .{kind.label()}))
+                .font(.title3).foreground(th.colors.secondary_label).frameMaxWidth(),
+            zigui.Text("Add a folder in Settings and Rescan, or download one:")
+                .font(.callout).foreground(th.colors.tertiary_label).frameMaxWidth(),
+            w.primaryButton(
+                .download,
+                w.fmt("Browse {s} models", .{kind.label()}),
+                .{ .ctx = kindCtx(st, kind), .func = onBrowseDownloads },
+            ),
+            zigui.Spacer(),
+        }).spacing(12).frameMaxWidth().frameMaxHeight()).frameMaxHeight();
     }
 
     const list = zigui.ScrollViewState(&st.models_scroll, zigui.VStack(rows.items).spacing(8).frameMaxWidth())
