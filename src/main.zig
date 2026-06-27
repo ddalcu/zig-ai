@@ -15,11 +15,20 @@ const shell = @import("ui/shell.zig");
 const widgets = @import("ui/widgets.zig");
 const api = @import("server/api.zig");
 const launcher = @import("launcher.zig");
+const log_capture = @import("log_capture.zig");
 
 // libc stdio for the headless BMP writer (--screenshot), matching the llm-chat
 // example's dev tooling.
 const cstdio = @cImport({
     @cInclude("stdio.h");
+});
+
+// ggml's dynamic backend loader. On the shared/DL builds (Windows/Linux CUDA),
+// CPU/CUDA/Vulkan are DLLs that ggml discovers at runtime; the registry is empty
+// until `ggml_backend_load_all` loads them. We call it once at startup so any
+// backend works regardless of which screen is opened first (see `main`).
+const ggml = @cImport({
+    @cInclude("ggml-backend.h");
 });
 
 // BSD sockets for discovering the LAN IP shown in the tray (POSIX only; Windows
@@ -150,7 +159,7 @@ fn busyCheck() bool {
     // Stay awake while the mic is recording so pumpAudio drains the capture
     // stream and the elapsed-time readout ticks.
     return a.chat.isBusy() or a.sd.isBusy() or a.video.isBusy() or a.tts.isBusy() or
-        a.downloader.isBusy() or playing_video or copy_feedback or agent_active or
+        a.downloader.isBusy() or a.dl_searching or playing_video or copy_feedback or agent_active or
         a.tts_recording;
 }
 
@@ -266,6 +275,10 @@ fn rowLabel(buf: []u8, label: []const u8, ready: bool, busy: bool, name: ?[]cons
 /// changes. Registered as the zigui frame hook, so it runs on the main thread.
 fn refreshTray() void {
     const a = g_app orelse return;
+
+    // Pull any captured stdout/stderr lines into the Logs view (Windows GUI
+    // build has no console; src/log_capture.zig redirects the streams here).
+    log_capture.drain(&a.logs);
 
     pumpCliLauncher(a);
 
@@ -826,6 +839,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
+    // Windows: the GUI subsystem gives us no console. For headless/CLI modes,
+    // re-attach the launching terminal so their output is visible; for the GUI,
+    // capture stdout/stderr into the in-app Logs view instead. (No-op elsewhere.)
+    const headless = mcp_smoke or dl_smoke != null or chat_smoke != null or
+        image_smoke != null or tts_smoke != null or video_smoke != null;
+    if (headless) {
+        log_capture.attachParentConsole();
+    } else {
+        log_capture.start(gpa);
+        log_capture.captureGgmlLogs(); // route ggml's own logs into the sink too
+    }
+
+    // Populate ggml's dynamic-backend registry before any model loads (done after
+    // the capture is in place so the cuda_init/load_backend lines are captured).
+    // llama.cpp and stable-diffusion.cpp call this on first use, but qwen3-tts.cpp
+    // does not — so on the GGML_BACKEND_DL build, opening the Audio screen first
+    // would find an empty registry and TTS would fail to initialize a compute
+    // backend. On the static (macOS) build the backends self-register and this is
+    // a harmless no-op. Covers the GUI and the headless --*-smoke paths alike.
+    ggml.ggml_backend_load_all();
+
     if (dl_smoke) |query| {
         try runDlSmoke(gpa, query);
         return;
@@ -902,8 +936,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     st.screen.set(@intFromEnum(start_screen));
     if (start_screen == .editor) st.openEditor(.system_prompt); // seed the buffer
     if (start_screen == .mcp and mock) st.openMcpConfig(1); // demo the config form
-    st.rescanModels();
-    st.resolveStartupChatModel(); // re-select the chat model used last session
+    st.rescanModels(); // also re-selects each task's last-used model (sticky) + auto-picks
 
     // Seed the starting theme; for `.system` this queries the OS. shell.body
     // re-resolves this every frame, so it also tracks live OS theme changes.
@@ -1000,5 +1033,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .min_height = 450,
         .theme = theme,
         .hide_on_close = true,
+        // Supersample 2× so text is crisp on a standard 100%/96-dpi monitor
+        // (capped internally to ≤2× total device pixels on HiDPI displays).
+        .supersample = 2,
     }, shell.body);
 }

@@ -135,6 +135,12 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{ .name = "zig-ai", .root_module = exe_mod });
     if (cmake_build) |s| exe.step.dependOn(s);
+    // On Windows, build as a GUI-subsystem app so launching it from Explorer
+    // doesn't flash a console window before the UI. With no console attached,
+    // stdout/stderr would be lost — src/log_capture.zig redirects them into the
+    // in-app Logs view instead (and CLI/headless modes re-attach the parent
+    // console so terminal output still works).
+    if (target.result.os.tag == .windows) exe.subsystem = .windows;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
