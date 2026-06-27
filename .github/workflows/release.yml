@@ -139,7 +139,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '12.9.0'
+          cuda: '13.2.0'
           linux-local-args: '["--toolkit"]'
 
       - name: Cache SDL3
@@ -261,9 +261,12 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '12.9.0'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
-          method: 'network'
+          cuda: '13.2.0'
+          # Full (local) install: the runner ships Visual Studio 18, which only
+          # CUDA 13.x supports, and 13.x's network sub-packages omit the CRT
+          # headers (crt/host_config.h) that nvcc/CMake need. A local install
+          # bundles everything (cached between runs).
+          method: 'local'
 
       - name: Fetch SDL3 (prebuilt mingw devel package)
         shell: bash
