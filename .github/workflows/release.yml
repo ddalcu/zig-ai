@@ -139,7 +139,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '13.2.0'
+          cuda: '12.9.0'
           linux-local-args: '["--toolkit"]'
 
       - name: Cache SDL3
@@ -165,9 +165,9 @@ jobs:
         # deps compile natively with gcc (which is also nvcc's CUDA host) into
         # .so libraries the zig exe links over their C ABI. The CPU/Vulkan/CUDA
         # backends are separate modules ggml loads at runtime. -Dcuda builds the
-        # CUDA module; -Dcuda-arch is left at ggml's portable default (the runner
-        # has no GPU, so "native" is not an option here).
-        run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix -Dcuda=true
+        # CUDA module; the arch list is constrained (Turing..Blackwell) to match
+        # the Windows job and keep the multi-arch CUDA compile from taking ~1h.
+        run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix -Dcuda=true -Dcuda-arch="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
 
       - name: Package
         # Split into a small base bundle and an optional CUDA add-on. The CUDA
@@ -182,8 +182,10 @@ jobs:
           mkdir base cuda
           cp zig-out/bin/zig-ai base/
           # ggml backend modules: the CUDA one goes in the add-on, the rest (cpu,
-          # vulkan, core ggml, llama/sd/tts) in the base.
-          for f in build-deps/lib/*.so*; do
+          # vulkan, core ggml, llama/sd/tts) in the base. The .so live in bin/
+          # (llama.cpp forces LIBRARY_OUTPUT=bin) or lib/, so scan both.
+          for f in build-deps/lib/*.so* build-deps/bin/*.so*; do
+            [ -e "$f" ] || continue
             case "$(basename "$f")" in
               *ggml-cuda*) cp -P "$f" cuda/ ;;
               *)           cp -P "$f" base/ ;;
@@ -259,7 +261,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '13.2.0'
+          cuda: '12.9.0'
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
           method: 'network'
 

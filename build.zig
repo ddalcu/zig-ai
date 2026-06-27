@@ -269,7 +269,11 @@ fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.Resolve
 /// The shared libraries are placed next to the binary at package time; the rpath
 /// ($ORIGIN on Linux, implicit same-dir search on Windows) finds them at runtime.
 fn linkAiBackendsShared(m: *std.Build.Module, target: std.Build.ResolvedTarget, llama: bool, sd: bool, tts: bool) void {
+    // Windows import libs (.lib) land in lib/; on Linux the shared objects (.so)
+    // land in bin/ because llama.cpp forces CMAKE_LIBRARY_OUTPUT_DIRECTORY=bin.
+    // Search both so the link resolves on every shared-build platform.
     m.addLibraryPath(.{ .cwd_relative = "build-deps/lib" });
+    m.addLibraryPath(.{ .cwd_relative = "build-deps/bin" });
     if (llama) m.linkSystemLibrary("llama", .{});
     if (sd) m.linkSystemLibrary("stable-diffusion", .{});
     if (tts) m.linkSystemLibrary("qwen3_tts", .{});
