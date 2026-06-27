@@ -39,6 +39,11 @@ env:
   SDL_REF: release-3.4.10
   # zigui release the app builds against (https://github.com/ddalcu/zigui).
   ZIGUI_REF: v0.3.2
+  # ccache speeds up the (slow, multi-arch CUDA) deps compile across runs. The
+  # deps' CMake already wires ccache as the compiler launcher (ggml's
+  # GGML_CCACHE), so installing ccache + caching this dir is all that's needed.
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
 
 jobs:
   build-macos:
@@ -66,7 +71,14 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Install build deps
-        run: brew install ninja sdl3
+        run: brew install ninja sdl3 ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: ccache-${{ runner.os }}-
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src
@@ -127,7 +139,7 @@ jobs:
             libegl1-mesa-dev libgl1-mesa-dev libdrm-dev libgbm-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev \
             libdbus-1-dev libudev-dev libusb-1.0-0-dev \
-            libvulkan-dev glslc glslang-tools spirv-headers
+            libvulkan-dev glslc glslang-tools spirv-headers ccache
 
       - name: Install CUDA Toolkit
         # The ggml CUDA backend is built with nvcc (host compiler = gcc, which
@@ -160,13 +172,21 @@ jobs:
           cmake --build sdl3-build -j
           cmake --install sdl3-build
 
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: ccache-${{ runner.os }}-
+
       - name: Build
         # Shared-library build with dynamic ggml backends (GGML_BACKEND_DL): the
         # deps compile natively with gcc (which is also nvcc's CUDA host) into
         # .so libraries the zig exe links over their C ABI. The CPU/Vulkan/CUDA
         # backends are separate modules ggml loads at runtime. -Dcuda builds the
         # CUDA module; the arch list is constrained (Turing..Blackwell) to match
-        # the Windows job and keep the multi-arch CUDA compile from taking ~1h.
+        # the Windows job and keep the multi-arch CUDA compile from taking ~1h
+        # (ccache makes repeat runs far faster).
         run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix -Dcuda=true -Dcuda-arch="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
 
       - name: Package
@@ -233,8 +253,8 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Install ninja
-        run: choco install -y ninja
+      - name: Install ninja + ccache
+        run: choco install -y ninja ccache
 
       - name: Set up MSVC (cl.exe) environment
         # The C++ deps now build natively with MSVC (and nvcc for the CUDA module
@@ -282,6 +302,13 @@ jobs:
           # import-lib name libSDL3.dll.a — expose it as SDL3.lib (lld links
           # gnu import libraries fine regardless of extension).
           cp sdl3-prefix/lib/libSDL3.dll.a sdl3-prefix/lib/SDL3.lib
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: ccache-${{ runner.os }}-
 
       - name: Build C++ deps
         shell: bash
