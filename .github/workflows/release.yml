@@ -136,7 +136,7 @@ jobs:
         # is present and falls back to Vulkan/CPU otherwise. Bump the version as
         # newer CUDA toolkits land. (Hosted runners have no GPU, so this BUILDS
         # but cannot run-test CUDA — like upstream llama.cpp's CUDA CI.)
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: '13.2.0'
@@ -256,7 +256,7 @@ jobs:
         # ggml falls back to Vulkan/CPU. Hosted runners have no GPU, so this
         # BUILDS but cannot run-test CUDA. Heavy: multi-arch CUDA compiles are
         # slow — bump the version as newer toolkits land.
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: '13.2.0'
