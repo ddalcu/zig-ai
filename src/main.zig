@@ -214,25 +214,34 @@ fn pumpCliLauncher(a: *AppState) void {
     }
 }
 
-/// Keep the event loop awake (~60fps) while any backend is generating, so the
-/// per-frame channel drain runs and the transcript fills in live.
-fn busyCheck() bool {
-    const a = g_app orelse return false;
-    // Keep the loop awake while any backend works, and while a finished video
-    // clip is on-screen so its frames can play back.
+/// How often (ms) the event loop should redraw while work is in flight, or 0
+/// when fully idle (the loop then blocks until the next OS event). This both
+/// keeps the per-frame channel drain running and paces it: AI generation is
+/// throttled by `Activity.redrawMs` (a heavy GPU job only animates a spinner,
+/// so it need not repaint at 60fps and fight the worker for the GPU), while two
+/// UI-only reasons keep their own smooth cadence.
+fn busyInterval() u32 {
+    const a = g_app orelse return 0;
+    var ms = a.activity().redrawMs();
+    // A finished video clip on-screen plays its frames back — keep it smooth.
     const playing_video = a.vid_result != null and
         a.screen.get() == @intFromEnum(st_mod.Screen.video);
-    // Stay awake while a transient "Copied" confirmation is on screen so it
-    // can revert without waiting for the next user interaction.
+    if (playing_video) ms = minCadence(ms, 33);
+    // Let a transient "Copied" confirmation revert without waiting for input.
     const copy_feedback = a.copied_until_ms > app.c.SDL_GetTicks();
-    // Stay awake while an agent tool call is in flight (or its result is queued)
-    // so the agent loop advances without needing a user event.
-    const agent_active = a.agent_busy or a.mcp_mgr.events.len() > 0;
-    // Stay awake while the mic is recording so pumpAudio drains the capture
-    // stream and the elapsed-time readout ticks.
-    return a.chat.isBusy() or a.sd.isBusy() or a.video.isBusy() or a.tts.isBusy() or
-        a.downloader.isBusy() or a.dl_searching or playing_video or copy_feedback or agent_active or
-        a.tts_recording;
+    if (copy_feedback) ms = minCadence(ms, 100);
+    return ms;
+}
+
+/// The faster (smaller, non-zero) of two redraw cadences; 0 means "no opinion".
+fn minCadence(a: u32, b: u32) u32 {
+    if (a == 0) return b;
+    return @min(a, b);
+}
+
+/// Keep the event loop awake while any work is in flight (see `busyInterval`).
+fn busyCheck() bool {
+    return busyInterval() != 0;
 }
 
 /// The app's live theme, queried once per frame by the run loop. `shell.body`
@@ -1116,6 +1125,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     g_app = &st;
     app.setBusyCheck(&busyCheck);
+    app.setBusyInterval(&busyInterval);
     // Live light/dark switching: the loop queries this each frame; shell.body
     // keeps widgets.active synced to st.dark just before it builds the tree.
     app.setThemeProvider(&themeProvider);

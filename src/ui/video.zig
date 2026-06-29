@@ -3,8 +3,9 @@
 //! Wan diffusion .gguf; its VAE and umt5 text-encoder are auto-discovered next to
 //! it (see state.generateVideo).
 //!
-//! NOTE: video runs on the CPU backend — upstream ggml's Metal backend doesn't
-//! implement the IM2COL_3D op Wan needs (see backends/video.zig).
+//! NOTE: video runs on the GPU (Metal/CUDA/Vulkan) via two local ggml/sd.cpp
+//! patches — a direct CONV_3D op and left/causal PAD that the Wan/LTX VAE need
+//! (see backends/video.zig).
 
 const std = @import("std");
 const zigui = @import("zigui");
@@ -50,7 +51,10 @@ fn leftPanel(st: *AppState) zigui.View {
         w.fmt("Quality · {d}×{d}", .{ sz.w, sz.h }),
         zigui.Picker(st.vid_quality.binding(), &[_][]const u8{ "480p", "720p" }).frameWidth(120),
     )) catch {};
-    rows.append(fa, w.settingRow(w.fmt("Steps: {d:.0}", .{st.vid_steps.get()}), zigui.Slider(st.vid_steps.binding(), 1, 50).frameWidth(160))) catch {};
+    // Wan/LTX need real denoising: below ~10 steps the latent stays mostly
+    // noise and the VAE decodes it to foggy mush, so the floor is 10 (default is
+    // 30 — see state.zig). The slider can't go lower to avoid that footgun.
+    rows.append(fa, w.settingRow(w.fmt("Steps: {d:.0}", .{st.vid_steps.get()}), zigui.Slider(st.vid_steps.binding(), 10, 50).frameWidth(160))) catch {};
     rows.append(fa, w.settingRow(w.fmt("CFG: {d:.1}", .{st.vid_cfg.get()}), zigui.Slider(st.vid_cfg.binding(), 1, 10).frameWidth(160))) catch {};
     rows.append(fa, w.settingRow("Frames", zigui.Stepper(w.fmt("{d}", .{st.vid_frames_n.get()}), st.vid_frames_n.binding(), 5, 121, 4))) catch {};
 
@@ -77,8 +81,15 @@ fn leftPanel(st: *AppState) zigui.View {
         const frac = st.video.job.fraction();
         const step = st.video.job.step.load(.acquire);
         const total = st.video.job.total.load(.acquire);
+        // The VAE decode now tiles, so its per-tile progress comes through the
+        // same callback as sampling; `decoding` tells the two phases apart and
+        // `frac` (step/total) is the right fraction for whichever is running.
+        const decoding = st.video.decoding.load(.acquire);
         rows.append(fa, zigui.ProgressView(frac).frameMaxWidth()) catch {};
-        rows.append(fa, zigui.Text(w.fmt("Generating… step {d}/{d}", .{ step, total }))
+        rows.append(fa, zigui.Text(if (decoding)
+            w.fmt("Decoding frames… tile {d}/{d}", .{ step, total })
+        else
+            w.fmt("Generating… step {d}/{d}", .{ step, total }))
             .font(.caption).foreground(th.colors.secondary_label)) catch {};
     } else {
         rows.append(fa, w.primaryButtonWide(.sparkles, "Generate", zigui.actionCtx(AppState, st, onGenerate))) catch {};

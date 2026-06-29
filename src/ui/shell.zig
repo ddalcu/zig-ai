@@ -89,6 +89,17 @@ fn sidebar(st: *AppState) zigui.View {
 
     rows.append(fa, zigui.Spacer()) catch {};
 
+    // Activity indicator: a quiet "working" row shown above the compute block
+    // whenever a backend is generating (chat, image, video, speech, …), so the
+    // GPU/CPU spike has a visible cause even while the UI repaints lazily.
+    if (st.activity().label()) |status| {
+        rows.append(fa, zigui.HStack(.{
+            zigui.Icon(.sparkles, 14, w.green()),
+            zigui.Text(status).font(.caption2).foreground(w.green()),
+            zigui.Spacer(),
+        }).spacing(7).frameMaxWidth().paddingInsets(.{ .top = 4, .leading = 10, .bottom = 0, .trailing = 8 })) catch {};
+    }
+
     // Compute indicator: memory (VRAM / unified / RAM) on top, then which ggml
     // backend is actually in use. Hidden until the device registry has loaded.
     const ai = st.acceleratorInfo();

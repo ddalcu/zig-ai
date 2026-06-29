@@ -55,13 +55,18 @@ pub fn query() Info {
     c.ggml_backend_dev_get_props(dev, &props);
 
     const ty = c.ggml_backend_dev_type(dev);
-    const label = std.mem.span(c.ggml_backend_reg_name(c.ggml_backend_dev_backend_reg(dev)));
+    const raw = std.mem.span(c.ggml_backend_reg_name(c.ggml_backend_dev_backend_reg(dev)));
+
+    // ggml registers the Metal backend under the terse name "MTL"; show the
+    // platform's familiar name instead (and use it to flag unified memory).
+    const is_metal = std.mem.eql(u8, raw, "MTL");
+    const label = if (is_metal) "Metal" else raw;
 
     return .{
         .label = label,
         .is_gpu = ty != c.GGML_BACKEND_DEVICE_TYPE_CPU,
         .unified = ty == c.GGML_BACKEND_DEVICE_TYPE_IGPU or
-            std.mem.eql(u8, label, "Metal") or
+            is_metal or
             isUnifiedName(props.description),
         .mem_used = if (props.memory_total >= props.memory_free) props.memory_total - props.memory_free else 0,
         .mem_total = props.memory_total,

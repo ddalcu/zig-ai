@@ -165,14 +165,28 @@ pub fn build(b: *std.Build) void {
 /// every `zig build` is cheap when the C++ sources are unchanged.
 fn cmakeBuildStep(b: *std.Build, target: std.Build.ResolvedTarget, use_vulkan: bool, use_cuda: bool, cuda_arch: ?[]const u8, shared: bool) *std.Build.Step {
     const configure = b.addSystemCommand(&.{
-        "cmake", "-S", ".", "-B", "build-deps", "-G", "Ninja",
+        "cmake",                      "-S", ".", "-B", "build-deps", "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
     });
     // macOS: static archives linked into the exe. Linux/Windows: shared libraries
     // with dynamically-loaded ggml backends (GGML_BACKEND_DL) so the CUDA backend
     // can be built by the native toolchain and loaded at runtime.
     if (shared) {
-        configure.addArgs(&.{ "-DBUILD_SHARED_LIBS=ON", "-DGGML_BACKEND_DL=ON" });
+        // GGML_BACKEND_DL: CPU/Vulkan/CUDA backends are loadable modules selected
+        // at runtime. GGML_CPU_ALL_VARIANTS builds the FULL x86 CPU ladder (x64
+        // baseline → sse42 → sandybridge → haswell → skylakex/AVX-512 → …) as
+        // separate modules; ggml scores the host CPU and dlopen's the best one it
+        // supports. This replaces ggml's default GGML_NATIVE (-march=native), which
+        // bakes the *build machine's* ISA into one module — on GitHub's Intel
+        // runners that means AVX-512, which SIGILLs on user CPUs that lack it. The
+        // variants are bundled automatically (Package globs every non-CUDA .so/.dll)
+        // and add no link-time cost (the exe links only ggml/ggml-base, not the CPU
+        // module). NATIVE must be OFF for ALL_VARIANTS. Costs ~10× CPU-backend
+        // compiles (small vs. the CUDA build; ccache amortises reruns).
+        configure.addArgs(&.{
+            "-DBUILD_SHARED_LIBS=ON", "-DGGML_BACKEND_DL=ON",
+            "-DGGML_NATIVE=OFF",      "-DGGML_CPU_ALL_VARIANTS=ON",
+        });
     } else {
         configure.addArg("-DBUILD_SHARED_LIBS=OFF");
     }
@@ -251,7 +265,7 @@ fn linkAiBackends(b: *std.Build, m: *std.Build.Module, target: std.Build.Resolve
     m.link_libcpp = true;
     if (target.result.os.tag == .macos) {
         const frameworks = [_][]const u8{
-            "Metal", "MetalKit", "Foundation", "CoreFoundation",
+            "Metal",      "MetalKit",   "Foundation",              "CoreFoundation",
             "Accelerate", "QuartzCore", "MetalPerformanceShaders",
         };
         for (frameworks) |f| m.linkFramework(f, .{});

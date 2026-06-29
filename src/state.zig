@@ -1418,6 +1418,56 @@ pub const AppState = struct {
         return total;
     }
 
+    /// What the app is actively generating. Drives the sidebar "working"
+    /// indicator and paces the run-loop redraw cadence (`busyInterval`).
+    pub const Activity = enum {
+        idle,
+        thinking, // chat / agent tool loop
+        image, // Stable Diffusion
+        video, // Wan / LTX
+        speech, // TTS synthesis
+        listening, // mic capture for STT
+        downloading, // model download / HF search
+
+        /// Short footer label, or null when nothing is running.
+        pub fn label(self: Activity) ?[]const u8 {
+            return switch (self) {
+                .idle => null,
+                .thinking => "Thinking…",
+                .image => "Generating image…",
+                .video => "Generating video…",
+                .speech => "Synthesizing speech…",
+                .listening => "Listening…",
+                .downloading => "Downloading…",
+            };
+        }
+
+        /// Redraw cadence (ms) the run loop should use while this runs. Token
+        /// streaming wants to feel live; the heavy GPU jobs only animate a
+        /// spinner + progress, so they repaint far less often to leave the GPU
+        /// (and CPU) to the worker.
+        pub fn redrawMs(self: Activity) u32 {
+            return switch (self) {
+                .idle => 0,
+                .thinking => 33, // ~30 fps — live tokens
+                .image, .video, .speech => 66, // ~15 fps — spinner + progress
+                .listening, .downloading => 100, // ~10 fps — elapsed / progress
+            };
+        }
+    };
+
+    /// Snapshot the current AI activity. The most user-visible work wins ties
+    /// (a chat reply mid-tool-call still reads as "Thinking").
+    pub fn activity(self: *AppState) Activity {
+        if (self.chat.isBusy() or self.agent_busy or self.mcp_mgr.events.len() > 0) return .thinking;
+        if (self.video.isBusy()) return .video;
+        if (self.sd.isBusy()) return .image;
+        if (self.tts.isBusy()) return .speech;
+        if (self.tts_recording) return .listening;
+        if (self.downloader.isBusy() or self.dl_searching) return .downloading;
+        return .idle;
+    }
+
     /// Active accelerator + memory for the footer indicator. Polls the driver
     /// ~twice a second (every 30 frames), and keeps retrying until backends have
     /// loaded, so the value appears as soon as the device registry is ready.

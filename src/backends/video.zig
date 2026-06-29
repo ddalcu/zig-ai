@@ -93,6 +93,11 @@ fn progressCb(step: c_int, steps: c_int, time: f32, data: ?*anyopaque) callconv(
     _ = time;
     _ = data;
     const self = g_active orelse return;
+    // sd.cpp routes BOTH diffusion sampling and the tiled VAE decode through this
+    // one callback. Sampling counts 1..N monotonically; the decode restarts the
+    // tile count at 0, so a step that moves backwards marks the decode phase.
+    if (step < self.last_step) self.decoding.store(true, .release);
+    self.last_step = step;
     self.job.setProgress(@intCast(step), @intCast(steps));
     self.events.push(.{ .progress = .{ .step = @intCast(step), .total = @intCast(steps) } });
 }
@@ -120,6 +125,14 @@ pub const Backend = struct {
 
     /// Set true once a model is loaded; read by the UI (tray status, RAM proxy).
     model_ready: std.atomic.Value(bool) = .init(false),
+
+    /// True while the worker is in the VAE-decode phase (vs diffusion sampling),
+    /// so the UI labels the progress bar "Decoding". Written by `progressCb` on
+    /// the worker thread; read by the UI thread.
+    decoding: std.atomic.Value(bool) = .init(false),
+    /// Last step `progressCb` saw (worker-thread only). The tiled decode restarts
+    /// the count, so a backward move flags the sampling→decode transition.
+    last_step: i32 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Backend {
         return .{ .gpa = gpa, .events = channel.Channel(Event).init(gpa) };
@@ -359,6 +372,12 @@ pub const Backend = struct {
 
         var vp: c.sd_vid_gen_params_t = undefined;
         c.sd_vid_gen_params_init(&vp);
+        // Decode the video VAE in overlapped spatial tiles. This gives the UI real
+        // per-tile decode progress (sd.cpp's progress callback fires per tile) and
+        // lowers peak memory vs decoding every frame in one monolithic graph. Left
+        // as spatial-only (no temporal tiling) so the tile count is a single
+        // monotonic 0→N pass rather than restarting per temporal chunk.
+        vp.vae_tiling_params.enabled = true;
         vp.prompt = prompt_z.ptr;
         vp.negative_prompt = neg_z.ptr;
         vp.width = req.params.width;
@@ -397,12 +416,15 @@ pub const Backend = struct {
         c.sd_set_log_callback(logCb, self);
         c.sd_set_progress_callback(progressCb, self);
         self.job.setProgress(0, req.params.steps);
+        self.last_step = 0;
+        self.decoding.store(false, .release);
 
         var frames_ptr: [*c]c.sd_image_t = null;
         var num_frames: c_int = 0;
         var audio_ptr: [*c]c.sd_audio_t = null;
         const ok = c.generate_video(ctx, &vp, &frames_ptr, &num_frames, &audio_ptr);
         g_active = null;
+        self.decoding.store(false, .release);
 
         // Free the context after every generation: sd.cpp does not release the
         // diffusion compute buffer when reusing a ctx, so a second generate_video

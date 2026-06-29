@@ -221,12 +221,64 @@ jobs:
           tar -cJf zig-ai-linux-x86_64-cuda.tar.xz -C cuda .
           ls -la zig-ai-linux-x86_64*.tar.*
 
+      - name: Build AppImage
+        # Wrap the base bundle (binary + co-located .so) as a single
+        # double-clickable AppImage. No app changes needed: the exe's $ORIGIN rpath
+        # already finds the bundled libs, and AppImage runs UNSANDBOXED, so the
+        # system tray, the local HTTP server and the terminal-based agent launcher
+        # all behave exactly as in the tarball. NVIDIA users are covered via Vulkan
+        # here; the separate -cuda.tar.xz add-on remains the max-performance path
+        # (its "drop the .so next to the binary" model can't live in a read-only
+        # AppImage mount, so CUDA is intentionally tarball-only).
+        run: |
+          # AppDir layout: AppRun -> usr/bin/zig-ai, with every bundled lib sitting
+          # next to the binary (cp -P preserves the versioned .so symlinks).
+          mkdir -p AppDir/usr/bin
+          cp -P base/* AppDir/usr/bin/
+          # Root icon becomes the AppImage thumbnail (.DirIcon); the hicolor copy is
+          # for menu integration once installed. Source icon is 751x753, so resize
+          # the menu copy to a standard 256x256 when ImageMagick is available.
+          cp assets/icon.png AppDir/zig-ai.png
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          if command -v convert >/dev/null 2>&1; then
+            convert assets/icon.png -resize 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/zig-ai.png
+          else
+            cp assets/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/zig-ai.png
+          fi
+          cat > AppDir/zig-ai.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Zig AI
+          Comment=In-process local AI desktop app
+          Exec=zig-ai
+          Icon=zig-ai
+          Categories=Utility;
+          Terminal=false
+          EOF
+          install -Dm644 AppDir/zig-ai.desktop AppDir/usr/share/applications/zig-ai.desktop
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/zig-ai" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          # appimagetool is itself an AppImage; the runner has no FUSE, so run it in
+          # extract-and-run mode. ARCH is required because the AppDir carries no
+          # embedded arch hint.
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          export APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64
+          ./appimagetool AppDir zig-ai-linux-x86_64.AppImage
+          ls -la zig-ai-linux-x86_64.AppImage
+
       - uses: actions/upload-artifact@v4
         with:
           name: zig-ai-linux-x86_64
           path: |
             zig-ai-linux-x86_64.tar.gz
             zig-ai-linux-x86_64-cuda.tar.xz
+            zig-ai-linux-x86_64.AppImage
 
   build-windows:
     runs-on: windows-latest # x86_64
@@ -379,6 +431,11 @@ jobs:
           generate_release_notes: true
           append_body: true
           body: |
+            ### Linux
+            Two equivalent base downloads: the `.tar.gz` (extract and run `zig-ai`)
+            or the single double-clickable `.AppImage` (`chmod +x` then run). Both
+            ship the same CPU + Vulkan build; pick whichever you prefer.
+
             ### NVIDIA CUDA (optional)
             The base download runs on CPU and any GPU via Vulkan (including NVIDIA).
             For maximum performance on an NVIDIA GPU, also download the matching
