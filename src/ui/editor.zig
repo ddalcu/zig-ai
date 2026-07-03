@@ -48,12 +48,11 @@ pub fn view(st: *AppState) zigui.View {
         .mcp_json => "Edit the MCP server registry. Each server needs a \"command\" and \"args\"; fill any <PLACEHOLDER> or empty env value.",
     };
 
+    // TextEditor paints its own themed surface (fill + border); wrapping it in
+    // `.background`/`.border` again double-frames it (see chat.zig input bar).
     const line_numbers = st.editor_target == .mcp_json;
     const editor = zigui.TextEditor(&st.editor_buf, &st.editor_scroll, line_numbers)
         .padding(10)
-        .background(th.colors.control_background)
-        .cornerRadius(th.metrics.corner_radius)
-        .border(th.colors.separator, th.metrics.hairline)
         .frameMaxWidth()
         .frameMaxHeight();
 

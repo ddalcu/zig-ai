@@ -76,13 +76,12 @@ fn leftPanel(st: *AppState) zigui.View {
 
     return w.card(zigui.VStack(.{
         w.sectionHeader("Text"),
+        // TextEditor paints its own themed surface (fill + border); wrapping it
+        // in `.background`/`.border` again double-frames it (see chat.zig).
         zigui.TextEditor(&st.tts_text, &st.tts_scroll, false)
             .softWrap()
             .frameHeight(140)
             .padding(8)
-            .background(th.colors.control_background)
-            .cornerRadius(6)
-            .border(th.colors.separator, th.metrics.hairline)
             .frameMaxWidth(),
         w.settingRow(w.fmt("Temperature: {d:.2}", .{st.tts_temperature.get()}), zigui.Slider(st.tts_temperature.binding(), 0, 1.5).frameWidth(160)),
         cloneSection(st),

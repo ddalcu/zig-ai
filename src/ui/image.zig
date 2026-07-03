@@ -43,13 +43,12 @@ fn leftPanel(st: *AppState) zigui.View {
 
     var rows: std.ArrayList(zigui.View) = .empty;
     rows.append(fa, w.sectionHeader("Prompt")) catch {};
+    // TextEditor paints its own themed surface (fill + border); wrapping it in
+    // `.background`/`.border` again double-frames it (see chat.zig input bar).
     rows.append(fa, zigui.TextEditor(&st.img_prompt, &st.img_scroll, false)
         .softWrap()
         .frameHeight(90)
         .padding(8)
-        .background(th.colors.control_background)
-        .cornerRadius(6)
-        .border(th.colors.separator, th.metrics.hairline)
         .frameMaxWidth()) catch {};
 
     rows.append(fa, w.settingRow(w.fmt("Steps: {d:.0}", .{st.img_steps.get()}), zigui.Slider(st.img_steps.binding(), 1, 50).frameWidth(160))) catch {};
@@ -89,9 +88,6 @@ fn leftPanel(st: *AppState) zigui.View {
             .softWrap()
             .frameHeight(56)
             .padding(8)
-            .background(th.colors.control_background)
-            .cornerRadius(6)
-            .border(th.colors.separator, th.metrics.hairline)
             .frameMaxWidth()) catch {};
         // Style LoRA (.safetensors/.gguf) applied to the diffusion model.
         if (st.img_lora_path) |lp| {
@@ -123,7 +119,7 @@ fn leftPanel(st: *AppState) zigui.View {
         rows.append(fa, w.primaryButtonWide(.sparkles, "Generate", zigui.actionCtx(AppState, st, onGenerate))) catch {};
     }
 
-    return w.card(zigui.VStack(rows.items).spacing(10)).frameWidth(340);
+    return w.card(zigui.VStack(rows.items).spacing(10)).frameWidth(w.input_col);
 }
 
 fn onOpenFolder(st: *AppState) void {
@@ -152,7 +148,7 @@ pub fn view(st: *AppState) zigui.View {
     return zigui.VStack(.{
         w.header("Image Generation", w.modelPicker(st, .image)),
         zigui.HStack(.{
-            zigui.VStack(.{ leftPanel(st), zigui.Spacer() }).frameWidth(340).frameMaxHeight(),
+            zigui.VStack(.{ leftPanel(st), zigui.Spacer() }).frameWidth(w.input_col).frameMaxHeight(),
             rightPanel(st),
         }).spacing(12).frameMaxWidth().frameMaxHeight(),
     }).spacing(12).frameMaxWidth().frameMaxHeight();

@@ -32,6 +32,10 @@ pub fn orange() zigui.Color {
 /// `zigui.components.fmt` but lets callers keep using it directly.
 pub const fmt = zigui.components.fmt;
 
+/// Width of the left input/settings column on the generation screens
+/// (image/video). Wide enough for a comfortable prompt editor.
+pub const input_col: f32 = 420;
+
 /// A grouped "card" container: padded, filled, rounded, hairline-bordered.
 pub fn card(content: zigui.View) zigui.View {
     const th = t();

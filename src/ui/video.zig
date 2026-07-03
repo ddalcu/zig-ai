@@ -70,13 +70,12 @@ fn leftPanel(st: *AppState) zigui.View {
 
     var rows: std.ArrayList(zigui.View) = .empty;
     rows.append(fa, w.sectionHeader("Prompt")) catch {};
+    // TextEditor paints its own themed surface (fill + border); wrapping it in
+    // `.background`/`.border` again double-frames it (see chat.zig input bar).
     rows.append(fa, zigui.TextEditor(&st.vid_prompt, &st.vid_scroll, false)
         .softWrap()
         .frameHeight(90)
         .padding(8)
-        .background(th.colors.control_background)
-        .cornerRadius(6)
-        .border(th.colors.separator, th.metrics.hairline)
         .frameMaxWidth()) catch {};
 
     // Output size, split into two compact pickers (Wan needs a real frame size —
@@ -92,10 +91,15 @@ fn leftPanel(st: *AppState) zigui.View {
     // 30 — see state.zig). The slider can't go lower to avoid that footgun.
     rows.append(fa, w.settingRow(w.fmt("Steps: {d:.0}", .{st.vid_steps.get()}), zigui.Slider(st.vid_steps.binding(), 10, 50).frameWidth(160))) catch {};
     rows.append(fa, w.settingRow(w.fmt("CFG: {d:.1}", .{st.vid_cfg.get()}), zigui.Slider(st.vid_cfg.binding(), 1, 10).frameWidth(160))) catch {};
-    rows.append(fa, w.settingRow("Frames", zigui.Stepper(w.fmt("{d}", .{st.vid_frames_n.get()}), st.vid_frames_n.binding(), 5, 121, 4))) catch {};
-    // FPS is a real model input for LTX (time axis + audio length); Wan uses it
-    // for playback/mux speed only. LTX native is 24.
-    rows.append(fa, w.settingRow("FPS", zigui.Stepper(w.fmt("{d}", .{st.vid_fps_n.get()}), st.vid_fps_n.binding(), 8, 32, 4))) catch {};
+    // Frame count on the 8N+1 ladder, with a live duration readout. FPS has no
+    // control — it's a model property (24 LTX / 16 Wan, set by
+    // applyVideoFamilyDefaults on model change), used here for the seconds math.
+    const frames = st.videoFrames();
+    const secs = @as(f32, @floatFromInt(frames)) / @as(f32, @floatFromInt(st.vid_fps_n.get()));
+    rows.append(fa, w.settingRow(
+        w.fmt("{d} frames · ~{d:.1}s", .{ frames, secs }),
+        zigui.Slider(st.vid_frames.binding(), 9, 193).frameWidth(160),
+    )) catch {};
 
     // Optional start frame (image-to-video: Wan TI2V / LTX I2V).
     rows.append(fa, w.sectionHeader("Start frame (optional)")) catch {};
@@ -123,9 +127,6 @@ fn leftPanel(st: *AppState) zigui.View {
             .softWrap()
             .frameHeight(56)
             .padding(8)
-            .background(th.colors.control_background)
-            .cornerRadius(6)
-            .border(th.colors.separator, th.metrics.hairline)
             .frameMaxWidth()) catch {};
         // Optional end frame (LTX first/last-frame-to-video).
         rows.append(fa, w.sectionHeader("End frame (LTX, optional)")) catch {};
@@ -171,7 +172,7 @@ fn leftPanel(st: *AppState) zigui.View {
         rows.append(fa, w.primaryButtonWide(.sparkles, "Generate", zigui.actionCtx(AppState, st, onGenerate))) catch {};
     }
 
-    return w.card(zigui.VStack(rows.items).spacing(10)).frameWidth(340);
+    return w.card(zigui.VStack(rows.items).spacing(10)).frameWidth(w.input_col);
 }
 
 fn onOpenFolder(st: *AppState) void {
@@ -203,7 +204,7 @@ pub fn view(st: *AppState) zigui.View {
     return zigui.VStack(.{
         w.header("Video Generation", w.modelPicker(st, .video)),
         zigui.HStack(.{
-            zigui.VStack(.{ leftPanel(st), zigui.Spacer() }).frameWidth(340).frameMaxHeight(),
+            zigui.VStack(.{ leftPanel(st), zigui.Spacer() }).frameWidth(w.input_col).frameMaxHeight(),
             rightPanel(st),
         }).spacing(12).frameMaxWidth().frameMaxHeight(),
     }).spacing(12).frameMaxWidth().frameMaxHeight();

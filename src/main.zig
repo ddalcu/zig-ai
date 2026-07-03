@@ -1144,7 +1144,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (auto_video) |prompt| {
         st.screen.set(@intFromEnum(st_mod.Screen.video));
         st.vid_prompt.setText(prompt) catch {};
-        st.vid_frames_n.set(17);
+        st.vid_frames.set(17);
         st.vid_steps.set(8);
         st.generateVideo();
     }

@@ -1132,11 +1132,12 @@ pub const Server = struct {
         self.video_backend.start() catch {
             return sendError(conn, "500 Internal Server Error", "server_error", "could not start video backend");
         };
-        // An empty negative hurts Wan quality badly — substitute the standard
-        // suppression list (same default as the GUI).
+        // An empty negative hurts video quality badly — substitute the family's
+        // suppression list (same defaults as the GUI; LTX uses mlx-serve's).
         const neg = blk: {
             const n = req.negative_prompt orelse "";
-            break :blk if (std.mem.trim(u8, n, " \t\n").len > 0) n else genspec.default_video_negative;
+            if (std.mem.trim(u8, n, " \t\n").len > 0) break :blk n;
+            break :blk if (is_ltx) genspec.default_ltx_negative else genspec.default_video_negative;
         };
         self.video_backend.submit(vspec.spec, req.prompt, neg, params, init_img, end_img, req.lora_path) catch {
             return sendError(conn, "500 Internal Server Error", "server_error", "could not submit request");

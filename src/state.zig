@@ -354,7 +354,12 @@ pub const AppState = struct {
     vid_neg_scroll: zigui.ScrollState = .{},
     vid_steps: zigui.State(f32),
     vid_cfg: zigui.State(f32),
-    vid_frames_n: zigui.State(i64),
+    /// Frame count as a raw slider value; `videoFrames()` snaps it to the
+    /// 8N+1 ladder both families need (LTX temporal factor 8; 8N+1 ≡ 1 mod 4,
+    /// so it's also valid for Wan's factor 4).
+    vid_frames: zigui.State(f32),
+    /// Playback/model FPS. No UI control — `applyVideoFamilyDefaults` is the
+    /// only writer (24 LTX / 16 Wan); shown in the frames-slider readout.
     vid_fps_n: zigui.State(i64),
     /// Seed as free text (empty or non-numeric → -1 = random).
     vid_seed: zigui.TextFieldState,
@@ -524,7 +529,7 @@ pub const AppState = struct {
             .vid_negative = zigui.TextFieldState.init(gpa),
             .vid_steps = zigui.State(f32).init(gpa, 30),
             .vid_cfg = zigui.State(f32).init(gpa, 5.0),
-            .vid_frames_n = zigui.State(i64).init(gpa, 49),
+            .vid_frames = zigui.State(f32).init(gpa, 97),
             .vid_fps_n = zigui.State(i64).init(gpa, 24),
             .vid_seed = zigui.TextFieldState.init(gpa),
             .vid_slg = zigui.State(f32).init(gpa, 0),
@@ -612,7 +617,7 @@ pub const AppState = struct {
         self.vid_negative.deinit();
         self.vid_steps.deinit();
         self.vid_cfg.deinit();
-        self.vid_frames_n.deinit();
+        self.vid_frames.deinit();
         self.vid_fps_n.deinit();
         self.vid_seed.deinit();
         self.vid_slg.deinit();
@@ -1123,10 +1128,16 @@ pub const AppState = struct {
         const flow_shift: f32 = if (vspec.isLtx())
             std.math.inf(f32)
         else if (@max(res.w, res.h) >= 720) 5.0 else 3.0;
-        // A negative prompt matters a lot for Wan quality; fall back to a sensible
-        // default when the user left the field empty.
+        // A negative prompt matters a lot for video quality; fall back to the
+        // family's default when the user left the field empty (LTX gets
+        // mlx-serve's LTX list, Wan its standard suppression list).
         const neg_in = std.mem.trim(u8, self.vid_negative.text(), " \t\n");
-        const neg = if (neg_in.len > 0) neg_in else default_video_negative;
+        const neg = if (neg_in.len > 0)
+            neg_in
+        else if (vspec.isLtx())
+            genspec.default_ltx_negative
+        else
+            default_video_negative;
         const hires = self.vid_hires.get() and spec.upscaler != null;
 
         self.logf("video: generating with {s} ({d}x{d}{s})…", .{ model.name, res.w, res.h, if (hires) " ×2 hires" else "" });
@@ -1148,7 +1159,7 @@ pub const AppState = struct {
             .steps = @intFromFloat(self.vid_steps.get()),
             .cfg = self.vid_cfg.get(),
             .flow_shift = flow_shift,
-            .frames = @intCast(self.vid_frames_n.get()),
+            .frames = self.videoFrames(),
             .fps = @intCast(self.vid_fps_n.get()),
             .width = res.w,
             .height = res.h,
@@ -1170,6 +1181,14 @@ pub const AppState = struct {
             2 => if (hd) .{ .w = 960, .h = 960 } else .{ .w = 640, .h = 640 }, // square
             else => if (hd) .{ .w = 1280, .h = 704 } else .{ .w = 832, .h = 480 }, // landscape
         };
+    }
+
+    /// Frame count snapped to the 8N+1 ladder (zigui's Slider is continuous
+    /// f32 with no snap support, so the raw state value lands between rungs).
+    pub fn videoFrames(self: *AppState) i32 {
+        const v = self.vid_frames.get();
+        const snapped = @round((v - 1) / 8) * 8 + 1;
+        return @intFromFloat(std.math.clamp(snapped, 9, 193));
     }
 
     /// Default negative prompt for video (shared with the HTTP API).

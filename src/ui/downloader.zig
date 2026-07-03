@@ -476,17 +476,15 @@ pub fn view(st: *AppState) zigui.View {
     const th = w.t();
     const fa = st.frame_arena.allocator();
 
+    // The TextField paints its own themed surface (fill + border); chrome on
+    // the enclosing HStack would double-frame it (see chat.zig input bar).
     const search_field = zigui.HStack(.{
         zigui.Icon(.search, 15, th.colors.secondary_label),
         zigui.TextField("Search HuggingFace…", &st.dl_search)
             .onSubmit(zigui.actionCtx(AppState, st, onSearch))
+            .cornerRadius(8)
             .frameMaxWidth(),
-    }).spacing(8)
-        .paddingInsets(.{ .top = 7, .leading = 11, .bottom = 7, .trailing = 12 })
-        .background(th.colors.control_background)
-        .cornerRadius(8)
-        .border(th.colors.separator, th.metrics.hairline)
-        .frameMaxWidth();
+    }).spacing(8).frameMaxWidth();
 
     const search_bar = zigui.HStack(.{
         search_field,
