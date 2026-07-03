@@ -14,6 +14,10 @@
 
 const std = @import("std");
 const llama = @import("../backends/llama.zig");
+const sd = @import("../backends/sd.zig");
+const video = @import("../backends/video.zig");
+const genspec = @import("../genspec.zig");
+const codecs = @import("../codecs/codecs.zig");
 const channel = @import("../channel.zig");
 const agent = @import("../agent.zig");
 const chat_parser = @import("chat_parser.zig");
@@ -94,6 +98,14 @@ pub const Server = struct {
     cfg: Config,
     resolver: ModelResolver,
     backend: llama.Backend,
+    /// The GUI's selected image / video model paths (same callback shape as the
+    /// chat resolver). Null resolvers disable the media endpoints.
+    image_resolver: ?ModelResolver = null,
+    video_resolver: ?ModelResolver = null,
+    /// Server-owned media backends (separate instances from the GUI's, exactly
+    /// like the chat `backend` — lazily started on first request).
+    sd_backend: sd.Backend,
+    video_backend: video.Backend,
     req_lock: channel.SpinLock = .{}, // serialize requests to the single backend
     shutdown: std.atomic.Value(bool) = .init(false),
     id_counter: std.atomic.Value(u64) = .init(0),
@@ -101,7 +113,14 @@ pub const Server = struct {
     net: ?*Net = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config, resolver: ModelResolver) Server {
-        return .{ .gpa = gpa, .cfg = cfg, .resolver = resolver, .backend = llama.Backend.init(gpa) };
+        return .{
+            .gpa = gpa,
+            .cfg = cfg,
+            .resolver = resolver,
+            .backend = llama.Backend.init(gpa),
+            .sd_backend = sd.Backend.init(gpa),
+            .video_backend = video.Backend.init(gpa),
+        };
     }
 
     pub fn start(self: *Server) !void {
@@ -125,6 +144,8 @@ pub const Server = struct {
         }
         if (self.thread) |th| th.join();
         self.backend.deinit();
+        self.sd_backend.deinit();
+        self.video_backend.deinit();
         if (self.net) |n| {
             n.threaded.deinit();
             self.gpa.destroy(n);
@@ -217,6 +238,12 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/v1/embeddings")) {
             return self.handleEmbeddings(conn, a, body);
+        }
+        if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/v1/images/generations")) {
+            return self.handleImageGen(conn, a, body);
+        }
+        if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/v1/video/generations")) {
+            return self.handleVideoGen(conn, a, body);
         }
         try sendError(conn, "404 Not Found", "not_found", "Unknown endpoint");
     }
@@ -748,6 +775,465 @@ pub const Server = struct {
         try chunkPrefix(w, id, created, model);
         try w.print("\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}", .{finish});
         try sendSse(conn, b.written());
+    }
+
+    // ── media generation (mlx-serve-compatible wire format) ────────────────
+
+    /// SSE response headers for the media endpoints (no Content-Length).
+    const sse_headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+
+    /// Send one `data: {"type":"progress",…}` event; returns false when the
+    /// client hung up (caller should cancel the generation).
+    fn sseProgress(conn: *Conn, stage: []const u8, step: i32, total: i32) bool {
+        var buf: [192]u8 = undefined;
+        const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}}}\n\n", .{ stage, step, total }) catch return true;
+        conn.writeAll(ev) catch return false;
+        conn.flush() catch return false;
+        return true;
+    }
+
+    fn sseError(conn: *Conn, msg: []const u8) void {
+        var buf: [256]u8 = undefined;
+        const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"error\",\"message\":\"{s}\"}}\n\n", .{msg}) catch return;
+        conn.writeAll(ev) catch {};
+        conn.flush() catch {};
+    }
+
+    /// Decode a base64 image payload (PNG/JPEG/WEBP) into an RGBA InitImage
+    /// whose `rgba` is gpa-owned. Null on any decode failure.
+    fn decodeB64Image(self: *Server, a: std.mem.Allocator, b64: []const u8) ?struct { width: u32, height: u32, rgba: []u8 } {
+        const n = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
+        const bytes = a.alloc(u8, n) catch return null;
+        std.base64.standard.Decoder.decode(bytes, b64) catch return null;
+        const img = codecs.loadImageMem(bytes) orelse return null;
+        defer codecs.freeImage(img);
+        const px = @as(usize, img.width) * @as(usize, img.height) * 4;
+        const rgba = self.gpa.dupe(u8, img.pixels[0..px]) catch return null;
+        return .{ .width = img.width, .height = img.height, .rgba = rgba };
+    }
+
+    /// Parse `"WxH"` / `"W×H"` (e.g. "1024x768").
+    fn parseSize(s: []const u8) ?struct { w: i32, h: i32 } {
+        const sep = std.mem.indexOfAny(u8, s, "xX*") orelse return null;
+        const w = std.fmt.parseInt(i32, std.mem.trim(u8, s[0..sep], " "), 10) catch return null;
+        const h = std.fmt.parseInt(i32, std.mem.trim(u8, s[sep + 1 ..], " "), 10) catch return null;
+        if (w <= 0 or h <= 0) return null;
+        return .{ .w = w, .h = h };
+    }
+
+    /// True when the model name suggests a few-step distilled variant (Krea2
+    /// Turbo, FLUX schnell/klein, LTX distilled) — used only for DEFAULTS when
+    /// the request omits steps/cfg.
+    fn isDistilledName(name: []const u8) bool {
+        return std.ascii.indexOfIgnoreCase(name, "turbo") != null or
+            std.ascii.indexOfIgnoreCase(name, "distill") != null or
+            std.ascii.indexOfIgnoreCase(name, "schnell") != null or
+            std.ascii.indexOfIgnoreCase(name, "klein") != null;
+    }
+
+    /// POST /v1/images/generations — mlx-serve-compatible: `prompt` (required),
+    /// `size`/`width`/`height`, `steps`, `seed`, `cfg`/`cfg_scale`/`guidance`,
+    /// `negative_prompt`, `image` (base64 source) + `mode:"variation"` +
+    /// `strength`, `lora_path` + `lora_scale`, `stream`. Replies
+    /// `{"created":0,"data":[{"b64_json":"<png>"}]}` (or SSE progress +
+    /// complete when streaming).
+    fn handleImageGen(self: *Server, conn: *Conn, a: std.mem.Allocator, body: []const u8) !void {
+        const Req = struct {
+            prompt: []const u8 = "",
+            negative_prompt: ?[]const u8 = null,
+            size: ?[]const u8 = null,
+            width: ?i32 = null,
+            height: ?i32 = null,
+            steps: ?i32 = null,
+            cfg: ?f32 = null,
+            cfg_scale: ?f32 = null,
+            guidance: ?f32 = null,
+            seed: ?i64 = null,
+            image: ?[]const u8 = null,
+            mode: ?[]const u8 = null,
+            strength: ?f32 = null,
+            lora_path: ?[]const u8 = null,
+            lora_scale: ?f32 = null,
+            stream: bool = false,
+            model: ?[]const u8 = null,
+            safety: ?bool = null, // accepted for wire-compat; no classifier here
+        };
+        const parsed = std.json.parseFromSlice(Req, a, body, .{ .ignore_unknown_fields = true }) catch {
+            return sendError(conn, "400 Bad Request", "invalid_request_error", "Invalid JSON body");
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        if (req.prompt.len == 0) {
+            return sendError(conn, "400 Bad Request", "invalid_request_error", "missing 'prompt'");
+        }
+        if (req.mode) |m| {
+            if (!std.mem.eql(u8, m, "variation")) {
+                return sendError(conn, "400 Bad Request", "invalid_request_error", "'mode' must be \"variation\" (instruction edit is not supported by this backend)");
+            }
+        }
+
+        const resolver = self.image_resolver orelse {
+            return sendError(conn, "503 Service Unavailable", "model_not_found", "image generation not wired up");
+        };
+        var path_buf: [1024]u8 = undefined;
+        const model_path = resolver.func(resolver.ctx, &path_buf) orelse {
+            return sendError(conn, "503 Service Unavailable", "model_not_found", "No image model selected in the app");
+        };
+        const name = modelId(model_path);
+        const dir = std.fs.path.dirname(model_path) orelse ".";
+
+        var ispec = genspec.resolveImage(a, model_path, name, dir) catch |e| {
+            return sendError(conn, "400 Bad Request", "invalid_request_error", genspec.message(e));
+        };
+        defer ispec.deinit();
+
+        // Size: explicit width/height beats `size`; default 1024².
+        var width: i32 = 1024;
+        var height: i32 = 1024;
+        if (req.size) |s| {
+            if (parseSize(s)) |wh| {
+                width = wh.w;
+                height = wh.h;
+            }
+        }
+        if (req.width) |w| width = w;
+        if (req.height) |h| height = h;
+
+        // Defaults follow the model family: distilled models want few steps and
+        // no CFG; everything else gets the classic 20 / 7.0.
+        const distilled = isDistilledName(name);
+        var params: sd.Params = .{
+            .steps = req.steps orelse (if (distilled) @as(i32, 8) else 20),
+            .cfg = req.cfg orelse req.cfg_scale orelse req.guidance orelse (if (distilled) @as(f32, 1.0) else 7.0),
+            .width = width,
+            .height = height,
+            .seed = req.seed orelse -1,
+            .n_threads = self.cfg.n_threads,
+        };
+        if (req.strength) |s| {
+            if (!(s > 0 and s <= 1)) return sendError(conn, "400 Bad Request", "invalid_request_error", "'strength' must be in (0,1]");
+            params.strength = s;
+        }
+        if (req.lora_scale) |s| params.lora_scale = s;
+
+        var init_img: ?sd.InitImage = null;
+        defer if (init_img) |im| self.gpa.free(im.rgba);
+        if (req.image) |b64| {
+            const dec = self.decodeB64Image(a, b64) orelse
+                return sendError(conn, "400 Bad Request", "invalid_request_error", "could not decode 'image' (base64 PNG/JPEG expected)");
+            init_img = .{ .width = dec.width, .height = dec.height, .rgba = dec.rgba };
+        }
+
+        self.req_lock.lock();
+        defer self.req_lock.unlock();
+        self.sd_backend.start() catch {
+            return sendError(conn, "500 Internal Server Error", "server_error", "could not start image backend");
+        };
+        self.sd_backend.submit(ispec.spec, req.prompt, req.negative_prompt orelse "", params, init_img, req.lora_path) catch {
+            return sendError(conn, "500 Internal Server Error", "server_error", "could not submit request");
+        };
+
+        if (req.stream) try conn.writeAll(sse_headers);
+
+        // Drain the backend to the final image (or error).
+        var result: ?@TypeOf(@as(sd.Event, undefined).image) = null;
+        var err_msg: ?[]const u8 = null;
+        var client_gone = false;
+        var tmp: std.ArrayList(sd.Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        loop: while (true) {
+            self.sd_backend.events.drain(&tmp);
+            if (tmp.items.len == 0) {
+                Io.sleep(conn.io, Io.Duration.fromMilliseconds(20), .awake) catch {};
+                continue;
+            }
+            for (tmp.items) |ev| switch (ev) {
+                .progress => |p| {
+                    if (req.stream and !client_gone) {
+                        if (!sseProgress(conn, "diffusion", p.step, p.total)) {
+                            client_gone = true;
+                            self.sd_backend.cancel();
+                        }
+                    }
+                },
+                .image => |img| {
+                    if (result) |r| self.gpa.free(@constCast(r.pixels));
+                    result = img;
+                },
+                .err => |e| {
+                    err_msg = a.dupe(u8, e) catch "generation failed";
+                    self.gpa.free(e);
+                },
+            };
+            if (result != null or err_msg != null) break :loop;
+            tmp.clearRetainingCapacity();
+        }
+        // The submit→events flow ends the job after pushing image/err; nothing
+        // else to reap.
+        if (err_msg) |e| {
+            if (req.stream) {
+                sseError(conn, e);
+                return;
+            }
+            return sendError(conn, "500 Internal Server Error", "server_error", e);
+        }
+        const img = result.?;
+        defer self.gpa.free(@constCast(img.pixels));
+        if (client_gone) return;
+
+        const png = codecs.encodePngMem(img.pixels[0 .. @as(usize, img.width) * @as(usize, img.height) * 4], img.width, img.height) orelse {
+            if (req.stream) {
+                sseError(conn, "PNG encode failed");
+                return;
+            }
+            return sendError(conn, "500 Internal Server Error", "server_error", "PNG encode failed");
+        };
+        defer codecs.freePng(png);
+        const b64_len = std.base64.standard.Encoder.calcSize(png.len);
+        const b64 = try a.alloc(u8, b64_len);
+        _ = std.base64.standard.Encoder.encode(b64, png);
+
+        var out: Io.Writer.Allocating = .init(a);
+        const w = &out.writer;
+        try w.writeAll(if (req.stream) "data: {\"type\":\"complete\",\"data\":[{\"b64_json\":\"" else "{\"created\":0,\"data\":[{\"b64_json\":\"");
+        try w.writeAll(b64);
+        try w.writeAll(if (req.stream) "\"}]}\n\n" else "\"}]}");
+        if (req.stream) {
+            try conn.writeAll(out.written());
+            try conn.flush();
+            return;
+        }
+        try sendJson(conn, "200 OK", out.written());
+    }
+
+    /// POST /v1/video/generations — mlx-serve-compatible: `prompt` (required),
+    /// `num_frames`, `width`, `height`, `steps`, `seed`, `pipeline`
+    /// (`one_stage` | `two_stage` | `two_stage_hq` — the two-stage modes map to
+    /// the LTX spatial-upscaler hires pass), `cfg_scale`, `stg_scale`,
+    /// `stage2_steps`, `fps`, `negative_prompt`, `first_frame_image` /
+    /// `end_frame_image` (base64), `lora_path` + `lora_scale`, `stream`.
+    /// Replies `{"created":0,"frames":N,"height":H,"width":W,"fps":F,
+    /// "format":"rgb8","data":"<b64>"}` plus `audio_*` fields when the model
+    /// generated sound (LTX).
+    fn handleVideoGen(self: *Server, conn: *Conn, a: std.mem.Allocator, body: []const u8) !void {
+        const Req = struct {
+            prompt: []const u8 = "",
+            negative_prompt: ?[]const u8 = null,
+            num_frames: ?i32 = null,
+            width: ?i32 = null,
+            height: ?i32 = null,
+            steps: ?i32 = null,
+            stage2_steps: ?i32 = null,
+            seed: ?i64 = null,
+            fps: ?i32 = null,
+            pipeline: ?[]const u8 = null,
+            cfg_scale: ?f32 = null,
+            cfg_audio_scale: ?f32 = null, // accepted; this backend has one CFG
+            stg_scale: ?f32 = null,
+            lora_path: ?[]const u8 = null,
+            lora_scale: ?f32 = null,
+            first_frame_image: ?[]const u8 = null,
+            end_frame_image: ?[]const u8 = null,
+            audio: ?[]const u8 = null, // a2v is not supported by this backend
+            stream: bool = false,
+            model: ?[]const u8 = null,
+        };
+        const parsed = std.json.parseFromSlice(Req, a, body, .{ .ignore_unknown_fields = true }) catch {
+            return sendError(conn, "400 Bad Request", "invalid_request_error", "Invalid JSON body");
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        if (req.prompt.len == 0) {
+            return sendError(conn, "400 Bad Request", "invalid_request_error", "missing 'prompt'");
+        }
+        if (req.audio != null) {
+            return sendError(conn, "400 Bad Request", "invalid_request_error", "audio-to-video is not supported by this backend");
+        }
+
+        const resolver = self.video_resolver orelse {
+            return sendError(conn, "503 Service Unavailable", "model_not_found", "video generation not wired up");
+        };
+        var path_buf: [1024]u8 = undefined;
+        const model_path = resolver.func(resolver.ctx, &path_buf) orelse {
+            return sendError(conn, "503 Service Unavailable", "model_not_found", "No video model selected in the app");
+        };
+        const dir = std.fs.path.dirname(model_path) orelse ".";
+
+        var vspec = genspec.resolveVideo(a, model_path, dir) catch |e| {
+            return sendError(conn, "400 Bad Request", "invalid_request_error", genspec.message(e));
+        };
+        defer vspec.deinit();
+        const is_ltx = vspec.isLtx();
+
+        // Two-stage pipelines need the spatial upscaler sidecar — explicit 400,
+        // never a silent one-stage downgrade (mlx-serve contract).
+        var hires = false;
+        var hires_denoise: f32 = 0.7;
+        if (req.pipeline) |p| {
+            if (std.mem.eql(u8, p, "two_stage") or std.mem.eql(u8, p, "two_stage_hq")) {
+                if (vspec.spec.upscaler == null) {
+                    return sendError(conn, "400 Bad Request", "invalid_request_error", "two-stage pipelines need the LTX spatial upscaler next to the model (ltx-2.3-spatial-upscaler-x2-*.safetensors)");
+                }
+                hires = true;
+                if (std.mem.eql(u8, p, "two_stage_hq")) hires_denoise = 0.45;
+            } else if (!std.mem.eql(u8, p, "one_stage")) {
+                return sendError(conn, "400 Bad Request", "invalid_request_error", "'pipeline' must be one_stage, two_stage or two_stage_hq");
+            }
+        }
+
+        // Two-stage semantics follow mlx-serve: the requested width/height are
+        // the FINAL size — stage 1 generates at half resolution and the spatial
+        // upscaler doubles it back. One-stage generates at the requested size.
+        var width: i32 = req.width orelse 832;
+        var height: i32 = req.height orelse 480;
+        if (hires) {
+            width = @divTrunc(width, 2);
+            height = @divTrunc(height, 2);
+        }
+        const distilled = isDistilledName(modelId(model_path));
+        var params: video.Params = .{
+            .steps = req.steps orelse (if (distilled) @as(i32, 12) else 30),
+            .cfg = req.cfg_scale orelse (if (distilled) @as(f32, 1.0) else 6.0),
+            .flow_shift = if (@max(width, height) >= 720) 5.0 else 3.0,
+            .width = width,
+            .height = height,
+            .frames = req.num_frames orelse 33,
+            .fps = req.fps orelse (if (is_ltx) @as(i32, 24) else 16),
+            .seed = req.seed orelse -1,
+            .n_threads = self.cfg.n_threads,
+            .slg_scale = req.stg_scale orelse 0,
+            .hires = hires,
+            .hires_denoise = hires_denoise,
+        };
+        if (req.stage2_steps) |s| {
+            if (s > 0) params.hires_steps = s;
+        }
+        if (req.lora_scale) |s| params.lora_scale = s;
+
+        var init_img: ?video.InitImage = null;
+        defer if (init_img) |im| self.gpa.free(im.rgba);
+        if (req.first_frame_image) |b64| {
+            const dec = self.decodeB64Image(a, b64) orelse
+                return sendError(conn, "400 Bad Request", "invalid_request_error", "could not decode 'first_frame_image' (base64 PNG/JPEG expected)");
+            init_img = .{ .width = dec.width, .height = dec.height, .rgba = dec.rgba };
+        }
+        var end_img: ?video.InitImage = null;
+        defer if (end_img) |im| self.gpa.free(im.rgba);
+        if (req.end_frame_image) |b64| {
+            const dec = self.decodeB64Image(a, b64) orelse
+                return sendError(conn, "400 Bad Request", "invalid_request_error", "could not decode 'end_frame_image' (base64 PNG/JPEG expected)");
+            end_img = .{ .width = dec.width, .height = dec.height, .rgba = dec.rgba };
+        }
+
+        self.req_lock.lock();
+        defer self.req_lock.unlock();
+        self.video_backend.start() catch {
+            return sendError(conn, "500 Internal Server Error", "server_error", "could not start video backend");
+        };
+        // An empty negative hurts Wan quality badly — substitute the standard
+        // suppression list (same default as the GUI).
+        const neg = blk: {
+            const n = req.negative_prompt orelse "";
+            break :blk if (std.mem.trim(u8, n, " \t\n").len > 0) n else genspec.default_video_negative;
+        };
+        self.video_backend.submit(vspec.spec, req.prompt, neg, params, init_img, end_img, req.lora_path) catch {
+            return sendError(conn, "500 Internal Server Error", "server_error", "could not submit request");
+        };
+
+        if (req.stream) try conn.writeAll(sse_headers);
+
+        var frames_res: ?@TypeOf(@as(video.Event, undefined).frames) = null;
+        var err_msg: ?[]const u8 = null;
+        var client_gone = false;
+        var tmp: std.ArrayList(video.Event) = .empty;
+        defer tmp.deinit(self.gpa);
+        loop: while (true) {
+            self.video_backend.events.drain(&tmp);
+            if (tmp.items.len == 0) {
+                Io.sleep(conn.io, Io.Duration.fromMilliseconds(20), .awake) catch {};
+                continue;
+            }
+            for (tmp.items) |ev| switch (ev) {
+                .progress => |p| {
+                    if (req.stream and !client_gone) {
+                        const stage = if (self.video_backend.decoding.load(.acquire)) "decode" else "diffusion";
+                        if (!sseProgress(conn, stage, p.step, p.total)) {
+                            client_gone = true;
+                            self.video_backend.cancel();
+                        }
+                    }
+                },
+                .frames => |f| frames_res = f,
+                .err => |e| {
+                    err_msg = a.dupe(u8, e) catch "generation failed";
+                    self.gpa.free(e);
+                },
+            };
+            if (frames_res != null or err_msg != null) break :loop;
+            tmp.clearRetainingCapacity();
+        }
+        if (err_msg) |e| {
+            if (req.stream) {
+                sseError(conn, e);
+                return;
+            }
+            return sendError(conn, "500 Internal Server Error", "server_error", e);
+        }
+        const fr = frames_res.?;
+        defer {
+            for (fr.images) |img| self.gpa.free(@constCast(img.pixels));
+            self.gpa.free(fr.images);
+            if (fr.audio) |au| self.gpa.free(au.samples);
+        }
+        if (client_gone or fr.images.len == 0) return;
+
+        // Concatenate frames as packed RGB (mlx-serve's "rgb8" format), base64.
+        const fw: u32 = fr.images[0].width;
+        const fh: u32 = fr.images[0].height;
+        const px: usize = @as(usize, fw) * @as(usize, fh);
+        const rgb = try a.alloc(u8, px * 3 * fr.images.len);
+        for (fr.images, 0..) |img, fi| {
+            const base = fi * px * 3;
+            var i: usize = 0;
+            while (i < px) : (i += 1) {
+                rgb[base + i * 3 + 0] = img.pixels[i * 4 + 0];
+                rgb[base + i * 3 + 1] = img.pixels[i * 4 + 1];
+                rgb[base + i * 3 + 2] = img.pixels[i * 4 + 2];
+            }
+        }
+        const b64_len = std.base64.standard.Encoder.calcSize(rgb.len);
+        const b64 = try a.alloc(u8, b64_len);
+        _ = std.base64.standard.Encoder.encode(b64, rgb);
+
+        var out: Io.Writer.Allocating = .init(a);
+        const w = &out.writer;
+        try w.writeAll(if (req.stream) "data: {\"type\":\"complete\"," else "{\"created\":0,");
+        try w.print("\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":{d},\"format\":\"rgb8\",\"data\":\"", .{ fr.images.len, fh, fw, fr.fps });
+        try w.writeAll(b64);
+        try w.writeAll("\"");
+        if (fr.audio) |au| {
+            // f32 [-1,1] interleaved → PCM16LE, base64 (mlx-serve audio format).
+            const pcm = try a.alloc(u8, au.samples.len * 2);
+            for (au.samples, 0..) |v, i| {
+                const clamped = @max(@as(f32, -1.0), @min(@as(f32, 1.0), v));
+                const iv: i16 = @intFromFloat(@round(clamped * 32767.0));
+                const u: u16 = @bitCast(iv);
+                pcm[i * 2] = @intCast(u & 0xff);
+                pcm[i * 2 + 1] = @intCast((u >> 8) & 0xff);
+            }
+            const ab64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(pcm.len));
+            _ = std.base64.standard.Encoder.encode(ab64, pcm);
+            try w.print(",\"audio_sample_rate\":{d},\"audio_channels\":{d},\"audio_format\":\"pcm_s16le\",\"audio_data\":\"", .{ au.sample_rate, au.channels });
+            try w.writeAll(ab64);
+            try w.writeAll("\"");
+        }
+        try w.writeAll(if (req.stream) "}\n\n" else "}");
+        if (req.stream) {
+            try conn.writeAll(out.written());
+            try conn.flush();
+            return;
+        }
+        try sendJson(conn, "200 OK", out.written());
     }
 };
 

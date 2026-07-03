@@ -17,6 +17,14 @@ int zigai_write_png(const char *path, const unsigned char *rgba, int w, int h) {
     return stbi_write_png(path, w, h, 4, rgba, w * 4) ? 1 : 0;
 }
 
+// Encode an RGBA8 image as PNG into a malloc'd buffer (free with
+// zigai_free_image); writes the byte count to *out_len. NULL on error.
+// Used by the HTTP API's b64_json image responses.
+unsigned char *zigai_encode_png_mem(const unsigned char *rgba, int w, int h, int *out_len) {
+    if (!rgba || w <= 0 || h <= 0 || !out_len) return 0;
+    return stbi_write_png_to_mem(rgba, w * 4, w, h, 4, out_len);
+}
+
 // Decode an image file (PNG/JPG/…) to RGBA8. Writes dimensions to *w/*h and
 // returns a malloc'd w*h*4 buffer (free with zigai_free_image), or NULL on error.
 // Used for the video init frame (image-to-video).

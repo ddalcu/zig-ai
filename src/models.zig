@@ -181,6 +181,8 @@ pub fn classifyName(basename: []const u8) ?Kind {
         std.mem.indexOf(u8, lower, "text_encoder") != null or
         std.mem.indexOf(u8, lower, "encoder") != null or
         std.mem.indexOf(u8, lower, "tokenizer") != null or // codec/audio tokenizer sidecar
+        std.mem.indexOf(u8, lower, "upscal") != null or // latent/spatial upscaler sidecar
+        std.mem.indexOf(u8, lower, "upsampl") != null or
         std.mem.indexOf(u8, lower, "clip_vision") != null or
         std.mem.indexOf(u8, lower, "clip-vision") != null) return null;
     if (std.mem.indexOf(u8, lower, "tts") != null) return .tts;
@@ -193,6 +195,7 @@ pub fn classifyName(basename: []const u8) ?Kind {
         std.mem.indexOf(u8, lower, "stable_diffusion") != null or
         std.mem.indexOf(u8, lower, "sdxl") != null or
         std.mem.indexOf(u8, lower, "flux") != null or
+        std.mem.indexOf(u8, lower, "krea") != null or
         std.mem.indexOf(u8, lower, "-sd-") != null) return .image;
     return .text;
 }

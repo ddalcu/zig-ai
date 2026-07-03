@@ -32,6 +32,26 @@ pub const Entry = struct {
 /// Verified against the node-omni download set (same backends).
 pub const entries = [_]Entry{
     .{
+        // Krea2 (Raw/Turbo): Krea2 DiT + Wan 2.1 VAE + Qwen3-VL-4B LLM encoder
+        // (see deps/stable-diffusion.cpp/docs/krea2.md). The encoder is renamed
+        // so the scanner treats it as a support file ("encoder") while
+        // `findSupport`'s "qwen" needle still matches it.
+        .match = "krea-2",
+        .sidecars = &.{
+            .{
+                .repo = "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+                .file = "split_files/vae/wan_2.1_vae.safetensors",
+                .label = "Wan 2.1 VAE (~0.3 GB)",
+            },
+            .{
+                .repo = "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+                .file = "Qwen3VL-4B-Instruct-Q4_K_M.gguf",
+                .dest = "qwen3-vl-4b-text-encoder.gguf",
+                .label = "Qwen3-VL-4B text encoder (~2.5 GB)",
+            },
+        },
+    },
+    .{
         .match = "flux.2-klein",
         .sidecars = &.{
             .{
@@ -111,6 +131,20 @@ pub const recommended = [_]Recommended{
             // Keep "gemma" (the video backend's findSupport locates it) but add
             // "encoder" so the scanner treats it as support, not a chat model.
             .{ .repo = "unsloth/gemma-3-12b-it-GGUF", .file = "gemma-3-12b-it-Q4_K_M.gguf", .dest = "gemma-3-12b-it-text-encoder.gguf", .label = "Gemma-3 12B text encoder (~7 GB)" },
+            // Optional: the spatial latent upscaler enables the two-stage hires
+            // pipeline (low-res pass → 2× latent upscale → short refine).
+            .{ .repo = "Lightricks/LTX-2.3", .file = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors", .label = "LTX spatial upscaler ×2 (~1 GB)" },
+        },
+    },
+    .{
+        .kind = .image,
+        .title = "Krea-2 Turbo",
+        .note = "Krea2 DiT (Q4_K_M) + Wan 2.1 VAE + Qwen3-VL-4B text encoder",
+        .repo = "realrebelai/KREA-2_GGUFs",
+        .items = &.{
+            .{ .repo = "realrebelai/KREA-2_GGUFs", .file = "TURBO/Krea-2-Turbo-Q4_K_M.gguf", .label = "Krea-2 Turbo diffusion (Q4_K_M, ~7.2 GB)" },
+            .{ .repo = "Comfy-Org/Wan_2.1_ComfyUI_repackaged", .file = "split_files/vae/wan_2.1_vae.safetensors", .label = "Wan 2.1 VAE (~0.3 GB)" },
+            .{ .repo = "Qwen/Qwen3-VL-4B-Instruct-GGUF", .file = "Qwen3VL-4B-Instruct-Q4_K_M.gguf", .dest = "qwen3-vl-4b-text-encoder.gguf", .label = "Qwen3-VL-4B text encoder (~2.5 GB)" },
         },
     },
     .{

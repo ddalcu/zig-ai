@@ -16,9 +16,9 @@ tool servers + agent mode, system-tray status, light/dark themes.
 
 Everything runs in one process: each backend's C/C++ library is linked directly
 and driven from a background worker thread, streaming results to the UI through a
-thread-safe channel. Nothing listens on a port; models, prompts and audio never
-leave the machine (the only outbound traffic is the model downloader, and MCP
-servers you explicitly add).
+thread-safe channel. Models, prompts and audio never leave the machine (the only
+outbound traffic is the model downloader, and MCP servers you explicitly add);
+the built-in OpenAI-compatible server listens on your local network only.
 
 macOS (Apple Silicon, Metal) is the primary target; Linux and Windows builds
 are produced by CI (CPU inference). Download binaries from the
@@ -75,16 +75,15 @@ The three AI backends are vendored as git submodules under `deps/`:
 | submodule | upstream |
 | --- | --- |
 | `deps/llama.cpp` | `ggml-org/llama.cpp` (chat + the shared ggml) |
-| `deps/stable-diffusion.cpp` | `leejet/stable-diffusion.cpp` (image + video) |
+| `deps/stable-diffusion.cpp` | `ddalcu/stable-diffusion.cpp` — our fork of `leejet/stable-diffusion.cpp` (image + video); any zig-ai patches live on the fork |
 | `deps/qwen3-tts.cpp` | `predict-woo/qwen3-tts.cpp` (TTS) |
 
 After cloning, fetch them (including each repo's nested `ggml`) and apply the
-local Metal patches (see "Video runs on Metal" below):
+local Metal patch (see "Video runs on Metal" below):
 
 ```sh
 git submodule update --init --recursive
 git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
-git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
 ```
 
 Then build:
@@ -132,6 +131,17 @@ default voice, or clones one from a reference: pick a WAV (any sample rate) or
 record a few seconds with the built-in mic recorder. The speaker encoder is
 part of the TTS model — no extra files needed.
 
+**Image.** Classic SD checkpoints are one self-contained file; split models
+pair a diffusion `.gguf` with sidecars auto-discovered beside it:
+- **Krea2** (Raw / Turbo) — diffusion `*.gguf` + Wan 2.1 VAE + a Qwen3-VL
+  `*.gguf` text encoder. Tested with
+  [realrebelai/KREA-2_GGUFs](https://huggingface.co/realrebelai/KREA-2_GGUFs) (Turbo Q4_K_M)
+  + Comfy-Org `wan_2.1_vae.safetensors` +
+  [Qwen/Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF).
+  Turbo is distilled: ~8 steps at CFG 1.0.
+- **FLUX.2** — diffusion `*.gguf` + FLUX VAE + a Qwen3 `*.gguf` encoder;
+  **FLUX.1** — CLIP-L + T5-XXL instead.
+
 **Video.** Drop a video model's files in one folder; the diffusion `.gguf` shows
 up as a **Video** model and its sidecars are auto-discovered beside it.
 - **Wan 2.2** — diffusion `*.gguf` + `*vae*.safetensors` + `umt5-xxl-*.gguf`.
@@ -144,18 +154,39 @@ up as a **Video** model and its sidecars are auto-discovered beside it.
   (LTX is built for 1280×720; very small sizes degrade badly, and frame counts are
   aligned to its temporal factor.)
 
-> **Video runs on Metal**, like everything else. This needs two local patches to
-> the vendored deps (since upstream ggml-org's Metal backend lacks the ops the
-> video VAEs need):
-> 1. `stable-diffusion.cpp` `ggml_ext_conv_3d` routes through the `GGML_OP_CONV_3D`
->    op (Metal kernel exists) instead of the `IM2COL_3D` decomposition (no Metal kernel).
-> 2. ggml's Metal `PAD` kernel is extended to support left/causal padding (the Wan/LTX
->    VAE needs it; mainline Metal was right-pad only).
->
-> The patches are kept as files in `deps/patches/` — apply them after every
-> `git submodule update` (see Building above); CI applies them automatically.
-> The Metal `conv_3d` kernel is naive, so the VAE pass is not fast; set
-> `keep_vae_on_cpu` in `video.zig` for a faster Metal-diffusion + CPU-VAE hybrid.
+> **Video runs on Metal**, like everything else. stable-diffusion.cpp handles
+> Metal's missing `IM2COL_3D` kernel since leejet#1731 (it checks
+> `ggml_backend_supports_op` and falls back to the direct `GGML_OP_CONV_3D`
+> op); our fork's `zig-ai` branch extends the same fallback to the
+> `force_prec_f32` branch, which the LTX-2.3 VAE *encoder* needs — without it,
+> image-to-video aborts on Metal. That fix is a committed part of the pinned
+> submodule, so no patch is needed. One optional local patch remains: ggml's
+> Metal `PAD` kernel extended with left/causal padding
+> (`deps/patches/llama.cpp-metal-left-pad.patch`); without it sd.cpp falls
+> back to right-pad + `ggml_roll` — still correct, just marginally slower.
+> Apply it after every `git submodule update` (see Building above); CI
+> applies it automatically.
+
+## Local API
+
+The app serves an OpenAI-compatible HTTP API on `http://0.0.0.0:8080/v1` (the
+tray shows the LAN URL). Chat: `/v1/chat/completions`, `/v1/completions`,
+`/v1/embeddings`, `/v1/models`. Media generation runs against the models
+selected in the GUI, with the same request fields as
+[mlx-serve](https://github.com/ddalcu/mlx-serve):
+
+- `POST /v1/images/generations` — `prompt` (required), `size` `"WxH"` (or
+  `width`/`height`), `steps`, `seed`, `cfg`/`cfg_scale`, `negative_prompt`,
+  `image` (base64 source) + `mode:"variation"` + `strength`, `lora_path` +
+  `lora_scale`, `stream` (SSE progress). Returns
+  `{"created":0,"data":[{"b64_json":"<png>"}]}`.
+- `POST /v1/video/generations` — `prompt`, `num_frames`, `width`, `height`,
+  `steps`, `seed`, `fps`, `cfg_scale`, `stg_scale`, `pipeline`
+  (`one_stage`/`two_stage`/`two_stage_hq` — two-stage needs the LTX spatial
+  upscaler sidecar), `stage2_steps`, `negative_prompt`, `first_frame_image` /
+  `end_frame_image` (base64), `lora_path` + `lora_scale`, `stream`. Returns
+  raw `rgb8` frames base64 plus `audio_*` PCM16 fields when the model
+  generates sound (LTX).
 
 ## MCP & agent mode
 

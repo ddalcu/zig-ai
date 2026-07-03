@@ -251,11 +251,19 @@ fn themeProvider() zigui.Theme {
     return widgets.active;
 }
 
-/// Model resolver for the HTTP API server: returns the GUI's selected chat model
-/// path (thread-safe). Called from the server thread.
+/// Model resolvers for the HTTP API server: return the GUI's selected chat /
+/// image / video model paths (thread-safe). Called from the server thread.
 fn apiResolveModel(ctx: *anyopaque, out: []u8) ?[]const u8 {
     const st: *AppState = @ptrCast(@alignCast(ctx));
     return st.apiModelPath(out);
+}
+fn apiResolveImageModel(ctx: *anyopaque, out: []u8) ?[]const u8 {
+    const st: *AppState = @ptrCast(@alignCast(ctx));
+    return st.apiImageModelPath(out);
+}
+fn apiResolveVideoModel(ctx: *anyopaque, out: []u8) ?[]const u8 {
+    const st: *AppState = @ptrCast(@alignCast(ctx));
+    return st.apiVideoModelPath(out);
 }
 
 /// Best-effort primary LAN IPv4 — the address the OS would use to reach the
@@ -747,53 +755,15 @@ fn writePpm(path: []const u8, img: zigui.canvas.Image) void {
     }
 }
 
-fn runImageSmoke(gpa: std.mem.Allocator, spec: sd.ModelSpec, prompt: []const u8, out: []const u8) !void {
+fn runImageSmoke(gpa: std.mem.Allocator, spec: sd.ModelSpec, prompt: []const u8, out: []const u8, params: sd.Params, runs: u32, init_path: ?[]const u8) !void {
     var be = sd.Backend.init(gpa);
     defer be.deinit();
     try be.start();
-    try be.submit(spec, prompt, "", .{ .steps = 20, .width = 512, .height = 512 });
-    var done = false;
-    while (!done) {
-        var tmp: std.ArrayList(sd.Event) = .empty;
-        defer tmp.deinit(gpa);
-        be.events.drain(&tmp);
-        for (tmp.items) |ev| switch (ev) {
-            .progress => |p| std.debug.print("\rstep {d}/{d}   ", .{ p.step, p.total }),
-            .image => |img| {
-                std.debug.print("\n[image {d}x{d}] -> {s}\n", .{ img.width, img.height, out });
-                writePpm(out, img);
-                gpa.free(@constCast(img.pixels));
-                done = true;
-            },
-            .err => |e| {
-                std.debug.print("[error: {s}]\n", .{e});
-                gpa.free(e);
-                done = true;
-            },
-        };
-        if (!done and tmp.items.len == 0) app.c.SDL_Delay(50);
-    }
-}
 
-/// Headless video generation (Wan or LTX). Writes each decoded frame to
-/// `<out>-NNN.ppm` (the `--out` value with its extension stripped as prefix).
-fn runVideoSmoke(
-    gpa: std.mem.Allocator,
-    spec: video.ModelSpec,
-    prompt: []const u8,
-    out: []const u8,
-    params: video.Params,
-    runs: u32,
-    init_path: ?[]const u8,
-) !void {
-    var be = video.Backend.init(gpa);
-    defer be.deinit();
-    try be.start();
-
-    // Optional image-to-video start frame (tests the VAE-encoder path + reload).
+    // Optional image-to-image source (tests the VAE-encode path).
     var decoded: ?codecs.DecodedImage = null;
     defer if (decoded) |d| codecs.freeImage(d);
-    var init_img: ?video.InitImage = null;
+    var init_img: ?sd.InitImage = null;
     if (init_path) |p| {
         const pz = try gpa.dupeZ(u8, p);
         defer gpa.free(pz);
@@ -807,8 +777,85 @@ fn runVideoSmoke(
     const prefix = out[0 .. std.mem.lastIndexOfScalar(u8, out, '.') orelse out.len];
     var run: u32 = 0;
     while (run < runs) : (run += 1) {
+        if (runs > 1) std.debug.print("=== run {d}/{d} ===\n", .{ run + 1, runs });
+        try be.submit(spec, prompt, "", params, init_img, null);
+        var done = false;
+        while (!done) {
+            var tmp: std.ArrayList(sd.Event) = .empty;
+            defer tmp.deinit(gpa);
+            be.events.drain(&tmp);
+            for (tmp.items) |ev| switch (ev) {
+                .progress => |p| std.debug.print("\rstep {d}/{d}   ", .{ p.step, p.total }),
+                .image => |img| {
+                    var buf: [512]u8 = undefined;
+                    const path = if (runs > 1)
+                        std.fmt.bufPrint(&buf, "{s}-r{d}.ppm", .{ prefix, run }) catch out
+                    else
+                        out;
+                    std.debug.print("\n[image {d}x{d}] -> {s}\n", .{ img.width, img.height, path });
+                    writePpm(path, img);
+                    gpa.free(@constCast(img.pixels));
+                    done = true;
+                },
+                .err => |e| {
+                    std.debug.print("[error: {s}]\n", .{e});
+                    gpa.free(e);
+                    done = true;
+                },
+            };
+            if (!done and tmp.items.len == 0) app.c.SDL_Delay(50);
+        }
+    }
+}
+
+/// Headless video generation (Wan or LTX). Writes each decoded frame to
+/// `<out>-NNN.ppm` (the `--out` value with its extension stripped as prefix).
+fn runVideoSmoke(
+    gpa: std.mem.Allocator,
+    spec: video.ModelSpec,
+    prompt: []const u8,
+    out: []const u8,
+    params: video.Params,
+    runs: u32,
+    init_path: ?[]const u8,
+    end_path: ?[]const u8,
+) !void {
+    var be = video.Backend.init(gpa);
+    defer be.deinit();
+    try be.start();
+
+    // Optional image-to-video start frame (tests the VAE-encoder path + reload)
+    // and last frame (LTX first/last-frame-to-video).
+    var decoded: ?codecs.DecodedImage = null;
+    defer if (decoded) |d| codecs.freeImage(d);
+    var init_img: ?video.InitImage = null;
+    if (init_path) |p| {
+        const pz = try gpa.dupeZ(u8, p);
+        defer gpa.free(pz);
+        if (codecs.loadImage(pz)) |img| {
+            decoded = img;
+            init_img = .{ .width = img.width, .height = img.height, .rgba = img.pixels[0 .. @as(usize, img.width) * @as(usize, img.height) * 4] };
+            std.debug.print("init image: {d}x{d}\n", .{ img.width, img.height });
+        } else std.debug.print("could not decode init image: {s}\n", .{p});
+    }
+    var end_decoded: ?codecs.DecodedImage = null;
+    defer if (end_decoded) |d| codecs.freeImage(d);
+    var end_img: ?video.InitImage = null;
+    if (end_path) |p| {
+        const pz = try gpa.dupeZ(u8, p);
+        defer gpa.free(pz);
+        if (codecs.loadImage(pz)) |img| {
+            end_decoded = img;
+            end_img = .{ .width = img.width, .height = img.height, .rgba = img.pixels[0 .. @as(usize, img.width) * @as(usize, img.height) * 4] };
+            std.debug.print("end image: {d}x{d}\n", .{ img.width, img.height });
+        } else std.debug.print("could not decode end image: {s}\n", .{p});
+    }
+
+    const prefix = out[0 .. std.mem.lastIndexOfScalar(u8, out, '.') orelse out.len];
+    var run: u32 = 0;
+    while (run < runs) : (run += 1) {
         std.debug.print("=== run {d}/{d} ===\n", .{ run + 1, runs });
-        try be.submit(spec, prompt, "", params, init_img);
+        try be.submit(spec, prompt, "", params, init_img, end_img, null);
         var done = false;
         while (!done) {
             var tmp: std.ArrayList(video.Event) = .empty;
@@ -826,6 +873,17 @@ fn runVideoSmoke(
                     }
                     std.debug.print("  wrote {d} frames ({d}x{d})\n", .{ f.images.len, f.images[0].width, f.images[0].height });
                     gpa.free(f.images);
+                    if (f.audio) |au| {
+                        var buf: [512]u8 = undefined;
+                        if (std.fmt.bufPrintSentinel(&buf, "{s}-r{d}.wav", .{ prefix, run }, 0)) |wpath| {
+                            const secs = @as(f32, @floatFromInt(au.samples.len / au.channels)) / @as(f32, @floatFromInt(au.sample_rate));
+                            if (codecs.writeWav(wpath, au.samples, au.sample_rate, au.channels))
+                                std.debug.print("  wrote audio {s} ({d:.2}s @ {d} Hz, {d}ch)\n", .{ wpath, secs, au.sample_rate, au.channels })
+                            else
+                                std.debug.print("  audio write failed\n", .{});
+                        } else |_| {}
+                        gpa.free(au.samples);
+                    }
                     done = true;
                 },
                 .err => |e| {
@@ -859,6 +917,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Optional voice-clone reference for --tts-smoke (WAV, any sample rate).
     var ref_wav: ?[]const u8 = null;
     var video_smoke: ?[]const u8 = null;
+    var auto_video: ?[]const u8 = null;
     var dl_smoke: ?[]const u8 = null;
     var mcp_smoke = false;
     var mcp_add: ?[]const u8 = null;
@@ -870,7 +929,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var connectors_path: ?[]const u8 = null;
     var vruns: u32 = 1;
     var init_image_path: ?[]const u8 = null;
+    var end_image_path: ?[]const u8 = null;
+    var upscaler_path: ?[]const u8 = null;
     var vparams: video.Params = .{ .steps = 8, .width = 256, .height = 256, .frames = 5, .n_threads = 10 };
+    var iparams: sd.Params = .{ .n_threads = 10 };
     var out_path: []const u8 = "/tmp/zigai_out.ppm";
     var model_path: ?[]const u8 = null;
     var mock = false;
@@ -897,6 +959,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (arg_it.next()) |p| ref_wav = p;
         } else if (std.mem.eql(u8, a, "--video-smoke")) {
             if (arg_it.next()) |p| video_smoke = p;
+        } else if (std.mem.eql(u8, a, "--auto-video")) {
+            if (arg_it.next()) |p| auto_video = p;
         } else if (std.mem.eql(u8, a, "--dl-smoke")) {
             if (arg_it.next()) |p| dl_smoke = p;
         } else if (std.mem.eql(u8, a, "--mcp-smoke")) {
@@ -923,10 +987,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (arg_it.next()) |p| vparams.frames = std.fmt.parseInt(i32, p, 10) catch vparams.frames;
         } else if (std.mem.eql(u8, a, "--vsteps")) {
             if (arg_it.next()) |p| vparams.steps = std.fmt.parseInt(i32, p, 10) catch vparams.steps;
+        } else if (std.mem.eql(u8, a, "--vcfg")) {
+            if (arg_it.next()) |p| vparams.cfg = std.fmt.parseFloat(f32, p) catch vparams.cfg;
+        } else if (std.mem.eql(u8, a, "--vfps")) {
+            if (arg_it.next()) |p| vparams.fps = std.fmt.parseInt(i32, p, 10) catch vparams.fps;
+        } else if (std.mem.eql(u8, a, "--vslg")) {
+            if (arg_it.next()) |p| vparams.slg_scale = std.fmt.parseFloat(f32, p) catch vparams.slg_scale;
+        } else if (std.mem.eql(u8, a, "--vseed")) {
+            if (arg_it.next()) |p| vparams.seed = std.fmt.parseInt(i64, p, 10) catch vparams.seed;
+        } else if (std.mem.eql(u8, a, "--hires")) {
+            vparams.hires = true;
+        } else if (std.mem.eql(u8, a, "--hires-steps")) {
+            if (arg_it.next()) |p| vparams.hires_steps = std.fmt.parseInt(i32, p, 10) catch vparams.hires_steps;
+        } else if (std.mem.eql(u8, a, "--upscaler")) {
+            if (arg_it.next()) |p| upscaler_path = p;
         } else if (std.mem.eql(u8, a, "--vruns")) {
             if (arg_it.next()) |p| vruns = std.fmt.parseInt(u32, p, 10) catch vruns;
         } else if (std.mem.eql(u8, a, "--init-image")) {
             if (arg_it.next()) |p| init_image_path = p;
+        } else if (std.mem.eql(u8, a, "--end-image")) {
+            if (arg_it.next()) |p| end_image_path = p;
+        } else if (std.mem.eql(u8, a, "--isteps")) {
+            if (arg_it.next()) |p| iparams.steps = std.fmt.parseInt(i32, p, 10) catch iparams.steps;
+        } else if (std.mem.eql(u8, a, "--iwidth")) {
+            if (arg_it.next()) |p| iparams.width = std.fmt.parseInt(i32, p, 10) catch iparams.width;
+        } else if (std.mem.eql(u8, a, "--iheight")) {
+            if (arg_it.next()) |p| iparams.height = std.fmt.parseInt(i32, p, 10) catch iparams.height;
+        } else if (std.mem.eql(u8, a, "--icfg")) {
+            if (arg_it.next()) |p| iparams.cfg = std.fmt.parseFloat(f32, p) catch iparams.cfg;
+        } else if (std.mem.eql(u8, a, "--iseed")) {
+            if (arg_it.next()) |p| iparams.seed = std.fmt.parseInt(i64, p, 10) catch iparams.seed;
+        } else if (std.mem.eql(u8, a, "--istrength")) {
+            if (arg_it.next()) |p| iparams.strength = std.fmt.parseFloat(f32, p) catch iparams.strength;
         } else if (std.mem.eql(u8, a, "--out")) {
             if (arg_it.next()) |p| out_path = p;
         } else if (std.mem.eql(u8, a, "--model")) {
@@ -992,10 +1084,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         else if (model_path) |mp|
             .{ .model = mp }
         else {
-            std.debug.print("--image-smoke requires --model <single-file> OR --diffusion <flux.gguf> --vae <vae> --llm/--t5xxl <encoder>\n", .{});
+            std.debug.print("--image-smoke requires --model <single-file> OR --diffusion <model.gguf> --vae <vae> --llm/--t5xxl <encoder>\n", .{});
             return;
         };
-        try runImageSmoke(gpa, spec, prompt, out_path);
+        try runImageSmoke(gpa, spec, prompt, out_path, iparams, vruns, init_image_path);
         return;
     }
     if (tts_smoke) |text| {
@@ -1026,7 +1118,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .llm = llm_path,
             .audio_vae = audio_vae_path,
             .connectors = connectors_path,
-        }, prompt, out_path, vparams, vruns, init_image_path);
+            .upscaler = upscaler_path,
+        }, prompt, out_path, vparams, vruns, init_image_path, end_image_path);
         return;
     }
 
@@ -1044,6 +1137,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (start_screen == .editor) st.openEditor(.system_prompt); // seed the buffer
     if (start_screen == .mcp and mock) st.openMcpConfig(1); // demo the config form
     st.rescanModels(); // also re-selects each task's last-used model (sticky) + auto-picks
+
+    // Dev/testing: `--auto-video <prompt>` starts a GUI video generation right
+    // away (the selected video model, small clip) so UI responsiveness under a
+    // real in-GUI generation can be measured without clicking.
+    if (auto_video) |prompt| {
+        st.screen.set(@intFromEnum(st_mod.Screen.video));
+        st.vid_prompt.setText(prompt) catch {};
+        st.vid_frames_n.set(17);
+        st.vid_steps.set(8);
+        st.generateVideo();
+    }
 
     // Seed the starting theme; for `.system` this queries the OS. shell.body
     // re-resolves this every frame, so it also tracks live OS theme changes.
@@ -1115,8 +1219,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     st.loadConfig(init.environ);
 
     // Local OpenAI-compatible HTTP server (localhost), serving the selected chat
-    // model over /v1/chat/completions. Lazily loads its own model on first request.
+    // model over /v1/chat/completions — plus /v1/images/generations and
+    // /v1/video/generations over the selected image/video models. Each lazily
+    // loads its own model on first request.
     var chat_api = api.Server.init(gpa, .{}, .{ .ctx = &st, .func = &apiResolveModel });
+    chat_api.image_resolver = .{ .ctx = &st, .func = &apiResolveImageModel };
+    chat_api.video_resolver = .{ .ctx = &st, .func = &apiResolveVideoModel };
     chat_api.start() catch |e| std.debug.print("api: server failed to start: {s}\n", .{@errorName(e)});
     defer chat_api.deinit();
     // The GUI talks to that server over HTTP for chat (single chat engine).

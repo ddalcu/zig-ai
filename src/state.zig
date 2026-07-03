@@ -8,7 +8,7 @@ const zigui = @import("zigui");
 const app = @import("zigui_app");
 const models = @import("models.zig");
 const config = @import("config.zig");
-const codecs = @import("codecs/codecs.zig");
+pub const codecs = @import("codecs/codecs.zig");
 const channel = @import("channel.zig");
 const mcp = @import("mcp.zig");
 const agent = @import("agent.zig");
@@ -18,6 +18,7 @@ const accel = @import("backends/accel.zig");
 const sd = @import("backends/sd.zig");
 const tts = @import("backends/tts.zig");
 const video = @import("backends/video.zig");
+const genspec = @import("genspec.zig");
 const downloader = @import("backends/downloader.zig");
 const audioplay = @import("audio.zig");
 
@@ -322,23 +323,47 @@ pub const AppState = struct {
 
     // --- image ------------------------------------------------------------
     img_prompt: zigui.TextFieldState,
+    img_negative: zigui.TextFieldState,
+    img_neg_scroll: zigui.ScrollState = .{},
     img_steps: zigui.State(f32),
     img_cfg: zigui.State(f32),
     img_width: zigui.State(i64),
     img_height: zigui.State(i64),
+    /// Seed as free text (empty or non-numeric → -1 = random).
+    img_seed: zigui.TextFieldState,
     img_advanced: zigui.State(bool),
     img_scroll: zigui.ScrollState = .{},
     /// Last generated image, shown in the preview pane.
     img_result: ?zigui.canvas.Image = null,
+    /// Optional source image for image-to-image (SDEdit variation at
+    /// `img_strength`); decoded RGBA8 (owned by stb_image; freed via
+    /// `codecs.freeImage`). `img_image_pending` guards collecting the
+    /// file-dialog result in `pumpImage`.
+    img_init_image: ?codecs.DecodedImage = null,
+    img_image_pending: bool = false,
+    img_strength: zigui.State(f32),
+    /// Optional style LoRA (.safetensors/.gguf), picked via the file dialog.
+    img_lora_path: ?[]u8 = null,
+    img_lora_pending: bool = false,
+    img_lora_scale: zigui.State(f32),
     sd: sd.Backend,
 
-    // --- video (Wan) ------------------------------------------------------
+    // --- video (Wan / LTX) --------------------------------------------------
     vid_prompt: zigui.TextFieldState,
     vid_negative: zigui.TextFieldState,
     vid_neg_scroll: zigui.ScrollState = .{},
     vid_steps: zigui.State(f32),
     vid_cfg: zigui.State(f32),
     vid_frames_n: zigui.State(i64),
+    vid_fps_n: zigui.State(i64),
+    /// Seed as free text (empty or non-numeric → -1 = random).
+    vid_seed: zigui.TextFieldState,
+    /// Spatio-temporal guidance scale (LTX STG / sd.cpp SLG); 0 = off.
+    vid_slg: zigui.State(f32),
+    /// Two-stage hires (LTX spatial latent upscaler): generate at the picked
+    /// size, 2× latent upscale, short refine. Needs an `*upscaler*` sidecar.
+    vid_hires: zigui.State(bool),
+    vid_advanced: zigui.State(bool),
     /// Output size, split into two compact pickers (a single 5-way picker is too
     /// wide for the panel): orientation 0=landscape/1=portrait/2=square and
     /// quality 0=480p/1=720p. Combined by `videoSize`.
@@ -347,15 +372,22 @@ pub const AppState = struct {
     vid_scroll: zigui.ScrollState = .{},
     /// Decoded frames of the last generation; cycled for playback in the view.
     vid_result: ?[]zigui.canvas.Image = null,
-    vid_fps: i32 = 16,
+    vid_fps: i32 = 24,
     /// Frame currently shown; advanced each frame for simple playback.
     vid_play_idx: usize = 0,
     vid_play_tick: u32 = 0,
-    /// Optional starting frame for image-to-video (Wan TI2V), decoded to RGBA8
-    /// (owned by stb_image; freed via `codecs.freeImage`). `vid_image_pending`
-    /// guards collecting the file-dialog result in `pumpVideo`.
+    /// Optional starting frame for image-to-video (Wan TI2V / LTX I2V), decoded
+    /// to RGBA8 (owned by stb_image; freed via `codecs.freeImage`).
+    /// `vid_image_pending` guards collecting the file-dialog result in `pumpVideo`.
     vid_init_image: ?codecs.DecodedImage = null,
     vid_image_pending: bool = false,
+    /// Optional last frame (LTX first/last-frame-to-video).
+    vid_end_image: ?codecs.DecodedImage = null,
+    vid_end_pending: bool = false,
+    /// Optional style LoRA (.safetensors/.gguf), picked via the file dialog.
+    vid_lora_path: ?[]u8 = null,
+    vid_lora_pending: bool = false,
+    vid_lora_scale: zigui.State(f32),
     video: video.Backend,
 
     // --- audio / tts ------------------------------------------------------
@@ -473,19 +505,29 @@ pub const AppState = struct {
                 zigui.TextFieldState.init(gpa),
             },
             .img_prompt = zigui.TextFieldState.init(gpa),
+            .img_negative = zigui.TextFieldState.init(gpa),
             .img_steps = zigui.State(f32).init(gpa, 20),
             .img_cfg = zigui.State(f32).init(gpa, 7),
             .img_width = zigui.State(i64).init(gpa, 512),
             .img_height = zigui.State(i64).init(gpa, 512),
+            .img_seed = zigui.TextFieldState.init(gpa),
             .img_advanced = zigui.State(bool).init(gpa, false),
+            .img_strength = zigui.State(f32).init(gpa, 0.6),
+            .img_lora_scale = zigui.State(f32).init(gpa, 1.0),
             .sd = sd.Backend.init(gpa),
             .vid_prompt = zigui.TextFieldState.init(gpa),
             .vid_negative = zigui.TextFieldState.init(gpa),
             .vid_steps = zigui.State(f32).init(gpa, 30),
             .vid_cfg = zigui.State(f32).init(gpa, 5.0),
             .vid_frames_n = zigui.State(i64).init(gpa, 49),
+            .vid_fps_n = zigui.State(i64).init(gpa, 24),
+            .vid_seed = zigui.TextFieldState.init(gpa),
+            .vid_slg = zigui.State(f32).init(gpa, 0),
+            .vid_hires = zigui.State(bool).init(gpa, false),
+            .vid_advanced = zigui.State(bool).init(gpa, false),
             .vid_orient = zigui.State(i64).init(gpa, 0),
             .vid_quality = zigui.State(i64).init(gpa, 0),
+            .vid_lora_scale = zigui.State(f32).init(gpa, 1.0),
             .video = video.Backend.init(gpa),
             .tts = tts.Backend.init(gpa),
             .tts_text = zigui.TextFieldState.init(gpa),
@@ -549,21 +591,35 @@ pub const AppState = struct {
         self.messages.deinit(self.gpa);
         self.chat_input.deinit();
         self.img_prompt.deinit();
+        self.img_negative.deinit();
         self.img_steps.deinit();
         self.img_cfg.deinit();
         self.img_width.deinit();
         self.img_height.deinit();
+        self.img_seed.deinit();
         self.img_advanced.deinit();
+        self.img_strength.deinit();
+        self.img_lora_scale.deinit();
         if (self.img_result) |img| self.gpa.free(@constCast(img.pixels));
+        self.clearImageInit();
+        if (self.img_lora_path) |p| self.gpa.free(p);
         self.vid_prompt.deinit();
         self.vid_negative.deinit();
         self.vid_steps.deinit();
         self.vid_cfg.deinit();
         self.vid_frames_n.deinit();
+        self.vid_fps_n.deinit();
+        self.vid_seed.deinit();
+        self.vid_slg.deinit();
+        self.vid_hires.deinit();
+        self.vid_advanced.deinit();
         self.vid_orient.deinit();
         self.vid_quality.deinit();
+        self.vid_lora_scale.deinit();
         self.freeVideoResult();
         self.clearVideoImage();
+        self.clearVideoEndImage();
+        if (self.vid_lora_path) |p| self.gpa.free(p);
         self.video.deinit();
         self.tts_text.deinit();
         self.tts_temperature.deinit();
@@ -692,9 +748,21 @@ pub const AppState = struct {
     /// the HTTP API server). Returns the slice, or null if no chat model is
     /// selected. Reads under `model_list_lock` so it can't race `rescanModels`.
     pub fn apiModelPath(self: *AppState, out: []u8) ?[]const u8 {
+        return self.apiPathFor(&self.sel_llm, out);
+    }
+
+    /// Same, for the selected image / video models (media API endpoints).
+    pub fn apiImageModelPath(self: *AppState, out: []u8) ?[]const u8 {
+        return self.apiPathFor(&self.sel_sd, out);
+    }
+    pub fn apiVideoModelPath(self: *AppState, out: []u8) ?[]const u8 {
+        return self.apiPathFor(&self.sel_video, out);
+    }
+
+    fn apiPathFor(self: *AppState, sel: *zigui.State(i64), out: []u8) ?[]const u8 {
         self.model_list_lock.lock();
         defer self.model_list_lock.unlock();
-        const m = self.selectedModel(self.sel_llm.get()) orelse return null;
+        const m = self.selectedModel(sel.get()) orelse return null;
         const n = @min(m.path.len, out.len);
         @memcpy(out[0..n], m.path[0..n]);
         return out[0..n];
@@ -835,6 +903,13 @@ pub const AppState = struct {
         return b.written();
     }
 
+    /// Parse a seed text field: empty or non-numeric → -1 (random).
+    fn parseSeed(text: []const u8) i64 {
+        const t = std.mem.trim(u8, text, " \t\n");
+        if (t.len == 0) return -1;
+        return std.fmt.parseInt(i64, t, 10) catch -1;
+    }
+
     /// Kick off image generation from the current prompt + controls.
     pub fn generateImage(self: *AppState) void {
         if (self.sd.isBusy()) return;
@@ -845,54 +920,93 @@ pub const AppState = struct {
         const prompt = self.img_prompt.text();
         if (std.mem.trim(u8, prompt, " \t\n").len == 0) return;
 
-        // A classic SD checkpoint is one self-contained file. FLUX is split: the
-        // diffusion file plus a VAE and a text encoder (FLUX.2 = a Qwen3 LLM,
-        // FLUX.1 = CLIP-L + T5-XXL), discovered as sidecars in the model folder.
-        var vae: ?[]u8 = null;
-        var enc1: ?[]u8 = null;
-        var enc2: ?[]u8 = null;
-        defer if (vae) |s| self.gpa.free(s);
-        defer if (enc1) |s| self.gpa.free(s);
-        defer if (enc2) |s| self.gpa.free(s);
-
-        var spec: sd.ModelSpec = .{ .model = model.path };
-        if (std.ascii.indexOfIgnoreCase(model.name, "flux") != null) {
-            vae = models.findSupport(self.gpa, model.dir, &.{ "vae", "ae." }, &.{ ".safetensors", ".gguf" }, &.{"audio"});
-            if (vae == null) {
-                self.alertf("FLUX needs a VAE (e.g. flux2-vae.safetensors) next to {s}", .{model.dir});
-                return;
-            }
-            // FLUX.2 ships a Qwen3 LLM text encoder; FLUX.1 uses CLIP-L + T5-XXL.
-            enc1 = models.findSupport(self.gpa, model.dir, &.{"qwen"}, &.{ ".gguf", ".safetensors" }, &.{});
-            if (enc1) |llm| {
-                spec = .{ .diffusion = model.path, .vae = vae.?, .llm = llm };
-            } else {
-                enc1 = models.findSupport(self.gpa, model.dir, &.{ "clip_l", "clip-l" }, &.{ ".safetensors", ".gguf" }, &.{});
-                enc2 = models.findSupport(self.gpa, model.dir, &.{ "t5xxl", "t5-xxl" }, &.{ ".safetensors", ".gguf" }, &.{});
-                if (enc1 == null or enc2 == null) {
-                    self.alertf("FLUX needs a text encoder next to {s}: Qwen3 (FLUX.2) or CLIP-L + T5-XXL (FLUX.1).", .{model.dir});
-                    return;
-                }
-                spec = .{ .diffusion = model.path, .vae = vae.?, .clip_l = enc1.?, .t5xxl = enc2.? };
-            }
-        }
+        // Resolve the model family + sidecars (shared with the HTTP API).
+        var ispec = genspec.resolveImage(self.gpa, model.path, model.name, model.dir) catch |e| {
+            self.alertf("{s}: {s}", .{ model.name, genspec.message(e) });
+            return;
+        };
+        defer ispec.deinit();
+        const spec = ispec.spec;
 
         self.logf("image: generating with {s}…", .{model.name});
         self.rememberLoaded(&self.loaded_sd, &self.loaded_size_sd, model);
+        // Optional image-to-image source (SDEdit variation at img_strength).
+        const init_img: ?sd.InitImage = if (self.img_init_image) |im| .{
+            .width = im.width,
+            .height = im.height,
+            .rgba = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
+        } else null;
         self.sd.start() catch {};
-        self.sd.submit(spec, prompt, "", .{
+        self.sd.submit(spec, prompt, self.img_negative.text(), .{
             .steps = @intFromFloat(self.img_steps.get()),
             .cfg = self.img_cfg.get(),
             .width = @intCast(self.img_width.get()),
             .height = @intCast(self.img_height.get()),
-            .seed = -1,
+            .seed = parseSeed(self.img_seed.text()),
             .n_threads = @intCast(self.threads.get()),
-        }) catch {};
+            .strength = self.img_strength.get(),
+            .lora_scale = self.img_lora_scale.get(),
+        }, init_img, self.img_lora_path) catch {};
+    }
+
+    /// Open the native dialog to pick an image-to-image source. The result is
+    /// collected (and decoded) in `pumpImage`.
+    pub fn chooseImageInit(self: *AppState) void {
+        self.img_image_pending = true;
+        _ = app.openFileDialog(&image_filters, null);
+    }
+
+    /// Drop the image-to-image source.
+    pub fn clearImageInit(self: *AppState) void {
+        if (self.img_init_image) |im| codecs.freeImage(im);
+        self.img_init_image = null;
+    }
+
+    /// Open the native dialog to pick a style LoRA for image generation.
+    pub fn chooseImageLora(self: *AppState) void {
+        self.img_lora_pending = true;
+        _ = app.openFileDialog(&lora_filters, null);
+    }
+
+    pub fn clearImageLora(self: *AppState) void {
+        if (self.img_lora_path) |p| self.gpa.free(p);
+        self.img_lora_path = null;
     }
 
     /// Drain sd events: progress drives the bar (via atomics), final image
     /// replaces the preview. Call once per frame.
     pub fn pumpImage(self: *AppState) void {
+        // Collect the img2img-source / LoRA file picks (only when we opened that
+        // dialog, so we don't steal another screen's pick).
+        if (self.img_image_pending) {
+            switch (app.takeFileDialogResult(self.gpa)) {
+                .none => {},
+                .canceled => self.img_image_pending = false,
+                .picked => |p| {
+                    defer self.gpa.free(p);
+                    self.img_image_pending = false;
+                    const pz = self.gpa.dupeZ(u8, p) catch return;
+                    defer self.gpa.free(pz);
+                    if (codecs.loadImage(pz)) |img| {
+                        self.clearImageInit();
+                        self.img_init_image = img;
+                        self.logf("image: source {d}x{d} from {s}", .{ img.width, img.height, p });
+                    } else self.alert("Could not decode that image.");
+                },
+            }
+        }
+        if (self.img_lora_pending) {
+            switch (app.takeFileDialogResult(self.gpa)) {
+                .none => {},
+                .canceled => self.img_lora_pending = false,
+                .picked => |p| {
+                    self.img_lora_pending = false;
+                    self.clearImageLora();
+                    self.img_lora_path = p;
+                    self.logf("image: LoRA {s}", .{p});
+                },
+            }
+        }
         var tmp: std.ArrayList(sd.Event) = .empty;
         defer tmp.deinit(self.gpa);
         self.sd.events.drain(&tmp);
@@ -936,9 +1050,10 @@ pub const AppState = struct {
     }
 
     /// Encode the just-generated frames to an MP4 in the outputs folder (H.264 via
-    /// the vendored minih264/minimp4 — no ffmpeg). Runs on the UI thread; fast for
-    /// the short clips we generate.
-    fn saveVideoMp4(self: *AppState, frames: []const zigui.canvas.Image, fps: i32) void {
+    /// the vendored minih264/minimp4 — no ffmpeg), plus a sibling WAV when the
+    /// model produced an audio track (LTX). Runs on the UI thread; fast for the
+    /// short clips we generate.
+    fn saveVideoMp4(self: *AppState, frames: []const zigui.canvas.Image, fps: i32, audio: ?video.Audio) void {
         if (frames.len == 0) return;
         const home = self.home orelse return;
         const ptrs = self.gpa.alloc([*]const u8, frames.len) catch return;
@@ -953,6 +1068,17 @@ pub const AppState = struct {
             self.logf("video: saved {s}", .{path})
         else
             self.logf("video: save failed", .{});
+        // The audio track, as `<same-stem>.wav` beside the MP4.
+        if (audio) |au| {
+            const stem = path[0 .. path.len - 4];
+            if (std.fmt.allocPrintSentinel(self.gpa, "{s}.wav", .{stem}, 0)) |wz| {
+                defer self.gpa.free(wz);
+                if (codecs.writeWav(wz, au.samples, au.sample_rate, au.channels))
+                    self.logf("video: saved audio {s}", .{wz})
+                else
+                    self.logf("video: audio save failed", .{});
+            } else |_| {}
+        }
     }
 
     fn freeVideoResult(self: *AppState) void {
@@ -977,46 +1103,13 @@ pub const AppState = struct {
         const prompt = self.vid_prompt.text();
         if (std.mem.trim(u8, prompt, " \t\n").len == 0) return;
 
-        // The video VAE: a *.safetensors/.gguf with "vae" but not "audio".
-        const vae = models.findSupport(self.gpa, model.dir, &.{"vae"}, &.{ ".safetensors", ".gguf" }, &.{"audio"}) orelse {
-            self.alertf("No video VAE found near {s}", .{model.dir});
+        // Resolve the family (Wan vs LTX) + sidecars (shared with the HTTP API).
+        var vspec = genspec.resolveVideo(self.gpa, model.path, model.dir) catch |e| {
+            self.alertf("{s}: {s}", .{ model.name, genspec.message(e) });
             return;
         };
-        defer self.gpa.free(vae);
-
-        // Distinguish Wan (umt5 text encoder) from LTX (Gemma LLM + audio VAE +
-        // embeddings connectors) by which sidecars are present.
-        const gemma = models.findSupport(self.gpa, model.dir, &.{"gemma"}, &.{".gguf"}, &.{});
-        defer if (gemma) |g| self.gpa.free(g);
-
-        var spec: video.ModelSpec = .{ .diffusion = model.path, .vae = vae };
-        var t5: ?[]u8 = null;
-        var avae: ?[]u8 = null;
-        var conn: ?[]u8 = null;
-        defer if (t5) |s| self.gpa.free(s);
-        defer if (avae) |s| self.gpa.free(s);
-        defer if (conn) |s| self.gpa.free(s);
-
-        if (gemma) |g| {
-            // LTX.
-            avae = models.findSupport(self.gpa, model.dir, &.{"audio_vae"}, &.{ ".safetensors", ".gguf" }, &.{});
-            conn = models.findSupport(self.gpa, model.dir, &.{ "connector", "connectors" }, &.{ ".safetensors", ".gguf" }, &.{});
-            if (avae == null or conn == null) {
-                self.alertf("LTX needs an audio-VAE + connectors next to {s}", .{model.dir});
-                return;
-            }
-            spec.llm = g;
-            spec.audio_vae = avae;
-            spec.connectors = conn;
-        } else {
-            // Wan: umt5/t5xxl text encoder.
-            t5 = models.findSupport(self.gpa, model.dir, &.{ "umt5", "t5xxl", "t5-xxl" }, &.{".gguf"}, &.{});
-            if (t5 == null) {
-                self.alertf("No umt5/t5xxl encoder found near {s}", .{model.dir});
-                return;
-            }
-            spec.t5xxl = t5;
-        }
+        defer vspec.deinit();
+        const spec = vspec.spec;
 
         const res = self.videoSize();
         // Wan needs a real frame size (it's trained at ~480–720p); tiny sizes give
@@ -1026,11 +1119,18 @@ pub const AppState = struct {
         // default when the user left the field empty.
         const neg_in = std.mem.trim(u8, self.vid_negative.text(), " \t\n");
         const neg = if (neg_in.len > 0) neg_in else default_video_negative;
+        const hires = self.vid_hires.get() and spec.upscaler != null;
 
-        self.logf("video: generating with {s} ({d}x{d})…", .{ model.name, res.w, res.h });
+        self.logf("video: generating with {s} ({d}x{d}{s})…", .{ model.name, res.w, res.h, if (hires) " ×2 hires" else "" });
         self.rememberLoaded(&self.loaded_video, &self.loaded_size_video, model);
-        // Optional image-to-video starting frame (Wan TI2V).
+        // Optional image-to-video start frame (Wan TI2V / LTX I2V) and last
+        // frame (LTX FLF2V).
         const init_img: ?video.InitImage = if (self.vid_init_image) |im| .{
+            .width = im.width,
+            .height = im.height,
+            .rgba = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
+        } else null;
+        const end_img: ?video.InitImage = if (self.vid_end_image) |im| .{
             .width = im.width,
             .height = im.height,
             .rgba = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
@@ -1041,11 +1141,15 @@ pub const AppState = struct {
             .cfg = self.vid_cfg.get(),
             .flow_shift = flow_shift,
             .frames = @intCast(self.vid_frames_n.get()),
+            .fps = @intCast(self.vid_fps_n.get()),
             .width = res.w,
             .height = res.h,
-            .seed = -1,
+            .seed = parseSeed(self.vid_seed.text()),
             .n_threads = @intCast(self.threads.get()),
-        }, init_img) catch {};
+            .slg_scale = self.vid_slg.get(),
+            .lora_scale = self.vid_lora_scale.get(),
+            .hires = hires,
+        }, init_img, end_img, self.vid_lora_path) catch {};
     }
 
     /// Output frame size from the orientation + quality pickers. Wan TI2V-5B is
@@ -1060,17 +1164,16 @@ pub const AppState = struct {
         };
     }
 
-    /// Default negative prompt for video (Wan's standard quality-suppression list).
-    /// Used when the user leaves the negative field blank.
-    pub const default_video_negative =
-        "low quality, worst quality, blurry, jpeg artifacts, overexposed, static, " ++
-        "still image, watermark, subtitles, text, deformed, disfigured, extra limbs, " ++
-        "fused fingers, messy background, ugly";
+    /// Default negative prompt for video (shared with the HTTP API).
+    pub const default_video_negative = genspec.default_video_negative;
 
-    /// Filters for the video init-frame picker (kept static — SDL holds the
+    /// Filters for the image pickers (kept static — SDL holds the
     /// pointer until the async dialog is dismissed).
     const image_filters = [_]app.FileFilter{
         .{ .name = "Images", .pattern = "png;jpg;jpeg;webp;bmp" },
+    };
+    const lora_filters = [_]app.FileFilter{
+        .{ .name = "LoRA", .pattern = "safetensors;gguf" },
     };
 
     /// Open the native dialog to pick a starting image for image-to-video. The
@@ -1084,6 +1187,29 @@ pub const AppState = struct {
     pub fn clearVideoImage(self: *AppState) void {
         if (self.vid_init_image) |im| codecs.freeImage(im);
         self.vid_init_image = null;
+    }
+
+    /// Open the native dialog to pick the LAST frame (LTX first/last-frame).
+    pub fn chooseVideoEndImage(self: *AppState) void {
+        self.vid_end_pending = true;
+        _ = app.openFileDialog(&image_filters, null);
+    }
+
+    /// Drop the first/last-frame end image.
+    pub fn clearVideoEndImage(self: *AppState) void {
+        if (self.vid_end_image) |im| codecs.freeImage(im);
+        self.vid_end_image = null;
+    }
+
+    /// Open the native dialog to pick a style LoRA for video generation.
+    pub fn chooseVideoLora(self: *AppState) void {
+        self.vid_lora_pending = true;
+        _ = app.openFileDialog(&lora_filters, null);
+    }
+
+    pub fn clearVideoLora(self: *AppState) void {
+        if (self.vid_lora_path) |p| self.gpa.free(p);
+        self.vid_lora_path = null;
     }
 
     /// Drain video events: progress drives the bar (atomics); final frames replace
@@ -1108,6 +1234,35 @@ pub const AppState = struct {
                 },
             }
         }
+        if (self.vid_end_pending) {
+            switch (app.takeFileDialogResult(self.gpa)) {
+                .none => {},
+                .canceled => self.vid_end_pending = false,
+                .picked => |p| {
+                    defer self.gpa.free(p);
+                    self.vid_end_pending = false;
+                    const pz = self.gpa.dupeZ(u8, p) catch return;
+                    defer self.gpa.free(pz);
+                    if (codecs.loadImage(pz)) |img| {
+                        self.clearVideoEndImage();
+                        self.vid_end_image = img;
+                        self.logf("video: end frame {d}x{d} from {s}", .{ img.width, img.height, p });
+                    } else self.alert("Could not decode that image.");
+                },
+            }
+        }
+        if (self.vid_lora_pending) {
+            switch (app.takeFileDialogResult(self.gpa)) {
+                .none => {},
+                .canceled => self.vid_lora_pending = false,
+                .picked => |p| {
+                    self.vid_lora_pending = false;
+                    self.clearVideoLora();
+                    self.vid_lora_path = p;
+                    self.logf("video: LoRA {s}", .{p});
+                },
+            }
+        }
         var tmp: std.ArrayList(video.Event) = .empty;
         defer tmp.deinit(self.gpa);
         self.video.events.drain(&tmp);
@@ -1118,7 +1273,8 @@ pub const AppState = struct {
                 self.vid_result = f.images;
                 self.vid_fps = f.fps;
                 self.logf("video: generated {d} frames", .{f.images.len});
-                self.saveVideoMp4(f.images, f.fps);
+                self.saveVideoMp4(f.images, f.fps, f.audio);
+                if (f.audio) |au| self.gpa.free(au.samples);
             },
             .err => |e| {
                 self.alert(e);

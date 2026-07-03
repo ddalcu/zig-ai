@@ -470,7 +470,6 @@ function Apply-Patch([string]$subRel, [string]$patchName) {
     finally { Pop-Location }
 }
 Apply-Patch 'deps\llama.cpp'             'llama.cpp-metal-left-pad.patch'
-Apply-Patch 'deps\stable-diffusion.cpp'  'stable-diffusion.cpp-conv3d-direct.patch'
 Apply-Patch 'deps\qwen3-tts.cpp'         'qwen3-tts.cpp-win-portability.patch'
 
 # =============================================================================

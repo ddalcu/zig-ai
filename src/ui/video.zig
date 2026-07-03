@@ -1,11 +1,9 @@
-//! Video generation screen (Wan 2.2 via stable-diffusion.cpp). A two-column form
-//! + frame preview, mirroring the Image screen. The selected video model is the
-//! Wan diffusion .gguf; its VAE and umt5 text-encoder are auto-discovered next to
-//! it (see state.generateVideo).
-//!
-//! NOTE: video runs on the GPU (Metal/CUDA/Vulkan) via two local ggml/sd.cpp
-//! patches — a direct CONV_3D op and left/causal PAD that the Wan/LTX VAE need
-//! (see backends/video.zig).
+//! Video generation screen (Wan 2.2 / LTX-2.3 via stable-diffusion.cpp). A
+//! two-column form + frame preview, mirroring the Image screen. The selected
+//! video model is the diffusion .gguf; its VAE, text-encoder and (LTX) audio
+//! VAE / connectors / spatial upscaler sidecars are auto-discovered next to it
+//! (see state.generateVideo). LTX models also produce an audio track, saved as
+//! a WAV beside the MP4.
 
 const std = @import("std");
 const zigui = @import("zigui");
@@ -17,12 +15,53 @@ fn onGenerate(st: *AppState) void {
     st.generateVideo();
 }
 
+fn onCancel(st: *AppState) void {
+    st.video.cancel();
+}
+
+fn onToggleAdvanced(st: *AppState) void {
+    st.vid_advanced.set(!st.vid_advanced.get());
+}
+
 fn onChooseImage(st: *AppState) void {
     st.chooseVideoImage();
 }
 
 fn onClearImage(st: *AppState) void {
     st.clearVideoImage();
+}
+
+fn onChooseEndImage(st: *AppState) void {
+    st.chooseVideoEndImage();
+}
+
+fn onClearEndImage(st: *AppState) void {
+    st.clearVideoEndImage();
+}
+
+fn onChooseLora(st: *AppState) void {
+    st.chooseVideoLora();
+}
+
+fn onClearLora(st: *AppState) void {
+    st.clearVideoLora();
+}
+
+/// Thumbnail + Change/Remove rows for a picked frame (start or end).
+fn framePickRows(st: *AppState, rows: *std.ArrayList(zigui.View), im: st_mod.codecs.DecodedImage, change: zigui.Callback, remove: zigui.Callback) void {
+    const th = w.t();
+    const fa = st.frame_arena.allocator();
+    const thumb: zigui.canvas.Image = .{
+        .width = im.width,
+        .height = im.height,
+        .pixels = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
+    };
+    rows.append(fa, zigui.Image(thumb).scaledToFit().frameMaxWidth().frameHeight(100)
+        .cornerRadius(6)) catch {};
+    rows.append(fa, zigui.HStack(.{
+        w.secondaryButton(.image, "Change", change),
+        w.tintedButton(.close, "Remove", th.colors.destructive, remove),
+    }).spacing(8)) catch {};
 }
 
 fn leftPanel(st: *AppState) zigui.View {
@@ -40,9 +79,6 @@ fn leftPanel(st: *AppState) zigui.View {
         .border(th.colors.separator, th.metrics.hairline)
         .frameMaxWidth()) catch {};
 
-    // Negative prompt is hidden for now — generateVideo always passes the default
-    // Wan negative (st.vid_negative stays empty → default in generateVideo).
-
     // Output size, split into two compact pickers (Wan needs a real frame size —
     // tiny sizes give mush; a single 5-way picker is too wide for the panel).
     rows.append(fa, zigui.Picker(st.vid_orient.binding(), &[_][]const u8{ "Landscape", "Portrait", "Square" }).frameMaxWidth()) catch {};
@@ -57,23 +93,59 @@ fn leftPanel(st: *AppState) zigui.View {
     rows.append(fa, w.settingRow(w.fmt("Steps: {d:.0}", .{st.vid_steps.get()}), zigui.Slider(st.vid_steps.binding(), 10, 50).frameWidth(160))) catch {};
     rows.append(fa, w.settingRow(w.fmt("CFG: {d:.1}", .{st.vid_cfg.get()}), zigui.Slider(st.vid_cfg.binding(), 1, 10).frameWidth(160))) catch {};
     rows.append(fa, w.settingRow("Frames", zigui.Stepper(w.fmt("{d}", .{st.vid_frames_n.get()}), st.vid_frames_n.binding(), 5, 121, 4))) catch {};
+    // FPS is a real model input for LTX (time axis + audio length); Wan uses it
+    // for playback/mux speed only. LTX native is 24.
+    rows.append(fa, w.settingRow("FPS", zigui.Stepper(w.fmt("{d}", .{st.vid_fps_n.get()}), st.vid_fps_n.binding(), 8, 32, 4))) catch {};
 
-    // Optional start frame (image-to-video, Wan TI2V).
+    // Optional start frame (image-to-video: Wan TI2V / LTX I2V).
     rows.append(fa, w.sectionHeader("Start frame (optional)")) catch {};
     if (st.vid_init_image) |im| {
-        const thumb: zigui.canvas.Image = .{
-            .width = im.width,
-            .height = im.height,
-            .pixels = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
-        };
-        rows.append(fa, zigui.Image(thumb).scaledToFit().frameMaxWidth().frameHeight(120)
-            .cornerRadius(6)) catch {};
-        rows.append(fa, zigui.HStack(.{
-            w.secondaryButton(.image, "Change", zigui.actionCtx(AppState, st, onChooseImage)),
-            w.tintedButton(.close, "Remove", th.colors.destructive, zigui.actionCtx(AppState, st, onClearImage)),
-        }).spacing(8)) catch {};
+        framePickRows(st, &rows, im, zigui.actionCtx(AppState, st, onChooseImage), zigui.actionCtx(AppState, st, onClearImage));
     } else {
         rows.append(fa, w.secondaryButton(.image, "Add start image", zigui.actionCtx(AppState, st, onChooseImage))) catch {};
+    }
+
+    rows.append(fa, zigui.HStack(.{
+        zigui.Text("Advanced").font(.subheadline),
+        zigui.Spacer(),
+        zigui.Toggle("", st.vid_advanced.binding()),
+    }).frameMaxWidth().onTap(zigui.actionCtx(AppState, st, onToggleAdvanced))) catch {};
+
+    if (st.vid_advanced.get()) {
+        rows.append(fa, w.settingRow("Seed", zigui.TextField("random", &st.vid_seed).frameWidth(120))) catch {};
+        // STG (LTX spatio-temporal guidance; sd.cpp SLG). 0 = off.
+        rows.append(fa, w.settingRow(w.fmt("STG: {d:.1}", .{st.vid_slg.get()}), zigui.Slider(st.vid_slg.binding(), 0, 4).frameWidth(160))) catch {};
+        // Two-stage hires: needs the LTX spatial upscaler sidecar in the model
+        // folder; generateVideo silently skips it when absent.
+        rows.append(fa, w.settingRow("2× hires (LTX)", zigui.Toggle("", st.vid_hires.binding()))) catch {};
+        rows.append(fa, w.sectionHeader("Negative prompt")) catch {};
+        rows.append(fa, zigui.TextEditor(&st.vid_negative, &st.vid_neg_scroll, false)
+            .softWrap()
+            .frameHeight(56)
+            .padding(8)
+            .background(th.colors.control_background)
+            .cornerRadius(6)
+            .border(th.colors.separator, th.metrics.hairline)
+            .frameMaxWidth()) catch {};
+        // Optional end frame (LTX first/last-frame-to-video).
+        rows.append(fa, w.sectionHeader("End frame (LTX, optional)")) catch {};
+        if (st.vid_end_image) |im| {
+            framePickRows(st, &rows, im, zigui.actionCtx(AppState, st, onChooseEndImage), zigui.actionCtx(AppState, st, onClearEndImage));
+        } else {
+            rows.append(fa, w.secondaryButton(.image, "Add end image", zigui.actionCtx(AppState, st, onChooseEndImage))) catch {};
+        }
+        // Style LoRA (.safetensors/.gguf) applied to the diffusion model.
+        if (st.vid_lora_path) |lp| {
+            rows.append(fa, zigui.Text(w.fmt("LoRA: {s}", .{std.fs.path.basename(lp)}))
+                .font(.caption).foreground(th.colors.secondary_label)) catch {};
+            rows.append(fa, zigui.HStack(.{
+                w.secondaryButton(.file, "Change", zigui.actionCtx(AppState, st, onChooseLora)),
+                w.tintedButton(.close, "Remove", th.colors.destructive, zigui.actionCtx(AppState, st, onClearLora)),
+            }).spacing(8)) catch {};
+            rows.append(fa, w.settingRow(w.fmt("LoRA scale: {d:.2}", .{st.vid_lora_scale.get()}), zigui.Slider(st.vid_lora_scale.binding(), 0, 2).frameWidth(160))) catch {};
+        } else {
+            rows.append(fa, w.secondaryButton(.file, "Add LoRA", zigui.actionCtx(AppState, st, onChooseLora))) catch {};
+        }
     }
 
     const busy = st.video.isBusy();
@@ -86,11 +158,15 @@ fn leftPanel(st: *AppState) zigui.View {
         // `frac` (step/total) is the right fraction for whichever is running.
         const decoding = st.video.decoding.load(.acquire);
         rows.append(fa, zigui.ProgressView(frac).frameMaxWidth()) catch {};
-        rows.append(fa, zigui.Text(if (decoding)
-            w.fmt("Decoding frames… tile {d}/{d}", .{ step, total })
-        else
-            w.fmt("Generating… step {d}/{d}", .{ step, total }))
-            .font(.caption).foreground(th.colors.secondary_label)) catch {};
+        rows.append(fa, zigui.HStack(.{
+            zigui.Text(if (decoding)
+                w.fmt("Decoding frames… tile {d}/{d}", .{ step, total })
+            else
+                w.fmt("Generating… step {d}/{d}", .{ step, total }))
+                .font(.caption).foreground(th.colors.secondary_label),
+            zigui.Spacer(),
+            w.tintedButton(.close, "Cancel", th.colors.destructive, zigui.actionCtx(AppState, st, onCancel)),
+        }).spacing(8).frameMaxWidth()) catch {};
     } else {
         rows.append(fa, w.primaryButtonWide(.sparkles, "Generate", zigui.actionCtx(AppState, st, onGenerate))) catch {};
     }

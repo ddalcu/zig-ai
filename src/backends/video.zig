@@ -1,11 +1,13 @@
-//! In-process stable-diffusion.cpp **video** backend (Wan 2.2). A worker thread
-//! owns the sd context and runs txt2vid via `generate_video`; diffusion progress
-//! (step/total) and the final frames stream back to the UI through a `Channel` +
-//! `JobState` atomics.
+//! In-process stable-diffusion.cpp **video** backend (Wan 2.2 / LTX-2.3). A
+//! worker thread owns the sd context and runs generate_video; diffusion progress
+//! (step/total) and the final frames (+ optional audio track, LTX) stream back
+//! to the UI through a `Channel` + `JobState` atomics.
 //!
-//! Unlike the image backend (single `model_path`), a Wan video model is loaded
-//! from three separate files: the diffusion model, the VAE, and the umt5-xxl
-//! (t5xxl) text encoder. See deps/stable-diffusion.cpp/docs/wan.md.
+//! Unlike the image backend (single `model_path`), a video model is loaded from
+//! separate files: the diffusion model, the VAE, and per-family sidecars — Wan
+//! uses a umt5-xxl (t5xxl) text encoder; LTX uses a Gemma-3 LLM + audio VAE +
+//! embeddings connectors (+ an optional spatial latent upscaler for the
+//! two-stage hires pipeline). See deps/stable-diffusion.cpp/docs/{wan,ltx2}.md.
 
 const std = @import("std");
 const zigui = @import("zigui");
@@ -30,13 +32,21 @@ pub const Params = struct {
     fps: i32 = 16,
     seed: i64 = -1,
     n_threads: i32 = 4,
+    /// Spatio-temporal guidance (LTX "STG", sd.cpp "SLG") scale; 0 = off.
+    slg_scale: f32 = 0,
+    /// Multiplier for the optional LoRA passed to `submit`.
+    lora_scale: f32 = 1.0,
+    /// Two-stage hires pipeline: generate at `width`×`height`, upscale latents
+    /// 2× through the model named in `ModelSpec.upscaler`, then refine for
+    /// `hires_steps` at `hires_denoise` strength (LTX spatial upscaler flow).
+    hires: bool = false,
+    hires_steps: i32 = 4,
+    hires_denoise: f32 = 0.7,
 };
 
-/// A set of model file paths identifying one Wan model. The trio is what makes a
-/// video "model" loadable, so we key the cached context on all three.
 /// A borrowed set of model file paths (caller owns the slices). `diffusion` and
 /// `vae` are always required. Wan uses `t5xxl`; LTX uses `llm` (Gemma) +
-/// `audio_vae` + `connectors`.
+/// `audio_vae` + `connectors` (+ optional `upscaler` for two-stage hires).
 pub const ModelSpec = struct {
     diffusion: []const u8,
     vae: []const u8,
@@ -44,6 +54,7 @@ pub const ModelSpec = struct {
     llm: ?[]const u8 = null,
     audio_vae: ?[]const u8 = null,
     connectors: ?[]const u8 = null,
+    upscaler: ?[]const u8 = null,
 };
 
 /// An owned copy of a ModelSpec (worker-thread lifetime), used as the context
@@ -55,17 +66,24 @@ const ModelPaths = struct {
     llm: ?[]u8 = null,
     audio_vae: ?[]u8 = null,
     connectors: ?[]u8 = null,
+    upscaler: ?[]u8 = null,
 };
+
+/// An audio track that accompanied the generated frames (LTX models generate
+/// sound). Interleaved f32 samples in [-1,1]; UI owns after receipt.
+pub const Audio = struct { samples: []f32, sample_rate: u32, channels: u32 };
 
 pub const Event = union(enum) {
     progress: struct { step: i32, total: i32 },
     /// Decoded RGBA8 frames; UI owns `images` (and each `.pixels`) after receipt.
-    frames: struct { images: []zigui.canvas.Image, fps: i32 },
+    /// `audio` (LTX) is owned by the UI too.
+    frames: struct { images: []zigui.canvas.Image, fps: i32, audio: ?Audio },
     err: []u8,
 };
 
-/// An optional starting frame for image-to-video (Wan TI2V). `rgba` is owned
-/// (`width*height*4` bytes); the worker converts it to packed RGB for sd.cpp.
+/// An optional frame for image-to-video (`init`, Wan TI2V / LTX I2V) or the
+/// last frame (`end_image`, LTX FLF2V). `rgba` is owned (`width*height*4`
+/// bytes); the worker converts it to packed RGB for sd.cpp.
 pub const InitImage = struct { width: u32, height: u32, rgba: []u8 };
 
 const Request = struct {
@@ -74,6 +92,8 @@ const Request = struct {
     negative: []u8,
     params: Params,
     init_image: ?InitImage = null,
+    end_image: ?InitImage = null,
+    lora_path: ?[]u8 = null,
 };
 
 /// The backend whose generation is currently running, so the global C progress
@@ -118,13 +138,14 @@ pub const Backend = struct {
     // Owned by the worker thread.
     ctx: ?*c.sd_ctx_t = null,
     loaded: ?ModelPaths = null,
-    /// Whether the loaded ctx has the VAE *encoder* (needed for image-to-video).
-    /// txt2vid loads decode-only; an init image needs encode, so the ctx is
-    /// rebuilt when this mode changes.
-    loaded_encode: bool = false,
 
     /// Set true once a model is loaded; read by the UI (tray status, RAM proxy).
     model_ready: std.atomic.Value(bool) = .init(false),
+
+    /// The ctx a generation is currently running on, published by the worker for
+    /// `cancel()` (sd_cancel_generation only flips an atomic flag inside the
+    /// ctx, so calling it from the UI thread is safe while the pointer is set).
+    cancel_ctx: std.atomic.Value(?*c.sd_ctx_t) = .init(null),
 
     /// True while the worker is in the VAE-decode phase (vs diffusion sampling),
     /// so the UI labels the progress bar "Decoding". Written by `progressCb` on
@@ -172,6 +193,7 @@ pub const Backend = struct {
         if (p.llm) |s| self.gpa.free(s);
         if (p.audio_vae) |s| self.gpa.free(s);
         if (p.connectors) |s| self.gpa.free(s);
+        if (p.upscaler) |s| self.gpa.free(s);
     }
 
     fn freeRequest(self: *Backend, req_opt: ?Request) void {
@@ -180,10 +202,20 @@ pub const Backend = struct {
         self.gpa.free(req.prompt);
         self.gpa.free(req.negative);
         if (req.init_image) |im| self.gpa.free(im.rgba);
+        if (req.end_image) |im| self.gpa.free(im.rgba);
+        if (req.lora_path) |s| self.gpa.free(s);
     }
 
     pub fn isBusy(self: *Backend) bool {
         return self.job.isRunning();
+    }
+
+    /// Ask sd.cpp to stop the running generation as soon as possible. Safe to
+    /// call from the UI thread; a no-op when nothing is generating.
+    pub fn cancel(self: *Backend) void {
+        if (self.cancel_ctx.load(.acquire)) |ctx| {
+            c.sd_cancel_generation(ctx, c.SD_CANCEL_ALL);
+        }
     }
 
     /// Free the cached model to release memory (see `llama.Backend.unload` for the
@@ -209,6 +241,8 @@ pub const Backend = struct {
         negative: []const u8,
         params: Params,
         init_image: ?InitImage, // borrowed; duped here
+        end_image: ?InitImage, // borrowed; duped here (LTX FLF2V)
+        lora_path: ?[]const u8, // borrowed; duped here
     ) !void {
         const paths = try self.dupePaths(spec);
         errdefer self.freePaths(paths);
@@ -216,20 +250,37 @@ pub const Backend = struct {
         errdefer self.gpa.free(pr);
         const ng = try self.gpa.dupe(u8, negative);
         errdefer self.gpa.free(ng);
-        const init_img: ?InitImage = if (init_image) |im| .{
-            .width = im.width,
-            .height = im.height,
-            .rgba = try self.gpa.dupe(u8, im.rgba),
-        } else null;
+        const init_img = try self.dupeImage(init_image);
         errdefer if (init_img) |im| self.gpa.free(im.rgba);
+        const end_img = try self.dupeImage(end_image);
+        errdefer if (end_img) |im| self.gpa.free(im.rgba);
+        const lora = try self.dupeOpt(lora_path);
+        errdefer if (lora) |s| self.gpa.free(s);
 
         _ = pt.pthread_mutex_lock(&self.mutex);
         defer _ = pt.pthread_mutex_unlock(&self.mutex);
         self.freeRequest(self.request);
-        self.request = .{ .paths = paths, .prompt = pr, .negative = ng, .params = params, .init_image = init_img };
+        self.request = .{
+            .paths = paths,
+            .prompt = pr,
+            .negative = ng,
+            .params = params,
+            .init_image = init_img,
+            .end_image = end_img,
+            .lora_path = lora,
+        };
         self.has_request = true;
         self.job.beginJob();
         _ = pt.pthread_cond_signal(&self.cond);
+    }
+
+    fn dupeImage(self: *Backend, im_opt: ?InitImage) !?InitImage {
+        const im = im_opt orelse return null;
+        return .{
+            .width = im.width,
+            .height = im.height,
+            .rgba = try self.gpa.dupe(u8, im.rgba),
+        };
     }
 
     fn dupeOpt(self: *Backend, s: ?[]const u8) !?[]u8 {
@@ -246,6 +297,7 @@ pub const Backend = struct {
         p.llm = try self.dupeOpt(spec.llm);
         p.audio_vae = try self.dupeOpt(spec.audio_vae);
         p.connectors = try self.dupeOpt(spec.connectors);
+        p.upscaler = try self.dupeOpt(spec.upscaler);
         return p;
     }
 
@@ -284,13 +336,19 @@ pub const Backend = struct {
         return std.mem.eql(u8, a.diffusion, b.diffusion) and
             std.mem.eql(u8, a.vae, b.vae) and
             optEql(a.t5xxl, b.t5xxl) and optEql(a.llm, b.llm) and
-            optEql(a.audio_vae, b.audio_vae) and optEql(a.connectors, b.connectors);
+            optEql(a.audio_vae, b.audio_vae) and optEql(a.connectors, b.connectors) and
+            optEql(a.upscaler, b.upscaler);
     }
 
     fn specOf(p: ModelPaths) ModelSpec {
         return .{
-            .diffusion = p.diffusion, .vae = p.vae, .t5xxl = p.t5xxl,
-            .llm = p.llm, .audio_vae = p.audio_vae, .connectors = p.connectors,
+            .diffusion = p.diffusion,
+            .vae = p.vae,
+            .t5xxl = p.t5xxl,
+            .llm = p.llm,
+            .audio_vae = p.audio_vae,
+            .connectors = p.connectors,
+            .upscaler = p.upscaler,
         };
     }
 
@@ -306,9 +364,9 @@ pub const Backend = struct {
         self.model_ready.store(false, .release);
     }
 
-    fn ensureCtx(self: *Backend, paths: ModelPaths, params: Params, needs_encode: bool) bool {
+    fn ensureCtx(self: *Backend, paths: ModelPaths, params: Params) bool {
         if (self.loaded) |lp| {
-            if (samePaths(lp, paths) and self.ctx != null and self.loaded_encode == needs_encode) return true;
+            if (samePaths(lp, paths) and self.ctx != null) return true;
         }
         if (self.ctx) |ctx| {
             c.free_sd_ctx(ctx);
@@ -338,16 +396,7 @@ pub const Backend = struct {
         if (paths.audio_vae) |s| cparams.audio_vae_path = zptr(a, s); // LTX audio VAE
         if (paths.connectors) |s| cparams.embeddings_connectors_path = zptr(a, s); // LTX
         cparams.n_threads = params.n_threads;
-        // Image-to-video needs the VAE encoder for the init frame; txt2vid only
-        // decodes latents, so it can skip the encoder (less VRAM).
-        cparams.vae_decode_only = !needs_encode;
         cparams.diffusion_flash_attn = false;
-        // Video runs entirely on the GPU (Metal). Two local ggml/sd.cpp patches
-        // make this possible against upstream ggml-org's Metal backend:
-        //   1. sd.cpp ggml_ext_conv_3d → GGML_OP_CONV_3D (has a Metal kernel)
-        //      instead of the IM2COL_3D decomposition (no Metal kernel).
-        //   2. ggml Metal PAD kernel extended to support left/causal padding
-        //      (the Wan/LTX VAE needs it); see ggml-metal.metal kernel_pad_impl.
 
         const ctx = c.new_sd_ctx(&cparams);
         if (ctx == null) {
@@ -356,13 +405,12 @@ pub const Backend = struct {
         }
         self.ctx = ctx;
         self.loaded = self.dupePaths(specOf(paths)) catch null;
-        self.loaded_encode = needs_encode;
         self.model_ready.store(true, .release);
         return true;
     }
 
     fn process(self: *Backend, req: Request) void {
-        if (!self.ensureCtx(req.paths, req.params, req.init_image != null)) return;
+        if (!self.ensureCtx(req.paths, req.params)) return;
         const ctx = self.ctx.?;
 
         const prompt_z = self.gpa.dupeZ(u8, req.prompt) catch return;
@@ -387,29 +435,58 @@ pub const Backend = struct {
         vp.fps = req.params.fps;
         vp.sample_params.sample_steps = req.params.steps;
         vp.sample_params.guidance.txt_cfg = req.params.cfg;
+        vp.sample_params.guidance.slg.scale = req.params.slg_scale;
         vp.sample_params.sample_method = c.EULER_SAMPLE_METHOD;
         vp.sample_params.flow_shift = req.params.flow_shift;
 
-        // Image-to-video: use the picked frame as the starting image. sd.cpp wants
-        // packed RGB (3 channels), so drop the alpha from our RGBA buffer.
+        // Two-stage hires (LTX spatial latent upscaler): low-res pass at
+        // width×height, model-backed 2× latent upscale, short refine pass.
+        var upscaler_z: ?[:0]u8 = null;
+        defer if (upscaler_z) |s| self.gpa.free(s);
+        if (req.params.hires) {
+            if (req.paths.upscaler) |up| {
+                if (self.gpa.dupeZ(u8, up)) |z| {
+                    upscaler_z = z;
+                    vp.hires.enabled = true;
+                    vp.hires.upscaler = c.SD_HIRES_UPSCALER_MODEL;
+                    vp.hires.model_path = z.ptr;
+                    vp.hires.scale = 2.0;
+                    vp.hires.steps = req.params.hires_steps;
+                    vp.hires.denoising_strength = req.params.hires_denoise;
+                } else |_| {}
+            }
+        }
+
+        // Optional style LoRA.
+        var lora_z: ?[:0]u8 = null;
+        defer if (lora_z) |s| self.gpa.free(s);
+        var lora_arr: [1]c.sd_lora_t = undefined;
+        if (req.lora_path) |lp| {
+            if (self.gpa.dupeZ(u8, lp)) |z| {
+                lora_z = z;
+                lora_arr[0] = .{ .is_high_noise = false, .multiplier = req.params.lora_scale, .path = z.ptr };
+                vp.loras = &lora_arr;
+                vp.lora_count = 1;
+            } else |_| {}
+        }
+
+        // Image-to-video (init) and first/last-frame (end, LTX FLF2V): sd.cpp
+        // wants packed RGB (3 channels), so drop the alpha from our RGBA buffers.
         var init_rgb: ?[]u8 = null;
         defer if (init_rgb) |buf| self.gpa.free(buf);
         if (req.init_image) |im| {
-            const px: usize = @as(usize, im.width) * @as(usize, im.height);
-            if (self.gpa.alloc(u8, px * 3)) |rgb| {
-                var si: usize = 0;
-                var di: usize = 0;
-                while (di + 3 <= rgb.len and si + 3 <= im.rgba.len) : ({
-                    si += 4;
-                    di += 3;
-                }) {
-                    rgb[di] = im.rgba[si];
-                    rgb[di + 1] = im.rgba[si + 1];
-                    rgb[di + 2] = im.rgba[si + 2];
-                }
+            if (rgbaToRgb(self.gpa, im.rgba, im.width, im.height)) |rgb| {
                 vp.init_image = .{ .width = im.width, .height = im.height, .channel = 3, .data = rgb.ptr };
                 init_rgb = rgb;
-            } else |_| {}
+            }
+        }
+        var end_rgb: ?[]u8 = null;
+        defer if (end_rgb) |buf| self.gpa.free(buf);
+        if (req.end_image) |im| {
+            if (rgbaToRgb(self.gpa, im.rgba, im.width, im.height)) |rgb| {
+                vp.end_image = .{ .width = im.width, .height = im.height, .channel = 3, .data = rgb.ptr };
+                end_rgb = rgb;
+            }
         }
 
         g_active = self;
@@ -418,31 +495,36 @@ pub const Backend = struct {
         self.job.setProgress(0, req.params.steps);
         self.last_step = 0;
         self.decoding.store(false, .release);
+        self.cancel_ctx.store(ctx, .release);
 
         var frames_ptr: [*c]c.sd_image_t = null;
         var num_frames: c_int = 0;
         var audio_ptr: [*c]c.sd_audio_t = null;
         const ok = c.generate_video(ctx, &vp, &frames_ptr, &num_frames, &audio_ptr);
+        self.cancel_ctx.store(null, .release);
+        c.sd_cancel_generation(ctx, c.SD_CANCEL_RESET);
         g_active = null;
         self.decoding.store(false, .release);
 
-        // Free the context after every generation: sd.cpp does not release the
-        // diffusion compute buffer when reusing a ctx, so a second generate_video
-        // on the same ctx OOMs ("CUDA error" on the 2nd Generate). Releasing it
-        // here means the next run reloads fresh (a few seconds) but never leaks.
-        self.freeCtx();
+        // Collect the audio track (LTX generates sound; Wan returns none) before
+        // any early-out so it can't leak.
+        var audio: ?Audio = null;
+        if (audio_ptr != null) {
+            audio = self.collectAudio(audio_ptr[0]);
+            c.free_sd_audio(audio_ptr);
+        }
 
-        if (audio_ptr != null) c.free_sd_audio(audio_ptr); // Wan has no audio track
         if (!ok or frames_ptr == null or num_frames <= 0) {
-            if (frames_ptr != null) c.free(frames_ptr);
+            if (frames_ptr != null) c.free_sd_images(frames_ptr, num_frames);
+            if (audio) |au| self.gpa.free(au.samples);
             self.emitErr("video generation failed", .{});
             return;
         }
 
         const n: usize = @intCast(num_frames);
         var images = self.gpa.alloc(zigui.canvas.Image, n) catch {
-            self.freeCFrames(frames_ptr, n);
-            c.free(frames_ptr);
+            c.free_sd_images(frames_ptr, num_frames);
+            if (audio) |au| self.gpa.free(au.samples);
             self.emitErr("out of memory collecting frames", .{});
             return;
         };
@@ -455,24 +537,25 @@ pub const Backend = struct {
             images[made] = .{ .width = fr.width, .height = fr.height, .pixels = rgba };
             made += 1;
         }
-        self.freeCFrames(frames_ptr, n);
-        c.free(frames_ptr);
+        c.free_sd_images(frames_ptr, num_frames);
 
         if (made == 0) {
             self.gpa.free(images);
+            if (audio) |au| self.gpa.free(au.samples);
             self.emitErr("no frames decoded", .{});
             return;
         }
         if (made != n) images = self.gpa.realloc(images, made) catch images[0..made];
 
-        self.events.push(.{ .frames = .{ .images = images, .fps = req.params.fps } });
+        self.events.push(.{ .frames = .{ .images = images, .fps = req.params.fps, .audio = audio } });
     }
 
-    fn freeCFrames(_: *Backend, frames_ptr: [*c]c.sd_image_t, n: usize) void {
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (frames_ptr[i].data != null) c.free(frames_ptr[i].data);
-        }
+    /// Copy an sd_audio_t into an owned `Audio` (null when empty or OOM).
+    fn collectAudio(self: *Backend, au: c.sd_audio_t) ?Audio {
+        if (au.data == null or au.sample_count == 0 or au.channels == 0) return null;
+        const total: usize = @intCast(au.sample_count * au.channels);
+        const samples = self.gpa.dupe(f32, au.data[0..total]) catch return null;
+        return .{ .samples = samples, .sample_rate = au.sample_rate, .channels = au.channels };
     }
 
     /// Convert an sd_image_t (RGB or RGBA) to a zigui RGBA8 pixel buffer.
@@ -495,3 +578,17 @@ pub const Backend = struct {
         return out;
     }
 };
+
+/// Convert a tightly-packed RGBA8 buffer to packed RGB (drops alpha).
+fn rgbaToRgb(gpa: std.mem.Allocator, rgba: []const u8, width: u32, height: u32) ?[]u8 {
+    const px: usize = @as(usize, width) * @as(usize, height);
+    if (rgba.len < px * 4) return null;
+    const rgb = gpa.alloc(u8, px * 3) catch return null;
+    var i: usize = 0;
+    while (i < px) : (i += 1) {
+        rgb[i * 3 + 0] = rgba[i * 4 + 0];
+        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+    return rgb;
+}

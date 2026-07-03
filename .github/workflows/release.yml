@@ -38,7 +38,7 @@ env:
   ZIG_VERSION: 0.16.0
   SDL_REF: release-3.4.10
   # zigui release the app builds against (https://github.com/ddalcu/zigui).
-  ZIGUI_REF: v0.3.2
+  ZIGUI_REF: v0.3.3
   # ccache speeds up the (slow, multi-arch CUDA) deps compile across runs. The
   # deps' CMake already wires ccache as the compiler launcher (ggml's
   # GGML_CCACHE), so installing ccache + caching this dir is all that's needed.
@@ -63,7 +63,6 @@ jobs:
       - name: Apply local submodule patches
         run: |
           git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
-          git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
           git -C deps/qwen3-tts.cpp apply ../patches/qwen3-tts.cpp-win-portability.patch
 
       - uses: mlugg/setup-zig@v2
@@ -121,7 +120,6 @@ jobs:
       - name: Apply local submodule patches
         run: |
           git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
-          git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
           git -C deps/qwen3-tts.cpp apply ../patches/qwen3-tts.cpp-win-portability.patch
 
       - uses: mlugg/setup-zig@v2
@@ -298,7 +296,6 @@ jobs:
         shell: bash
         run: |
           git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
-          git -C deps/stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-conv3d-direct.patch
           git -C deps/qwen3-tts.cpp apply ../patches/qwen3-tts.cpp-win-portability.patch
 
       - uses: mlugg/setup-zig@v2

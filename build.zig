@@ -110,7 +110,11 @@ pub fn build(b: *std.Build) void {
             "src/codecs/codecs_h264.c",
             "src/codecs/codecs_mp4.c",
         },
-        .flags = &.{"-O2"},
+        // -fno-sanitize=undefined: zig's Debug builds trap C UB, and vendored
+        // minih264 relies on wrapping int math (e.g. the byte*0x01010101 lane
+        // broadcast in the intra chooser) — a bright frame would abort the app
+        // mid-save. Release builds never trapped; this makes Debug match.
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
     });
 
     // Vendored Jinja engine (Apache-2.0, from mlx-serve / llama.cpp lineage) so we
