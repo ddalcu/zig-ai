@@ -149,7 +149,7 @@ up as a **Video** model and its sidecars are auto-discovered beside it.
   + Comfy-Org `wan2.2_vae.safetensors` + [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf).
 - **LTX-2.3** — diffusion `*.gguf` + `*video_vae*` + `*audio_vae*` + `*connectors*`
   + a Gemma-3 `*.gguf` text encoder. Tested with
-  [unsloth/LTX-2.3-GGUF](https://huggingface.co/unsloth/LTX-2.3-GGUF) (distilled-1.1 Q3_K_S)
+  [unsloth/LTX-2.3-GGUF](https://huggingface.co/unsloth/LTX-2.3-GGUF) (distilled-1.1 Q4_K_M)
   + [unsloth/gemma-3-12b-it-GGUF](https://huggingface.co/unsloth/gemma-3-12b-it-GGUF).
   (LTX is built for 1280×720; very small sizes degrade badly, and frame counts are
   aligned to its temporal factor.)

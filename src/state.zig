@@ -388,6 +388,11 @@ pub const AppState = struct {
     vid_lora_path: ?[]u8 = null,
     vid_lora_pending: bool = false,
     vid_lora_scale: zigui.State(f32),
+    /// Selection index the family defaults were last applied for (-2 = never).
+    /// When the picked video model changes family (Wan ↔ LTX), the CFG/FPS
+    /// controls snap to that family's sane defaults — LTX distilled is built
+    /// for CFG 1.0 @ 24 fps and looks fried at Wan's CFG 5.
+    vid_family_sel: i64 = -2,
     video: video.Backend,
 
     // --- audio / tts ------------------------------------------------------
@@ -1113,8 +1118,11 @@ pub const AppState = struct {
 
         const res = self.videoSize();
         // Wan needs a real frame size (it's trained at ~480–720p); tiny sizes give
-        // mush. flow_shift follows Wan's guidance: 5 at 720p, 3 at 480p.
-        const flow_shift: f32 = if (@max(res.w, res.h) >= 720) 5.0 else 3.0;
+        // mush. flow_shift follows Wan's guidance: 5 at 720p, 3 at 480p. LTX has
+        // its own sigma schedule — leave it at the model default there.
+        const flow_shift: f32 = if (vspec.isLtx())
+            std.math.inf(f32)
+        else if (@max(res.w, res.h) >= 720) 5.0 else 3.0;
         // A negative prompt matters a lot for Wan quality; fall back to a sensible
         // default when the user left the field empty.
         const neg_in = std.mem.trim(u8, self.vid_negative.text(), " \t\n");
@@ -1212,9 +1220,28 @@ pub const AppState = struct {
         self.vid_lora_path = null;
     }
 
+    /// Snap the video controls to the selected model family's defaults when the
+    /// selection changes: LTX (distilled) wants CFG 1.0 @ 24 fps; Wan wants
+    /// CFG ~5 @ 16 fps. Only fires on a selection change, so user tweaks stick
+    /// while they keep working with one model.
+    fn applyVideoFamilyDefaults(self: *AppState) void {
+        const sel = self.sel_video.get();
+        if (sel == self.vid_family_sel) return;
+        self.vid_family_sel = sel;
+        const model = self.selectedModel(sel) orelse return;
+        if (std.ascii.indexOfIgnoreCase(model.name, "ltx") != null) {
+            self.vid_cfg.set(1.0);
+            self.vid_fps_n.set(24);
+        } else {
+            self.vid_cfg.set(5.0);
+            self.vid_fps_n.set(16);
+        }
+    }
+
     /// Drain video events: progress drives the bar (atomics); final frames replace
     /// the playback buffer. Call once per frame.
     pub fn pumpVideo(self: *AppState) void {
+        self.applyVideoFamilyDefaults();
         // Collect the init-frame file pick (only when we opened that dialog, so we
         // don't steal the TTS reference-WAV pick that `pumpAudio` handles).
         if (self.vid_image_pending) {

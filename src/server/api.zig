@@ -1092,9 +1092,11 @@ pub const Server = struct {
         }
         const distilled = isDistilledName(modelId(model_path));
         var params: video.Params = .{
-            .steps = req.steps orelse (if (distilled) @as(i32, 12) else 30),
+            .steps = req.steps orelse (if (distilled) @as(i32, 16) else 30),
             .cfg = req.cfg_scale orelse (if (distilled) @as(f32, 1.0) else 6.0),
-            .flow_shift = if (@max(width, height) >= 720) 5.0 else 3.0,
+            // Wan wants an explicit sigma shift (5 @ 720p, 3 below); LTX has
+            // its own schedule — the Params default (model default) stands.
+            .flow_shift = if (is_ltx) std.math.inf(f32) else if (@max(width, height) >= 720) 5.0 else 3.0,
             .width = width,
             .height = height,
             .frames = req.num_frames orelse 33,

@@ -121,10 +121,12 @@ pub const recommended = [_]Recommended{
     .{
         .kind = .video,
         .title = "LTX-2.3 (distilled 1.1)",
-        .note = "22B video · diffusion + video/audio VAE + connectors + Gemma-3 encoder",
+        .note = "22B video+audio · diffusion + video/audio VAE + connectors + Gemma-3 encoder",
         .repo = "unsloth/LTX-2.3-GGUF",
         .items = &.{
-            .{ .repo = "unsloth/LTX-2.3-GGUF", .file = "distilled-1.1/ltx-2.3-22b-distilled-1.1-Q3_K_S.gguf", .label = "LTX-2.3 diffusion (Q3_K_S)" },
+            // Q4_K_M: video DiTs degrade visibly below 4-bit (Q3 looks soft and
+            // smeary next to the ~q4 mlx-serve build of the same model).
+            .{ .repo = "unsloth/LTX-2.3-GGUF", .file = "distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf", .label = "LTX-2.3 diffusion (Q4_K_M, ~14 GB)" },
             .{ .repo = "unsloth/LTX-2.3-GGUF", .file = "vae/ltx-2.3-22b-distilled_video_vae.safetensors", .label = "LTX video VAE" },
             .{ .repo = "unsloth/LTX-2.3-GGUF", .file = "vae/ltx-2.3-22b-distilled_audio_vae.safetensors", .label = "LTX audio VAE" },
             .{ .repo = "unsloth/LTX-2.3-GGUF", .file = "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors", .label = "LTX connectors" },

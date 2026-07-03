@@ -25,7 +25,10 @@ const pt = @cImport({
 pub const Params = struct {
     steps: i32 = 30,
     cfg: f32 = 6.0,
-    flow_shift: f32 = 3.0,
+    /// Sigma-schedule shift. INFINITY = the model's own default — only Wan
+    /// wants an explicit value (5 at 720p, 3 below); LTX has its own schedule
+    /// and a Wan-tuned shift visibly degrades it.
+    flow_shift: f32 = std.math.inf(f32),
     width: i32 = 480,
     height: i32 = 480,
     frames: i32 = 33,
