@@ -82,9 +82,14 @@ fn leftPanel(st: *AppState) zigui.View {
     // tiny sizes give mush; a single 5-way picker is too wide for the panel).
     rows.append(fa, zigui.Picker(st.vid_orient.binding(), &[_][]const u8{ "Landscape", "Portrait", "Square" }).frameMaxWidth()) catch {};
     const sz = st.videoSize();
+    // Match the slider column: 160pt frame, minus the 8pt the slider groove
+    // insets each side (slider_knob_r) as trailing pad, so the segmented box's
+    // right edge lines up with the grooves below instead of overhanging them.
     rows.append(fa, w.settingRow(
         w.fmt("Quality · {d}×{d}", .{ sz.w, sz.h }),
-        zigui.Picker(st.vid_quality.binding(), &[_][]const u8{ "480p", "720p" }).frameWidth(120),
+        zigui.Picker(st.vid_quality.binding(), &[_][]const u8{ "480p", "720p" })
+            .frameWidth(152)
+            .paddingInsets(.{ .trailing = 8 }),
     )) catch {};
     // Wan/LTX need real denoising: below ~10 steps the latent stays mostly
     // noise and the VAE decodes it to foggy mush, so the floor is 10 (default is

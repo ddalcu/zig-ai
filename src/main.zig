@@ -1254,10 +1254,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     try app.run(gpa, AppState, &st, .{
         .title = "zig-ai",
-        .width = 1000,
-        .height = 700,
-        .min_width = 850,
-        .min_height = 450,
+        .width = 1240,
+        .height = 820,
+        .min_width = 900,
+        .min_height = 520,
         .theme = theme,
         .icon = window_icon,
         .hide_on_close = true,
