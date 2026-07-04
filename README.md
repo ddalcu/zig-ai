@@ -29,6 +29,17 @@ needs.
 > stack in-process from Zig. The plan is to eventually merge it with
 > [mlx-serve](https://github.com/ddalcu/mlx-serve), whose UI it mirrors.
 
+## Screenshots
+
+<p align="center">
+  <img src="assets/screenshots/chat.png" width="49%" alt="Chat" />
+  <img src="assets/screenshots/video.png" width="49%" alt="Video generation" />
+</p>
+<p align="center">
+  <img src="assets/screenshots/image.png" width="49%" alt="Image generation" />
+  <img src="assets/screenshots/models.png" width="49%" alt="Model browser / downloader" />
+</p>
+
 ## Architecture
 
 ```
