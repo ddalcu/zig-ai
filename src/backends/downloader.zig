@@ -1003,6 +1003,11 @@ fn classifyTreeFile(path: []const u8) ?bool {
     // Multimodal projection weights are an optional add-on, not needed to run
     // the base model — skip to avoid surprising multi-GB extras.
     if (std.mem.indexOf(u8, lower, "mmproj") != null) return null;
+    // The MiniMax-H3 Qwen3-VL-32B encoder quants (ComfyUI naming, underscore —
+    // chat Qwen3VL GGUFs use dashes) sit beside the DiT quants in the same
+    // repo. Neither selectable quants nor blanket support (two multi-GB files):
+    // the curated `minimax-h3` sidecar fetches the right one, renamed.
+    if (std.mem.indexOf(u8, lower, "qwen3vl_32b") != null) return null;
 
     if (std.mem.endsWith(u8, lower, ".gguf")) {
         // Some GGUFs are required *components* shipped beside the model weight
@@ -1058,7 +1063,8 @@ fn backendSupports(kind: models.Kind, id: []const u8) bool {
             has(lower, "sd3") or has(lower, "sd-3") or
             has(lower, "flux.2-klein") or has(lower, "flux2-klein") or has(lower, "flux-2-klein"),
         .video => has(lower, "wan2.2") or has(lower, "wan-2.2") or has(lower, "wan2_2") or
-            has(lower, "wan_2.2") or has(lower, "ltx"),
+            has(lower, "wan_2.2") or has(lower, "ltx") or
+            has(lower, "minimax-h3") or has(lower, "minimax_h3"),
         .tts => (has(lower, "qwen3-tts") or has(lower, "qwen3tts")) and has(lower, "cpp"),
     };
 }

@@ -1,13 +1,15 @@
-//! In-process stable-diffusion.cpp **video** backend (Wan 2.2 / LTX-2.3). A
-//! worker thread owns the sd context and runs generate_video; diffusion progress
-//! (step/total) and the final frames (+ optional audio track, LTX) stream back
-//! to the UI through a `Channel` + `JobState` atomics.
+//! In-process stable-diffusion.cpp **video** backend (Wan 2.2 / LTX-2.3 /
+//! MiniMax-H3). A worker thread owns the sd context and runs generate_video;
+//! diffusion progress (step/total) and the final frames (+ optional audio
+//! track, LTX/H3) stream back to the UI through a `Channel` + `JobState`
+//! atomics.
 //!
 //! Unlike the image backend (single `model_path`), a video model is loaded from
 //! separate files: the diffusion model, the VAE, and per-family sidecars — Wan
 //! uses a umt5-xxl (t5xxl) text encoder; LTX uses a Gemma-3 LLM + audio VAE +
 //! embeddings connectors (+ an optional spatial latent upscaler for the
-//! two-stage hires pipeline). See deps/stable-diffusion.cpp/docs/{wan,ltx2}.md.
+//! two-stage hires pipeline); MiniMax-H3 uses a Qwen3-VL-32B LLM + audio VAE.
+//! See deps/stable-diffusion.cpp/docs/{wan,ltx2,minimax_h3}.md.
 
 const std = @import("std");
 const zigui = @import("zigui");
@@ -45,11 +47,21 @@ pub const Params = struct {
     hires: bool = false,
     hires_steps: i32 = 4,
     hires_denoise: f32 = 0.7,
+    /// Flash attention in the diffusion model. On for MiniMax-H3 (its packed
+    /// AV sequence is huge — FA cuts memory and keeps Metal kernels short
+    /// enough that the UI can present between them); sd.cpp falls back
+    /// per-op when a backend rejects it (leejet#1732).
+    flash_attn: bool = false,
+    /// Spatial tile size for the video-VAE decode, in LATENT units (0 = the
+    /// model's default). Set smaller for MiniMax-H3 (8 = 128 px): its decoder
+    /// otherwise runs quarter-second conv3d kernels that freeze the compositor.
+    vae_tile: i32 = 0,
 };
 
 /// A borrowed set of model file paths (caller owns the slices). `diffusion` and
 /// `vae` are always required. Wan uses `t5xxl`; LTX uses `llm` (Gemma) +
-/// `audio_vae` + `connectors` (+ optional `upscaler` for two-stage hires).
+/// `audio_vae` + `connectors` (+ optional `upscaler` for two-stage hires);
+/// MiniMax-H3 uses `llm` (Qwen3-VL) + `audio_vae`.
 pub const ModelSpec = struct {
     diffusion: []const u8,
     vae: []const u8,
@@ -72,8 +84,8 @@ const ModelPaths = struct {
     upscaler: ?[]u8 = null,
 };
 
-/// An audio track that accompanied the generated frames (LTX models generate
-/// sound). Interleaved f32 samples in [-1,1]; UI owns after receipt.
+/// An audio track that accompanied the generated frames (LTX and MiniMax-H3
+/// generate sound). Interleaved f32 samples in [-1,1]; UI owns after receipt.
 pub const Audio = struct { samples: []f32, sample_rate: u32, channels: u32 };
 
 pub const Event = union(enum) {
@@ -395,11 +407,11 @@ pub const Backend = struct {
         cparams.diffusion_model_path = zptr(a, paths.diffusion);
         cparams.vae_path = zptr(a, paths.vae);
         if (paths.t5xxl) |s| cparams.t5xxl_path = zptr(a, s);
-        if (paths.llm) |s| cparams.llm_path = zptr(a, s); // LTX Gemma-3 text encoder
-        if (paths.audio_vae) |s| cparams.audio_vae_path = zptr(a, s); // LTX audio VAE
+        if (paths.llm) |s| cparams.llm_path = zptr(a, s); // LTX Gemma-3 / H3 Qwen3-VL text encoder
+        if (paths.audio_vae) |s| cparams.audio_vae_path = zptr(a, s); // LTX / H3 audio VAE
         if (paths.connectors) |s| cparams.embeddings_connectors_path = zptr(a, s); // LTX
         cparams.n_threads = params.n_threads;
-        cparams.diffusion_flash_attn = false;
+        cparams.diffusion_flash_attn = params.flash_attn;
 
         const ctx = c.new_sd_ctx(&cparams);
         if (ctx == null) {
@@ -429,6 +441,10 @@ pub const Backend = struct {
         // as spatial-only (no temporal tiling) so the tile count is a single
         // monotonic 0→N pass rather than restarting per temporal chunk.
         vp.vae_tiling_params.enabled = true;
+        if (req.params.vae_tile > 0) {
+            vp.vae_tiling_params.tile_size_x = req.params.vae_tile;
+            vp.vae_tiling_params.tile_size_y = req.params.vae_tile;
+        }
         vp.prompt = prompt_z.ptr;
         vp.negative_prompt = neg_z.ptr;
         vp.width = req.params.width;
@@ -509,8 +525,8 @@ pub const Backend = struct {
         g_active = null;
         self.decoding.store(false, .release);
 
-        // Collect the audio track (LTX generates sound; Wan returns none) before
-        // any early-out so it can't leak.
+        // Collect the audio track (LTX/H3 generate sound; Wan returns none)
+        // before any early-out so it can't leak.
         var audio: ?Audio = null;
         if (audio_ptr != null) {
             audio = self.collectAudio(audio_ptr[0]);

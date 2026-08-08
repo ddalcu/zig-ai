@@ -1063,7 +1063,7 @@ pub const Server = struct {
             return sendError(conn, "400 Bad Request", "invalid_request_error", genspec.message(e));
         };
         defer vspec.deinit();
-        const is_ltx = vspec.isLtx();
+        const family = vspec.family;
 
         // Two-stage pipelines need the spatial upscaler sidecar — explicit 400,
         // never a silent one-stage downgrade (mlx-serve contract).
@@ -1093,19 +1093,22 @@ pub const Server = struct {
         const distilled = isDistilledName(modelId(model_path));
         var params: video.Params = .{
             .steps = req.steps orelse (if (distilled) @as(i32, 16) else 30),
-            .cfg = req.cfg_scale orelse (if (distilled) @as(f32, 1.0) else 6.0),
-            // Wan wants an explicit sigma shift (5 @ 720p, 3 below); LTX has
-            // its own schedule — the Params default (model default) stands.
-            .flow_shift = if (is_ltx) std.math.inf(f32) else if (@max(width, height) >= 720) 5.0 else 3.0,
+            // MiniMax-H3 is CFG-distilled (no guidance knob), like distilled LTX.
+            .cfg = req.cfg_scale orelse (if (distilled or family == .minimax) @as(f32, 1.0) else 6.0),
+            // Wan wants an explicit sigma shift (5 @ 720p, 3 below); LTX and
+            // MiniMax-H3 have their own schedules — the model default stands.
+            .flow_shift = if (family != .wan) std.math.inf(f32) else if (@max(width, height) >= 720) 5.0 else 3.0,
             .width = width,
             .height = height,
             .frames = req.num_frames orelse 33,
-            .fps = req.fps orelse (if (is_ltx) @as(i32, 24) else 16),
+            .fps = req.fps orelse (if (family == .wan) @as(i32, 16) else 24),
             .seed = req.seed orelse -1,
             .n_threads = self.cfg.n_threads,
             .slg_scale = req.stg_scale orelse 0,
             .hires = hires,
             .hires_denoise = hires_denoise,
+            .flash_attn = family == .minimax,
+            .vae_tile = if (family == .minimax) @as(i32, 8) else 0,
         };
         if (req.stage2_steps) |s| {
             if (s > 0) params.hires_steps = s;
@@ -1134,10 +1137,15 @@ pub const Server = struct {
         };
         // An empty negative hurts video quality badly — substitute the family's
         // suppression list (same defaults as the GUI; LTX uses mlx-serve's).
+        // MiniMax-H3 is CFG-distilled: at CFG 1 the negative is never evaluated.
         const neg = blk: {
             const n = req.negative_prompt orelse "";
             if (std.mem.trim(u8, n, " \t\n").len > 0) break :blk n;
-            break :blk if (is_ltx) genspec.default_ltx_negative else genspec.default_video_negative;
+            break :blk switch (family) {
+                .ltx => genspec.default_ltx_negative,
+                .minimax => "",
+                .wan => genspec.default_video_negative,
+            };
         };
         self.video_backend.submit(vspec.spec, req.prompt, neg, params, init_img, end_img, req.lora_path) catch {
             return sendError(conn, "500 Internal Server Error", "server_error", "could not submit request");

@@ -68,6 +68,31 @@ pub const entries = [_]Entry{
         },
     },
     .{
+        // MiniMax-H3: the GGUF repo carries only the DiT + text encoder; the
+        // video/audio VAEs live in Comfy-Org's repackaged repo. The encoder is
+        // renamed so the scanner treats it as support ("encoder") while
+        // `findSupport`'s "qwen" needle still matches it.
+        .match = "minimax-h3",
+        .sidecars = &.{
+            .{
+                .repo = "Comfy-Org/MiniMax-H3",
+                .file = "vae/minimax_h3_video_vae_fp16.safetensors",
+                .label = "MiniMax-H3 video VAE (~5 GB)",
+            },
+            .{
+                .repo = "Comfy-Org/MiniMax-H3",
+                .file = "vae/minimax_h3_audio_vae_fp32.safetensors",
+                .label = "MiniMax-H3 audio VAE (~0.6 GB)",
+            },
+            .{
+                .repo = "leejet/MiniMax-H3-GGUF",
+                .file = "qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+                .dest = "qwen3vl-32b-minimax-h3-text-encoder.gguf",
+                .label = "Qwen3-VL-32B text encoder (~18 GB)",
+            },
+        },
+    },
+    .{
         .match = "wan2.2-ti2v",
         .sidecars = &.{
             .{
@@ -136,6 +161,23 @@ pub const recommended = [_]Recommended{
             // Optional: the spatial latent upscaler enables the two-stage hires
             // pipeline (low-res pass → 2× latent upscale → short refine).
             .{ .repo = "Lightricks/LTX-2.3", .file = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors", .label = "LTX spatial upscaler ×2 (~1 GB)" },
+        },
+    },
+    .{
+        .kind = .video,
+        .title = "MiniMax-H3 (Hailuo 3.0)",
+        .note = "video + native audio · 24 fps · diffusion + video/audio VAE + Qwen3-VL-32B encoder",
+        .repo = "leejet/MiniMax-H3-GGUF",
+        .items = &.{
+            // FL2VA build: text-to-video plus first/last-frame conditioning
+            // (the app's start/end frame pickers). Q4_K_M for the same reason
+            // as LTX: video DiTs degrade visibly below 4-bit.
+            .{ .repo = "leejet/MiniMax-H3-GGUF", .file = "minimax_h3_fl2va-Q4_K_M.gguf", .label = "MiniMax-H3 FL2VA diffusion (Q4_K_M, ~19 GB)" },
+            .{ .repo = "Comfy-Org/MiniMax-H3", .file = "vae/minimax_h3_video_vae_fp16.safetensors", .label = "MiniMax-H3 video VAE (~5 GB)" },
+            .{ .repo = "Comfy-Org/MiniMax-H3", .file = "vae/minimax_h3_audio_vae_fp32.safetensors", .label = "MiniMax-H3 audio VAE (~0.6 GB)" },
+            // Keep "qwen" (findSupport's needle) but add "encoder" so the
+            // scanner treats it as support, not a chat model.
+            .{ .repo = "leejet/MiniMax-H3-GGUF", .file = "qwen3vl_32b_minimax_h3-Q4_K_M.gguf", .dest = "qwen3vl-32b-minimax-h3-text-encoder.gguf", .label = "Qwen3-VL-32B text encoder (~18 GB)" },
         },
     },
     .{

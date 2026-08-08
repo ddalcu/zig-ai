@@ -74,8 +74,11 @@ set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE) # portable CPU baseline, not -march=native
 set(GGML_LTO OFF CACHE BOOL "" FORCE)
 
-# stable-diffusion.cpp requires GGML_MAX_NAME >= 128 (longer tensor names).
-add_compile_definitions(GGML_MAX_NAME=128)
+# stable-diffusion.cpp requires GGML_MAX_NAME = 160 (longer tensor names; its
+# own CMake forces 160 since the MiniMax-H3 update). GGML_MAX_NAME sizes
+# ggml_tensor's embedded name buffer, so EVERY user of the one shared ggml must
+# agree on it or struct layouts diverge across the library boundary.
+add_compile_definitions(GGML_MAX_NAME=160)
 
 # ---- llama.cpp: provides ggml + llama ---------------------------------------
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)

@@ -348,18 +348,17 @@ pub const AppState = struct {
     img_lora_scale: zigui.State(f32),
     sd: sd.Backend,
 
-    // --- video (Wan / LTX) --------------------------------------------------
+    // --- video (Wan / LTX / MiniMax-H3) -------------------------------------
     vid_prompt: zigui.TextFieldState,
     vid_negative: zigui.TextFieldState,
     vid_neg_scroll: zigui.ScrollState = .{},
     vid_steps: zigui.State(f32),
     vid_cfg: zigui.State(f32),
     /// Frame count as a raw slider value; `videoFrames()` snaps it to the
-    /// 8N+1 ladder both families need (LTX temporal factor 8; 8N+1 ≡ 1 mod 4,
-    /// so it's also valid for Wan's factor 4).
+    /// family's ladder (8N+1 for Wan/LTX, 17k+5 for MiniMax-H3).
     vid_frames: zigui.State(f32),
     /// Playback/model FPS. No UI control — `applyVideoFamilyDefaults` is the
-    /// only writer (24 LTX / 16 Wan); shown in the frames-slider readout.
+    /// only writer (24 LTX/MiniMax / 16 Wan); shown in the frames-slider readout.
     vid_fps_n: zigui.State(i64),
     /// Seed as free text (empty or non-numeric → -1 = random).
     vid_seed: zigui.TextFieldState,
@@ -369,11 +368,19 @@ pub const AppState = struct {
     /// size, 2× latent upscale, short refine. Needs an `*upscaler*` sidecar.
     vid_hires: zigui.State(bool),
     vid_advanced: zigui.State(bool),
-    /// Output size, split into two compact pickers (a single 5-way picker is too
-    /// wide for the panel): orientation 0=landscape/1=portrait/2=square and
-    /// quality 0=480p/1=720p. Combined by `videoSize`.
-    vid_orient: zigui.State(i64),
-    vid_quality: zigui.State(i64),
+    /// Output size: index into `videoResOptions()` (family-dependent presets);
+    /// the dropdown's last row ("Custom…", any out-of-range index) switches to
+    /// the free W/H fields. Reset to 0 on model change.
+    vid_res: zigui.State(i64),
+    vid_res_open: zigui.State(bool),
+    /// Custom output size fields (resolution = Custom); parsed, clamped and
+    /// snapped to /32 by `videoSize`.
+    vid_w: zigui.TextFieldState,
+    vid_h: zigui.TextFieldState,
+    /// Pending generations, oldest first. Generate always enqueues;
+    /// `drainVideoQueue` (called from `pumpVideo`) submits the next job
+    /// whenever the backend is idle. Each job owns its strings/pixels.
+    vid_queue: std.ArrayList(VideoJob) = .empty,
     vid_scroll: zigui.ScrollState = .{},
     /// Decoded frames of the last generation; cycled for playback in the view.
     vid_result: ?[]zigui.canvas.Image = null,
@@ -535,8 +542,10 @@ pub const AppState = struct {
             .vid_slg = zigui.State(f32).init(gpa, 0),
             .vid_hires = zigui.State(bool).init(gpa, false),
             .vid_advanced = zigui.State(bool).init(gpa, false),
-            .vid_orient = zigui.State(i64).init(gpa, 0),
-            .vid_quality = zigui.State(i64).init(gpa, 0),
+            .vid_res = zigui.State(i64).init(gpa, 0),
+            .vid_res_open = zigui.State(bool).init(gpa, false),
+            .vid_w = zigui.TextFieldState.init(gpa),
+            .vid_h = zigui.TextFieldState.init(gpa),
             .vid_lora_scale = zigui.State(f32).init(gpa, 1.0),
             .video = video.Backend.init(gpa),
             .tts = tts.Backend.init(gpa),
@@ -623,8 +632,12 @@ pub const AppState = struct {
         self.vid_slg.deinit();
         self.vid_hires.deinit();
         self.vid_advanced.deinit();
-        self.vid_orient.deinit();
-        self.vid_quality.deinit();
+        self.vid_res.deinit();
+        self.vid_res_open.deinit();
+        self.vid_w.deinit();
+        self.vid_h.deinit();
+        self.clearVideoQueue();
+        self.vid_queue.deinit(self.gpa);
         self.vid_lora_scale.deinit();
         self.freeVideoResult();
         self.clearVideoImage();
@@ -1101,63 +1114,83 @@ pub const AppState = struct {
         self.vid_play_tick = 0;
     }
 
-    /// Generate a Wan video from the selected video model. The diffusion .gguf is
-    /// the selected model; its VAE and umt5 text-encoder sidecars are discovered
-    /// by name in the same directory tree.
+    /// A queued video generation: everything `video.Backend.submit` needs,
+    /// snapshotted (owned) at Generate time so later control edits or a model
+    /// switch don't mutate jobs already in the queue.
+    pub const VideoJob = struct {
+        model_path: []u8,
+        model_dir: []u8,
+        prompt: []u8,
+        negative: []u8,
+        params: video.Params,
+        init_image: ?video.InitImage = null,
+        end_image: ?video.InitImage = null,
+        lora_path: ?[]u8 = null,
+    };
+
+    fn freeVideoJob(self: *AppState, j: *VideoJob) void {
+        self.gpa.free(j.model_path);
+        self.gpa.free(j.model_dir);
+        self.gpa.free(j.prompt);
+        self.gpa.free(j.negative);
+        if (j.init_image) |im| self.gpa.free(im.rgba);
+        if (j.end_image) |im| self.gpa.free(im.rgba);
+        if (j.lora_path) |p| self.gpa.free(p);
+    }
+
+    /// Drop every pending job (the running generation is untouched — Cancel
+    /// handles that one).
+    pub fn clearVideoQueue(self: *AppState) void {
+        for (self.vid_queue.items) |*j| self.freeVideoJob(j);
+        self.vid_queue.clearRetainingCapacity();
+    }
+
+    /// The selected video model's family by filename — cheap enough to call at
+    /// render time (drives which controls the Video screen shows and the frame
+    /// ladder). The authoritative sidecar-based detection still runs in
+    /// genspec.resolveVideo at submit time.
+    pub fn videoFamily(self: *AppState) genspec.Family {
+        const m = self.selectedModel(self.sel_video.get()) orelse return .wan;
+        if (std.ascii.indexOfIgnoreCase(m.name, "ltx") != null) return .ltx;
+        if (std.ascii.indexOfIgnoreCase(m.name, "minimax") != null) return .minimax;
+        return .wan;
+    }
+
+    /// Queue a video generation from the selected model + current controls.
+    /// Always enqueues (Generate stays clickable while one renders);
+    /// `drainVideoQueue` feeds the backend FIFO as it goes idle.
     pub fn generateVideo(self: *AppState) void {
-        if (self.video.isBusy()) return;
         const model = self.selectedModel(self.sel_video.get()) orelse {
-            self.alert("No video model selected. Pick a Wan or LTX model in the Models tab.");
+            self.alert("No video model selected. Pick a Wan, LTX or MiniMax model in the Models tab.");
             return;
         };
-        const prompt = self.vid_prompt.text();
-        if (std.mem.trim(u8, prompt, " \t\n").len == 0) return;
+        const prompt = std.mem.trim(u8, self.vid_prompt.text(), " \t\n");
+        if (prompt.len == 0) return;
 
-        // Resolve the family (Wan vs LTX) + sidecars (shared with the HTTP API).
-        var vspec = genspec.resolveVideo(self.gpa, model.path, model.dir) catch |e| {
-            self.alertf("{s}: {s}", .{ model.name, genspec.message(e) });
-            return;
-        };
-        defer vspec.deinit();
-        const spec = vspec.spec;
-
+        const fam = self.videoFamily();
         const res = self.videoSize();
         // Wan needs a real frame size (it's trained at ~480–720p); tiny sizes give
-        // mush. flow_shift follows Wan's guidance: 5 at 720p, 3 at 480p. LTX has
-        // its own sigma schedule — leave it at the model default there.
-        const flow_shift: f32 = if (vspec.isLtx())
-            std.math.inf(f32)
-        else if (@max(res.w, res.h) >= 720) 5.0 else 3.0;
+        // mush. flow_shift follows Wan's guidance: 5 at 720p, 3 at 480p. LTX and
+        // MiniMax-H3 have their own sigma schedules — leave the model default.
+        const flow_shift: f32 = if (fam == .wan)
+            (if (@max(res.w, res.h) >= 720) 5.0 else 3.0)
+        else
+            std.math.inf(f32);
         // A negative prompt matters a lot for video quality; fall back to the
         // family's default when the user left the field empty (LTX gets
-        // mlx-serve's LTX list, Wan its standard suppression list).
+        // mlx-serve's LTX list, Wan its standard suppression list). MiniMax-H3
+        // is CFG-distilled — CFG is pinned to 1.0, so the negative (and STG)
+        // are never evaluated and their controls are hidden.
         const neg_in = std.mem.trim(u8, self.vid_negative.text(), " \t\n");
-        const neg = if (neg_in.len > 0)
-            neg_in
-        else if (vspec.isLtx())
-            genspec.default_ltx_negative
-        else
-            default_video_negative;
-        const hires = self.vid_hires.get() and spec.upscaler != null;
+        const neg = if (neg_in.len > 0) neg_in else switch (fam) {
+            .ltx => genspec.default_ltx_negative,
+            .minimax => "",
+            .wan => default_video_negative,
+        };
 
-        self.logf("video: generating with {s} ({d}x{d}{s})…", .{ model.name, res.w, res.h, if (hires) " ×2 hires" else "" });
-        self.rememberLoaded(&self.loaded_video, &self.loaded_size_video, model);
-        // Optional image-to-video start frame (Wan TI2V / LTX I2V) and last
-        // frame (LTX FLF2V).
-        const init_img: ?video.InitImage = if (self.vid_init_image) |im| .{
-            .width = im.width,
-            .height = im.height,
-            .rgba = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
-        } else null;
-        const end_img: ?video.InitImage = if (self.vid_end_image) |im| .{
-            .width = im.width,
-            .height = im.height,
-            .rgba = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4],
-        } else null;
-        self.video.start() catch {};
-        self.video.submit(spec, prompt, neg, .{
+        self.enqueueVideo(model, prompt, neg, .{
             .steps = @intFromFloat(self.vid_steps.get()),
-            .cfg = self.vid_cfg.get(),
+            .cfg = if (fam == .minimax) 1.0 else self.vid_cfg.get(),
             .flow_shift = flow_shift,
             .frames = self.videoFrames(),
             .fps = @intCast(self.vid_fps_n.get()),
@@ -1165,28 +1198,138 @@ pub const AppState = struct {
             .height = res.h,
             .seed = parseSeed(self.vid_seed.text()),
             .n_threads = @intCast(self.threads.get()),
-            .slg_scale = self.vid_slg.get(),
+            .slg_scale = if (fam == .minimax) 0 else self.vid_slg.get(),
             .lora_scale = self.vid_lora_scale.get(),
-            .hires = hires,
-        }, init_img, end_img, self.vid_lora_path) catch {};
+            .hires = self.vid_hires.get() and fam == .ltx,
+            .flash_attn = fam == .minimax,
+            .vae_tile = if (fam == .minimax) @as(i32, 8) else 0,
+        }) catch return;
+        self.rememberLoaded(&self.loaded_video, &self.loaded_size_video, model);
+        self.logf("video: queued with {s} ({d}x{d}, {d} in queue)", .{ model.name, res.w, res.h, self.vid_queue.items.len });
+        self.drainVideoQueue();
     }
 
-    /// Output frame size from the orientation + quality pickers. Wan TI2V-5B is
-    /// trained around 480–720p; 480p landscape is the default (a good 16 GB
-    /// balance — 720p is heavier and may not fit on smaller cards).
-    pub fn videoSize(self: *AppState) struct { w: i32, h: i32 } {
-        const hd = self.vid_quality.get() == 1;
-        return switch (self.vid_orient.get()) {
-            1 => if (hd) .{ .w = 704, .h = 1280 } else .{ .w = 480, .h = 832 }, // portrait
-            2 => if (hd) .{ .w = 960, .h = 960 } else .{ .w = 640, .h = 640 }, // square
-            else => if (hd) .{ .w = 1280, .h = 704 } else .{ .w = 832, .h = 480 }, // landscape
+    fn enqueueVideo(self: *AppState, model: models.ModelInfo, prompt: []const u8, negative: []const u8, params: video.Params) !void {
+        const path = try self.gpa.dupe(u8, model.path);
+        errdefer self.gpa.free(path);
+        const dir = try self.gpa.dupe(u8, model.dir);
+        errdefer self.gpa.free(dir);
+        const pr = try self.gpa.dupe(u8, prompt);
+        errdefer self.gpa.free(pr);
+        const ng = try self.gpa.dupe(u8, negative);
+        errdefer self.gpa.free(ng);
+        const init_img = try self.dupeQueueImage(self.vid_init_image);
+        errdefer if (init_img) |im| self.gpa.free(im.rgba);
+        const end_img = try self.dupeQueueImage(self.vid_end_image);
+        errdefer if (end_img) |im| self.gpa.free(im.rgba);
+        const lora = if (self.vid_lora_path) |p| try self.gpa.dupe(u8, p) else null;
+        errdefer if (lora) |p| self.gpa.free(p);
+        try self.vid_queue.append(self.gpa, .{
+            .model_path = path,
+            .model_dir = dir,
+            .prompt = pr,
+            .negative = ng,
+            .params = params,
+            .init_image = init_img,
+            .end_image = end_img,
+            .lora_path = lora,
+        });
+    }
+
+    fn dupeQueueImage(self: *AppState, im_opt: ?codecs.DecodedImage) !?video.InitImage {
+        const im = im_opt orelse return null;
+        const px = im.pixels[0 .. @as(usize, im.width) * @as(usize, im.height) * 4];
+        return .{ .width = im.width, .height = im.height, .rgba = try self.gpa.dupe(u8, px) };
+    }
+
+    /// Submit the oldest queued job once the backend is idle. Called every
+    /// frame from `pumpVideo` (and right after enqueueing). A job whose
+    /// sidecars fail to resolve is dropped with an alert; the next one runs on
+    /// the following pump. Sidecars resolve at submit (not enqueue) time so a
+    /// download finishing mid-queue is picked up.
+    fn drainVideoQueue(self: *AppState) void {
+        if (self.video.isBusy()) return;
+        if (self.vid_queue.items.len == 0) return;
+        var job = self.vid_queue.orderedRemove(0);
+        defer self.freeVideoJob(&job);
+        var vspec = genspec.resolveVideo(self.gpa, job.model_path, job.model_dir) catch |e| {
+            self.alertf("{s}: {s}", .{ std.fs.path.basename(job.model_path), genspec.message(e) });
+            return;
+        };
+        defer vspec.deinit();
+        var params = job.params;
+        // Two-stage hires needs the spatial upscaler sidecar on disk.
+        if (params.hires and vspec.spec.upscaler == null) params.hires = false;
+        self.logf("video: generating {s} ({d}x{d}, {d} queued)", .{ std.fs.path.basename(job.model_path), params.width, params.height, self.vid_queue.items.len });
+        self.video.start() catch {};
+        self.video.submit(vspec.spec, job.prompt, job.negative, params, job.init_image, job.end_image, job.lora_path) catch {};
+    }
+
+    /// A video resolution preset (one dropdown row).
+    pub const ResOption = struct { w: i32, h: i32, label: []const u8 };
+
+    /// MiniMax-H3's native canvases — labels (incl. the measured speed ratios)
+    /// verbatim from mlx-serve, same model so same relative costs. Fastest
+    /// first, so the family default (index 0) favors iteration speed.
+    const h3_res = [_]ResOption{
+        .{ .w = 960, .h = 544, .label = "960 × 544 (16:9 widescreen) — fastest, best for long clips" },
+        .{ .w = 1344, .h = 768, .label = "1344 × 768 (16:9 widescreen) — most detail, 2.9x slower" },
+        .{ .w = 768, .h = 768, .label = "768 × 768 (square) — 1.2x slower" },
+        .{ .w = 1024, .h = 768, .label = "1024 × 768 (4:3 landscape) — 1.8x slower" },
+        .{ .w = 768, .h = 1024, .label = "768 × 1024 (3:4 portrait) — 1.8x slower" },
+        .{ .w = 768, .h = 1344, .label = "768 × 1344 (9:16 portrait) — 2.9x slower" },
+        .{ .w = 1536, .h = 672, .label = "1536 × 672 (21:9 cinematic) — 2.9x slower" },
+    };
+    /// Wan/LTX presets — the former orientation × quality grid, flattened.
+    /// (Wan TI2V-5B is trained around 480–720p; 480p landscape default.)
+    const wan_ltx_res = [_]ResOption{
+        .{ .w = 832, .h = 480, .label = "832 × 480 (landscape 480p)" },
+        .{ .w = 480, .h = 832, .label = "480 × 832 (portrait 480p)" },
+        .{ .w = 640, .h = 640, .label = "640 × 640 (square 480p)" },
+        .{ .w = 1280, .h = 704, .label = "1280 × 704 (landscape 720p)" },
+        .{ .w = 704, .h = 1280, .label = "704 × 1280 (portrait 720p)" },
+        .{ .w = 960, .h = 960, .label = "960 × 960 (square 720p)" },
+    };
+
+    /// The selected model family's resolution presets (dropdown rows).
+    pub fn videoResOptions(self: *AppState) []const ResOption {
+        return switch (self.videoFamily()) {
+            .minimax => &h3_res,
+            else => &wan_ltx_res,
         };
     }
 
-    /// Frame count snapped to the 8N+1 ladder (zigui's Slider is continuous
+    /// Output frame size: the picked preset, or the free W/H fields when the
+    /// dropdown is on Custom (index past the preset list).
+    pub fn videoSize(self: *AppState) struct { w: i32, h: i32 } {
+        const opts = self.videoResOptions();
+        const idx = self.vid_res.get();
+        if (idx >= 0 and idx < @as(i64, @intCast(opts.len))) {
+            const o = opts[@intCast(idx)];
+            return .{ .w = o.w, .h = o.h };
+        }
+        return .{ .w = parseDim(self.vid_w.text(), 832), .h = parseDim(self.vid_h.text(), 480) };
+    }
+
+    /// Parse a custom dimension field: empty/garbage → `default`; otherwise
+    /// clamped to 256–1536 and rounded to the nearest multiple of 32 (every
+    /// video family aligns its canvas to 32, so the readout stays honest).
+    fn parseDim(s: []const u8, default: i32) i32 {
+        const v = std.fmt.parseInt(i32, std.mem.trim(u8, s, " \t"), 10) catch return default;
+        return @divTrunc(std.math.clamp(v, 256, 1536) + 16, 32) * 32;
+    }
+
+    /// Frame count snapped to the family's ladder (zigui's Slider is continuous
     /// f32 with no snap support, so the raw state value lands between rungs).
+    /// Wan/LTX share 8N+1; MiniMax-H3 is 17k+5 (its VAE folds 17 source frames
+    /// into 5 latents) — sd.cpp aligns the count upward anyway, so snapping here
+    /// keeps the slider readout honest about what will actually render.
     pub fn videoFrames(self: *AppState) i32 {
         const v = self.vid_frames.get();
+        if (self.videoFamily() == .minimax) {
+            const snapped = @round((v - 5) / 17) * 17 + 5;
+            return @intFromFloat(std.math.clamp(snapped, 5, 192));
+        }
         const snapped = @round((v - 1) / 8) * 8 + 1;
         return @intFromFloat(std.math.clamp(snapped, 9, 193));
     }
@@ -1240,21 +1383,27 @@ pub const AppState = struct {
     }
 
     /// Snap the video controls to the selected model family's defaults when the
-    /// selection changes: LTX (distilled) wants CFG 1.0 @ 24 fps; Wan wants
-    /// CFG ~5 @ 16 fps. Only fires on a selection change, so user tweaks stick
-    /// while they keep working with one model.
+    /// selection changes: LTX (distilled) and MiniMax-H3 (CFG-distilled) want
+    /// CFG 1.0 @ 24 fps; Wan wants CFG ~5 @ 16 fps. Only fires on a selection
+    /// change, so user tweaks stick while they keep working with one model.
     fn applyVideoFamilyDefaults(self: *AppState) void {
         const sel = self.sel_video.get();
         if (sel == self.vid_family_sel) return;
         self.vid_family_sel = sel;
-        const model = self.selectedModel(sel) orelse return;
-        if (std.ascii.indexOfIgnoreCase(model.name, "ltx") != null) {
-            self.vid_cfg.set(1.0);
-            self.vid_fps_n.set(24);
-        } else {
-            self.vid_cfg.set(5.0);
-            self.vid_fps_n.set(16);
+        _ = self.selectedModel(sel) orelse return;
+        switch (self.videoFamily()) {
+            .ltx, .minimax => {
+                self.vid_cfg.set(1.0);
+                self.vid_fps_n.set(24);
+            },
+            .wan => {
+                self.vid_cfg.set(5.0);
+                self.vid_fps_n.set(16);
+            },
         }
+        // The resolution presets are family-dependent; snap back to the
+        // family's default so a stale index can't point at the wrong list.
+        self.vid_res.set(0);
     }
 
     /// Drain video events: progress drives the bar (atomics); final frames replace
@@ -1327,6 +1476,9 @@ pub const AppState = struct {
                 self.gpa.free(e);
             },
         };
+
+        // Start the next queued generation the moment the backend goes idle.
+        self.drainVideoQueue();
 
         // Advance simple frame playback: step once every ~4 UI frames so a 16 fps
         // clip plays at roughly real time on a 60 fps loop.

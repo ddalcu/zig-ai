@@ -186,11 +186,16 @@ pub fn classifyName(basename: []const u8) ?Kind {
         std.mem.indexOf(u8, lower, "clip_vision") != null or
         std.mem.indexOf(u8, lower, "clip-vision") != null) return null;
     if (std.mem.indexOf(u8, lower, "tts") != null) return .tts;
-    // Video diffusion models (Wan, LTX); their encoder/vae siblings were skipped
-    // above (umt5/t5xxl/vae/clip_vision). LTX's connectors/audio-vae are
-    // .safetensors so they aren't scanned at all.
+    // Video diffusion models (Wan, LTX, MiniMax-H3); their encoder/vae siblings
+    // were skipped above (umt5/t5xxl/vae/clip_vision, and the H3 Qwen3-VL
+    // encoder is renamed *-text-encoder.gguf on download). LTX's
+    // connectors/audio-vae are .safetensors so they aren't scanned at all.
+    // "minimax_h3"/"minimax-h3" specifically — a bare "minimax" would steal
+    // MiniMax's CHAT GGUFs (MiniMax-M2 etc.) from the text kind.
     if (std.mem.indexOf(u8, lower, "wan") != null or
-        std.mem.indexOf(u8, lower, "ltx") != null) return .video;
+        std.mem.indexOf(u8, lower, "ltx") != null or
+        std.mem.indexOf(u8, lower, "minimax_h3") != null or
+        std.mem.indexOf(u8, lower, "minimax-h3") != null) return .video;
     if (std.mem.indexOf(u8, lower, "stable-diffusion") != null or
         std.mem.indexOf(u8, lower, "stable_diffusion") != null or
         std.mem.indexOf(u8, lower, "sdxl") != null or

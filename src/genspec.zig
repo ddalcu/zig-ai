@@ -51,7 +51,7 @@ pub const default_ltx_negative =
 pub fn message(e: Error) []const u8 {
     return switch (e) {
         error.MissingVae => "no VAE found next to the model (e.g. *vae*.safetensors)",
-        error.MissingEncoder => "no text encoder found next to the model (Qwen/CLIP-L+T5-XXL for image; umt5/gemma for video)",
+        error.MissingEncoder => "no text encoder found next to the model (Qwen/CLIP-L+T5-XXL for image; umt5/gemma/qwen for video)",
         error.MissingLtxSidecars => "LTX needs an audio-VAE + embeddings connectors next to the model",
         error.OutOfMemory => "out of memory",
     };
@@ -112,26 +112,29 @@ pub fn resolveImage(gpa: std.mem.Allocator, path: []const u8, name: []const u8, 
     return out; // single-file checkpoint
 }
 
+/// Video model family, detected from the sidecars present next to the
+/// diffusion model. Drives per-family defaults (CFG, FPS, frame ladder,
+/// flow shift, negative prompt) in the GUI and the HTTP API.
+pub const Family = enum { wan, ltx, minimax };
+
 /// A video ModelSpec plus the owned sidecar paths its slices point into.
 pub const VideoSpec = struct {
     gpa: std.mem.Allocator,
     spec: video.ModelSpec,
+    family: Family = .wan,
     vae: []u8,
     t5: ?[]u8 = null,
     gemma: ?[]u8 = null,
+    qwen: ?[]u8 = null,
     avae: ?[]u8 = null,
     conn: ?[]u8 = null,
     upscaler: ?[]u8 = null,
-
-    /// True for the LTX family (Gemma text encoder + audio VAE + connectors).
-    pub fn isLtx(self: *const VideoSpec) bool {
-        return self.gemma != null;
-    }
 
     pub fn deinit(self: *VideoSpec) void {
         self.gpa.free(self.vae);
         if (self.t5) |s| self.gpa.free(s);
         if (self.gemma) |s| self.gpa.free(s);
+        if (self.qwen) |s| self.gpa.free(s);
         if (self.avae) |s| self.gpa.free(s);
         if (self.conn) |s| self.gpa.free(s);
         if (self.upscaler) |s| self.gpa.free(s);
@@ -141,7 +144,9 @@ pub const VideoSpec = struct {
 /// Build the video.ModelSpec for a video model. Wan pairs the diffusion .gguf
 /// with a VAE + umt5-xxl encoder; LTX with a video VAE + Gemma-3 LLM + audio
 /// VAE + embeddings connectors (+ optional spatial upscaler for two-stage
-/// hires). The family is detected by which sidecars are present.
+/// hires); MiniMax-H3 with a video VAE + Qwen3-VL-32B LLM + audio VAE (audio
+/// VAE optional — without it the joint model still generates video, silently).
+/// The family is detected by which sidecars are present.
 pub fn resolveVideo(gpa: std.mem.Allocator, path: []const u8, dir: []const u8) Error!VideoSpec {
     const vae = models.findSupport(gpa, dir, &.{"vae"}, &.{ ".safetensors", ".gguf" }, &.{"audio"}) orelse
         return error.MissingVae;
@@ -155,6 +160,7 @@ pub fn resolveVideo(gpa: std.mem.Allocator, path: []const u8, dir: []const u8) E
     out.gemma = models.findSupport(gpa, dir, &.{"gemma"}, &.{".gguf"}, &.{});
     if (out.gemma) |g| {
         // LTX.
+        out.family = .ltx;
         out.avae = models.findSupport(gpa, dir, &.{"audio_vae"}, &.{ ".safetensors", ".gguf" }, &.{});
         out.conn = models.findSupport(gpa, dir, &.{ "connector", "connectors" }, &.{ ".safetensors", ".gguf" }, &.{});
         if (out.avae == null or out.conn == null) return error.MissingLtxSidecars;
@@ -163,6 +169,15 @@ pub fn resolveVideo(gpa: std.mem.Allocator, path: []const u8, dir: []const u8) E
         out.spec.audio_vae = out.avae;
         out.spec.connectors = out.conn;
         out.spec.upscaler = out.upscaler;
+        return out;
+    }
+    out.qwen = models.findSupport(gpa, dir, &.{"qwen"}, &.{".gguf"}, &.{"mmproj"});
+    if (out.qwen) |q| {
+        // MiniMax-H3.
+        out.family = .minimax;
+        out.avae = models.findSupport(gpa, dir, &.{"audio_vae"}, &.{ ".safetensors", ".gguf" }, &.{});
+        out.spec.llm = q;
+        out.spec.audio_vae = out.avae;
         return out;
     }
     // Wan: umt5/t5xxl text encoder.

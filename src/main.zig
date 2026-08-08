@@ -1108,7 +1108,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             return;
         };
         if (t5xxl_path == null and llm_path == null) {
-            std.debug.print("--video-smoke requires a text encoder: --t5xxl <umt5.gguf> (Wan) or --llm <gemma.gguf> --audio-vae <..> --connectors <..> (LTX)\n", .{});
+            std.debug.print("--video-smoke requires a text encoder: --t5xxl <umt5.gguf> (Wan), --llm <gemma.gguf> --audio-vae <..> --connectors <..> (LTX), or --llm <qwen3vl.gguf> --audio-vae <..> (MiniMax-H3)\n", .{});
             return;
         }
         try runVideoSmoke(gpa, .{

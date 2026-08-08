@@ -164,6 +164,14 @@ up as a **Video** model and its sidecars are auto-discovered beside it.
   + [unsloth/gemma-3-12b-it-GGUF](https://huggingface.co/unsloth/gemma-3-12b-it-GGUF).
   (LTX is built for 1280×720; very small sizes degrade badly, and frame counts are
   aligned to its temporal factor.)
+- **MiniMax-H3 (Hailuo 3.0)** — video + native stereo audio in one joint model.
+  Diffusion `*.gguf` + `*video_vae*` + `*audio_vae*` + a Qwen3-VL-32B `*.gguf`
+  text encoder. Uses [leejet/MiniMax-H3-GGUF](https://huggingface.co/leejet/MiniMax-H3-GGUF)
+  (FL2VA Q4_K_M) + the VAEs from
+  [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).
+  CFG-distilled (CFG 1.0, no negative), 24 fps, frame counts on a 17k+5 ladder.
+  Supports text-to-video plus first/last-frame conditioning; the audio VAE is
+  optional (omit it for silent video).
 
 > **Video runs on Metal**, like everything else. stable-diffusion.cpp handles
 > Metal's missing `IM2COL_3D` kernel since leejet#1731 (it checks
