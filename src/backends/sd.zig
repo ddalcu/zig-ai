@@ -5,11 +5,12 @@
 const std = @import("std");
 const zigui = @import("zigui");
 const channel = @import("../channel.zig");
-
 pub const c = @cImport({
     @cInclude("stable-diffusion.h");
     @cInclude("stdlib.h"); // free()
 });
+
+const sdcompat = @import("sdcompat.zig").Compat(c);
 
 const pt = @cImport({
     @cInclude("pthread.h");
@@ -207,7 +208,7 @@ pub const Backend = struct {
     /// call from the UI thread; a no-op when nothing is generating.
     pub fn cancel(self: *Backend) void {
         if (self.cancel_ctx.load(.acquire)) |ctx| {
-            c.sd_cancel_generation(ctx, c.SD_CANCEL_ALL);
+            sdcompat.cancelAll(ctx);
         }
     }
 
@@ -395,26 +396,25 @@ pub const Backend = struct {
         self.job.setProgress(0, req.params.steps);
         self.cancel_ctx.store(ctx, .release);
 
-        var images: [*c]c.sd_image_t = null;
         var num_images: c_int = 0;
-        const ok = c.generate_image(ctx, &gp, &images, &num_images);
+        const images = sdcompat.generateImage(ctx, &gp, &num_images);
         self.cancel_ctx.store(null, .release);
         // Clear any pending cancel flag so it can't bleed into the next run.
-        c.sd_cancel_generation(ctx, c.SD_CANCEL_RESET);
+        sdcompat.cancelReset(ctx);
         g_active = null;
 
-        if (!ok or images == null or num_images <= 0 or images[0].data == null) {
-            if (images != null) c.free_sd_images(images, num_images);
+        if (images == null or num_images <= 0 or images[0].data == null) {
+            if (images != null) sdcompat.freeImages(images, num_images);
             self.emitErr("image generation failed", .{});
             return;
         }
         const img = images[0];
         const rgba = self.toRgba(img) catch {
-            c.free_sd_images(images, num_images);
+            sdcompat.freeImages(images, num_images);
             self.emitErr("out of memory converting image", .{});
             return;
         };
-        c.free_sd_images(images, num_images);
+        sdcompat.freeImages(images, num_images);
 
         self.events.push(.{ .image = .{
             .width = img.width,

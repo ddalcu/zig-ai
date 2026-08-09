@@ -19,6 +19,7 @@ const sd = @import("backends/sd.zig");
 const tts = @import("backends/tts.zig");
 const video = @import("backends/video.zig");
 const genspec = @import("genspec.zig");
+const vram = @import("vram.zig");
 const downloader = @import("backends/downloader.zig");
 const audioplay = @import("audio.zig");
 
@@ -1203,6 +1204,7 @@ pub const AppState = struct {
             .hires = self.vid_hires.get() and fam == .ltx,
             .flash_attn = fam == .minimax,
             .vae_tile = if (fam == .minimax) @as(i32, 8) else 0,
+            .vram = if (fam == .minimax) vram.minimax_h3 else vram.resident,
         }) catch return;
         self.rememberLoaded(&self.loaded_video, &self.loaded_size_video, model);
         self.logf("video: queued with {s} ({d}x{d}, {d} in queue)", .{ model.name, res.w, res.h, self.vid_queue.items.len });

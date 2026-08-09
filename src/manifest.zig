@@ -172,7 +172,13 @@ pub const recommended = [_]Recommended{
             // FL2VA build: text-to-video plus first/last-frame conditioning
             // (the app's start/end frame pickers). Q4_K_M for the same reason
             // as LTX: video DiTs degrade visibly below 4-bit.
-            .{ .repo = "leejet/MiniMax-H3-GGUF", .file = "minimax_h3_fl2va-Q4_K_M.gguf", .label = "MiniMax-H3 FL2VA diffusion (Q4_K_M, ~19 GB)" },
+            //
+            // *Pruned*: the unpruned Q4_K_M is 17.49 GiB and cannot fit a 16 GB
+            // card at all. The pruned build is the same quant at 10.64 GiB and
+            // leaves room for the latents. If even that OOMs, unsloth's
+            // MiniMax-H3-GGUF has a sub-4-bit ladder leejet doesn't
+            // (UD-Q3_K_XL, 8.90 GiB) — but expect visible quality loss.
+            .{ .repo = "leejet/MiniMax-H3-GGUF", .file = "minimax_h3_fl2va_pruned-Q4_K_M.gguf", .label = "MiniMax-H3 FL2VA diffusion (pruned Q4_K_M, ~11 GB)" },
             .{ .repo = "Comfy-Org/MiniMax-H3", .file = "vae/minimax_h3_video_vae_fp16.safetensors", .label = "MiniMax-H3 video VAE (~5 GB)" },
             .{ .repo = "Comfy-Org/MiniMax-H3", .file = "vae/minimax_h3_audio_vae_fp32.safetensors", .label = "MiniMax-H3 audio VAE (~0.6 GB)" },
             // Keep "qwen" (findSupport's needle) but add "encoder" so the
@@ -235,4 +241,22 @@ test "sidecarsFor matches FLUX.2 klein by repo id" {
     const s = sidecarsFor("unsloth/FLUX.2-klein-4B-GGUF");
     try std.testing.expectEqual(@as(usize, 2), s.len);
     try std.testing.expect(sidecarsFor("some/Llama-3-GGUF").len == 0);
+}
+
+/// The bundle whose title starts with `prefix`, or null.
+fn recommendedByTitle(prefix: []const u8) ?Recommended {
+    for (recommended) |r| {
+        if (std.mem.startsWith(u8, r.title, prefix)) return r;
+    }
+    return null;
+}
+
+test "MiniMax-H3 bundle ships the pruned FL2VA diffusion build" {
+    // The unpruned `minimax_h3_fl2va-Q4_K_M.gguf` is 17.49 GiB of weights: it
+    // cannot be resident on a 16 GB card, let alone alongside activations. The
+    // pruned build is the same quant level at 10.64 GiB and is what makes H3
+    // runnable on consumer hardware. Guards against a revert to the fat file.
+    const h3 = recommendedByTitle("MiniMax-H3") orelse return error.BundleMissing;
+    const dit = h3.items[0].file;
+    try std.testing.expect(std.mem.indexOf(u8, dit, "fl2va_pruned-") != null);
 }

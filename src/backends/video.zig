@@ -14,11 +14,13 @@
 const std = @import("std");
 const zigui = @import("zigui");
 const channel = @import("../channel.zig");
-
+const vram_mod = @import("../vram.zig");
 pub const c = @cImport({
     @cInclude("stable-diffusion.h");
     @cInclude("stdlib.h"); // free()
 });
+
+const sdcompat = @import("sdcompat.zig").Compat(c);
 
 const pt = @cImport({
     @cInclude("pthread.h");
@@ -56,6 +58,9 @@ pub const Params = struct {
     /// model's default). Set smaller for MiniMax-H3 (8 = 128 px): its decoder
     /// otherwise runs quarter-second conv3d kernels that freeze the compositor.
     vae_tile: i32 = 0,
+    /// Where the weights live. Defaults to fully GPU-resident; MiniMax-H3 needs
+    /// `vram.minimax_h3` or its encoder alone overruns a 16 GB card.
+    vram: vram_mod.Policy = vram_mod.resident,
 };
 
 /// A borrowed set of model file paths (caller owns the slices). `diffusion` and
@@ -229,7 +234,7 @@ pub const Backend = struct {
     /// call from the UI thread; a no-op when nothing is generating.
     pub fn cancel(self: *Backend) void {
         if (self.cancel_ctx.load(.acquire)) |ctx| {
-            c.sd_cancel_generation(ctx, c.SD_CANCEL_ALL);
+            sdcompat.cancelAll(ctx);
         }
     }
 
@@ -412,6 +417,14 @@ pub const Backend = struct {
         if (paths.connectors) |s| cparams.embeddings_connectors_path = zptr(a, s); // LTX
         cparams.n_threads = params.n_threads;
         cparams.diffusion_flash_attn = params.flash_attn;
+        // Weight residency. Without this the H3 weight set (~33 GiB) is asked
+        // to be GPU-resident and the context fails to load on a 16 GB card.
+        cparams.auto_fit = params.vram.auto_fit;
+        cparams.stream_layers = params.vram.stream_layers;
+        cparams.enable_mmap = params.vram.enable_mmap;
+        if (params.vram.max_vram) |s| cparams.max_vram = s.ptr;
+        if (params.vram.backend) |s| cparams.backend = s.ptr;
+        if (params.vram.params_backend) |s| cparams.params_backend = s.ptr;
 
         const ctx = c.new_sd_ctx(&cparams);
         if (ctx == null) {
@@ -521,7 +534,7 @@ pub const Backend = struct {
         var audio_ptr: [*c]c.sd_audio_t = null;
         const ok = c.generate_video(ctx, &vp, &frames_ptr, &num_frames, &audio_ptr);
         self.cancel_ctx.store(null, .release);
-        c.sd_cancel_generation(ctx, c.SD_CANCEL_RESET);
+        sdcompat.cancelReset(ctx);
         g_active = null;
         self.decoding.store(false, .release);
 
@@ -534,7 +547,7 @@ pub const Backend = struct {
         }
 
         if (!ok or frames_ptr == null or num_frames <= 0) {
-            if (frames_ptr != null) c.free_sd_images(frames_ptr, num_frames);
+            if (frames_ptr != null) sdcompat.freeImages(frames_ptr, num_frames);
             if (audio) |au| self.gpa.free(au.samples);
             self.emitErr("video generation failed", .{});
             return;
@@ -542,7 +555,7 @@ pub const Backend = struct {
 
         const n: usize = @intCast(num_frames);
         var images = self.gpa.alloc(zigui.canvas.Image, n) catch {
-            c.free_sd_images(frames_ptr, num_frames);
+            sdcompat.freeImages(frames_ptr, num_frames);
             if (audio) |au| self.gpa.free(au.samples);
             self.emitErr("out of memory collecting frames", .{});
             return;
@@ -556,7 +569,7 @@ pub const Backend = struct {
             images[made] = .{ .width = fr.width, .height = fr.height, .pixels = rgba };
             made += 1;
         }
-        c.free_sd_images(frames_ptr, num_frames);
+        sdcompat.freeImages(frames_ptr, num_frames);
 
         if (made == 0) {
             self.gpa.free(images);

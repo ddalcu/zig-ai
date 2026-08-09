@@ -17,6 +17,7 @@ const llama = @import("../backends/llama.zig");
 const sd = @import("../backends/sd.zig");
 const video = @import("../backends/video.zig");
 const genspec = @import("../genspec.zig");
+const vram = @import("../vram.zig");
 const codecs = @import("../codecs/codecs.zig");
 const channel = @import("../channel.zig");
 const agent = @import("../agent.zig");
@@ -1109,6 +1110,7 @@ pub const Server = struct {
             .hires_denoise = hires_denoise,
             .flash_attn = family == .minimax,
             .vae_tile = if (family == .minimax) @as(i32, 8) else 0,
+            .vram = if (family == .minimax) vram.minimax_h3 else vram.resident,
         };
         if (req.stage2_steps) |s| {
             if (s > 0) params.hires_steps = s;
