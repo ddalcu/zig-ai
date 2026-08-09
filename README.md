@@ -7,8 +7,9 @@
 <p align="center"><b>Local AI, in one native app — chat, image, video & voice, all on-device.</b></p>
 
 A cross-platform desktop app that runs local AI models **in-process** — chat
-(llama.cpp), image generation (stable-diffusion.cpp), video (Wan / LTX via
-stable-diffusion.cpp), and text-to-speech with voice cloning (qwen3-tts.cpp) —
+(llama.cpp), image generation (stable-diffusion.cpp), video (Wan / LTX /
+MiniMax-H3 via stable-diffusion.cpp), and text-to-speech with voice cloning
+(qwen3-tts.cpp) —
 behind a single, clean UI built on the
 [`zigui`](https://github.com/ddalcu/zigui) library. A sidebar of screens,
 iMessage-style chat bubbles, a built-in Hugging Face model downloader, MCP
@@ -20,14 +21,17 @@ thread-safe channel. Models, prompts and audio never leave the machine (the only
 outbound traffic is the model downloader, and MCP servers you explicitly add);
 the built-in OpenAI-compatible server listens on your local network only.
 
-macOS (Apple Silicon, Metal) is the primary target; Linux and Windows builds
-are produced by CI (CPU inference). Download binaries from the
+macOS (Apple Silicon, Metal) is the primary target. The Linux and Windows CI
+builds ship the CPU, **Vulkan** and **CUDA** ggml backends as runtime-loadable
+modules — the app picks the best one for your hardware at startup
+(CUDA → Vulkan → CPU), no separate downloads. Download binaries from the
 [Releases](../../releases) page — each archive bundles the SDL3 library it
 needs.
 
 > **Status: proof of concept.** This app explores running the full local-AI
-> stack in-process from Zig. The plan is to eventually merge it with
-> [mlx-serve](https://github.com/ddalcu/mlx-serve), whose UI it mirrors.
+> stack in-process from Zig, and the possibility of making
+> [mlx-serve](https://github.com/ddalcu/mlx-serve), whose UI it mirrors,
+> cross-platform by using only Zig.
 
 ## Screenshots
 
@@ -49,7 +53,7 @@ src/
   models.zig          GGUF discovery (dir scan + kind heuristics)
   config.zig          per-user config dir, system-prompt.md + mcp.json I/O
   settings_store.zig  persisted UI settings
-  manifest.zig        curated cross-repo sidecar manifest (FLUX/Wan extras)
+  manifest.zig        curated cross-repo sidecar manifest (FLUX/Wan/MiniMax-H3 extras)
   mcp.zig             MCP: preset catalog, mcp.json registry, JSON-RPC runtime
   agent.zig           agent mode: tool-aware system prompt + tool-call parsing
   builtin.zig         built-in agent tools (read/write/list/search files, shell)
@@ -58,7 +62,7 @@ src/
   backends/
     llama.zig         llama.cpp chat: worker thread, streaming decode/sample loop
     sd.zig            stable-diffusion.cpp txt2img: worker + progress callback
-    video.zig         Wan / LTX video generation (split-file model specs)
+    video.zig         Wan / LTX / MiniMax-H3 video generation (split-file model specs)
     tts.zig           qwen3-tts.cpp synthesis: worker -> float32 PCM (+ clone refs)
     downloader.zig    native Hugging Face search/quant-list/download (std.http)
   ui/
@@ -176,7 +180,7 @@ up as a **Video** model and its sidecars are auto-discovered beside it.
 > **Video runs on Metal**, like everything else. stable-diffusion.cpp handles
 > Metal's missing `IM2COL_3D` kernel since leejet#1731 (it checks
 > `ggml_backend_supports_op` and falls back to the direct `GGML_OP_CONV_3D`
-> op); our fork's `zig-ai` branch extends the same fallback to the
+> op); our fork extends the same fallback to the
 > `force_prec_f32` branch, which the LTX-2.3 VAE *encoder* needs — without it,
 > image-to-video aborts on Metal. That fix is a committed part of the pinned
 > submodule, so no patch is needed. One optional local patch remains: ggml's
@@ -205,7 +209,7 @@ selected in the GUI, with the same request fields as
   upscaler sidecar), `stage2_steps`, `negative_prompt`, `first_frame_image` /
   `end_frame_image` (base64), `lora_path` + `lora_scale`, `stream`. Returns
   raw `rgb8` frames base64 plus `audio_*` PCM16 fields when the model
-  generates sound (LTX).
+  generates sound (LTX, MiniMax-H3).
 
 ## MCP & agent mode
 
@@ -225,7 +229,8 @@ zig build
 ./zig-out/bin/zig-ai --tts-smoke "hello" --tts-dir <tts-model-folder>
 # Voice cloning: add a reference WAV.
 ./zig-out/bin/zig-ai --tts-smoke "hello" --tts-dir <tts-model-folder> --ref-wav voice.wav
-# Wan: --t5xxl ; LTX: --llm + --audio-vae + --connectors. Optional:
+# Wan: --t5xxl ; LTX: --llm + --audio-vae + --connectors ;
+# MiniMax-H3: --llm + --audio-vae. Optional:
 # --vwidth/--vheight/--vframes/--vsteps. Writes /tmp/frame-000.ppm …
 ./zig-out/bin/zig-ai --video-smoke "a cat in a garden" \
     --diffusion <wan.gguf> --vae <wan2.2_vae.safetensors> --t5xxl <umt5.gguf> \
