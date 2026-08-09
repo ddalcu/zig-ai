@@ -1,4 +1,5 @@
 const std = @import("std");
+const cuda_cache = @import("build/cuda_cache.zig");
 
 // The three AI backends live as git submodules under deps/ and are compiled by
 // our top-level CMakeLists.txt into static archives under build-deps/lib. See
@@ -44,6 +45,16 @@ pub fn build(b: *std.Build) void {
     // CMAKE_CUDA_ARCHITECTURES override (e.g. "native", "120", "75;80;86;89;90").
     // Default: ggml's own portable architecture list.
     const cuda_arch = b.option([]const u8, "cuda-arch", "CMAKE_CUDA_ARCHITECTURES (default: ggml's portable list)");
+    // Reuse an already-compiled ggml CUDA module instead of building it. The
+    // module is a runtime-loaded GGML_BACKEND_DL plugin that nothing links
+    // against, so a binary built once stays valid until the ggml sources, the
+    // architecture list, GGML_MAX_NAME or the target change — exactly what the
+    // fingerprint in build/cuda_cache.zig captures. Compiling it costs ~180 .cu
+    // files x every architecture in the list (hours in CI), so this is the
+    // difference between a two-hour release build and a two-minute one.
+    const cuda_prebuilt = b.option([]const u8, "cuda-prebuilt", "Directory with a prebuilt ggml CUDA module + cuda-fingerprint.txt (skips the CUDA compile)");
+    if (use_cuda and cuda_prebuilt != null)
+        fail("-Dcuda and -Dcuda-prebuilt are mutually exclusive: the first builds the CUDA module, the second reuses one.", .{});
 
     // ---- zigui core module (mirror zigui/build.zig) -----------------------
     const zigui = b.addModule("zigui", .{
@@ -141,11 +152,52 @@ pub fn build(b: *std.Build) void {
     // Linux/Windows build shared libraries with dynamic ggml backends and link
     // them over their C ABI (see CMakeLists.txt and linkAiBackends).
     const shared = target.result.os.tag != .macos;
+
+    // The identity of a CUDA module for this checkout. Costs ~75 ms (a hash of
+    // the ggml headers + the ggml-cuda sources), so it is computed on every
+    // Linux/Windows configure rather than being threaded through conditionals.
+    // macOS has no CUDA backend at all — it uses Metal.
+    const cuda_fingerprint: ?[]const u8 = if (shared) cudaFingerprint(b, target, cuda_arch) else null;
+    if (cuda_fingerprint) |fp| {
+        // `zig build cuda-fingerprint` writes it where CI can read it as a cache
+        // key, and every produced bundle carries a copy so a module found on
+        // disk later can still be checked against the sources that made it.
+        const wf = b.addWriteFiles();
+        const file = wf.add("cuda-fingerprint.txt", fp);
+        const install = b.addInstallBinFile(file, "cuda-fingerprint.txt");
+        b.step("cuda-fingerprint", "Write the prebuilt-CUDA cache key to zig-out/bin/cuda-fingerprint.txt")
+            .dependOn(&install.step);
+        if (use_cuda or cuda_prebuilt != null) b.getInstallStep().dependOn(&install.step);
+    }
+
+    // A prebuilt module is verified here, at configure time, and its files are
+    // staged next to the exe. Verification is fatal rather than a silent
+    // fallback to compiling: falling back would reintroduce the surprise
+    // multi-hour build this option exists to eliminate.
+    if (cuda_prebuilt) |dir| {
+        const fp = cuda_fingerprint orelse
+            fail("-Dcuda-prebuilt is meaningless on macOS: there is no CUDA backend there, only Metal.", .{});
+        installPrebuiltCuda(b, dir, fp);
+    }
+
     const cmake_build: ?*std.Build.Step = if (link_llama or link_sd or link_tts) blk: {
         const step = cmakeBuildStep(b, target, use_vulkan, use_cuda, cuda_arch, shared);
         linkAiBackends(b, exe_mod, target, link_llama, link_sd, link_tts, use_vulkan, vulkan_prefix, shared);
         break :blk step;
     } else null;
+
+    // `zig build test` — the pure build-support logic plus the app's own tests.
+    const test_step = b.step("test", "Run unit tests");
+    for ([_][]const u8{ "src/tests.zig", "build/cuda_cache.zig" }) |path| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(path),
+                .target = b.graph.host,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 
     const exe = b.addExecutable(.{ .name = "zig-ai", .root_module = exe_mod });
     if (cmake_build) |s| exe.step.dependOn(s);
@@ -161,6 +213,106 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run zig-ai").dependOn(&run_cmd.step);
+}
+
+/// Abort the configure with a clean, actionable message. Panicking would bury
+/// it under a Zig stack trace that says nothing useful about a build option.
+fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("\nerror: " ++ fmt ++ "\n\n", args);
+    std.process.exit(1);
+}
+
+/// Render the fingerprint identifying a CUDA module built from this checkout.
+fn cudaFingerprint(b: *std.Build, target: std.Build.ResolvedTarget, cuda_arch: ?[]const u8) []const u8 {
+    const io = b.graph.io;
+    const hash = cuda_cache.hashSources(
+        b.allocator,
+        io,
+        b.build_root.handle,
+        &cuda_cache.ggml_cuda_roots,
+    ) catch |err| fail(
+        "could not hash the ggml sources for the CUDA fingerprint ({t}).\n" ++
+            "Are the deps/ submodules checked out?  git submodule update --init --recursive",
+        .{err},
+    );
+    return cuda_cache.render(b.allocator, .{
+        // Architecture + OS only, NOT the full zig triple. The triple carries an
+        // OS version range ("windows.win10...win11_dt") that shifts with the zig
+        // version and with how -Dtarget was spelled, which would evict a
+        // perfectly good module for no reason. The ABI is excluded on purpose
+        // too: this module is produced by the native toolchain (MSVC/gcc + nvcc),
+        // never by zig, so zig's ABI selection has no bearing on its contents.
+        .target = b.fmt("{t}-{t}", .{ target.result.cpu.arch, target.result.os.tag }),
+        .ggml_hash = &hash,
+        // Mirrors add_compile_definitions(GGML_MAX_NAME=160) in CMakeLists.txt.
+        // If you change it there, change it here — they must not drift.
+        .max_name = 160,
+        // No -Dcuda-arch means ggml picks its own list, which is stable for a
+        // given ggml checkout and therefore already covered by the tree hash.
+        .arch = cuda_arch orelse "ggml-default",
+        .toolkit = nvccVersion(b) orelse "unknown",
+    }) catch @panic("OOM");
+}
+
+/// nvcc's release number, for the provenance comment in the fingerprint. Absent
+/// toolkit is fine — it is not part of the module's identity (see cuda_cache).
+fn nvccVersion(b: *std.Build) ?[]const u8 {
+    var code: u8 = undefined;
+    const stdout = b.runAllowFail(&.{ "nvcc", "--version" }, &code, .ignore) catch return null;
+    // "... Cuda compilation tools, release 13.2, V13.2.55"
+    const marker = "release ";
+    const at = std.mem.indexOf(u8, stdout, marker) orelse return null;
+    const rest = stdout[at + marker.len ..];
+    const end = std.mem.indexOfAny(u8, rest, ",\r\n") orelse return null;
+    return rest[0..end];
+}
+
+/// Verify a prebuilt CUDA module against this checkout and stage its files next
+/// to the executable. ggml discovers backend modules by scanning the exe's own
+/// directory at runtime, so "install it" really is the whole integration.
+fn installPrebuiltCuda(b: *std.Build, dir_path: []const u8, current_fingerprint: []const u8) void {
+    const io = b.graph.io;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| fail(
+        "-Dcuda-prebuilt={s}: cannot open that directory ({t}).",
+        .{ dir_path, err },
+    );
+    defer dir.close(io);
+
+    const stamp = "cuda-fingerprint.txt";
+    const stored = dir.readFileAlloc(io, stamp, b.allocator, .limited(64 << 10)) catch |err| fail(
+        "-Dcuda-prebuilt={s}: no readable {s} ({t}).\n" ++
+            "A CUDA module without a fingerprint cannot be checked against these sources,\n" ++
+            "and a mismatched one corrupts results silently. Rebuild it with -Dcuda=true.",
+        .{ dir_path, stamp, err },
+    );
+    if (!cuda_cache.matches(stored, current_fingerprint)) fail(
+        "-Dcuda-prebuilt={s} is stale — it was built from different sources/settings.\n\n" ++
+            "  stored:\n{s}\n  current:\n{s}\n" ++
+            "Rebuild the module with -Dcuda=true (and refresh the cache), or drop\n" ++
+            "-Dcuda-prebuilt to build without CUDA.",
+        .{ dir_path, stored, current_fingerprint },
+    );
+
+    var staged: usize = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch |err| fail("-Dcuda-prebuilt={s}: {t}", .{ dir_path, err })) |entry| {
+        if (entry.kind != .file) continue;
+        // The stamp is installed separately (from the freshly rendered text) so
+        // the bundle records the fingerprint that was actually verified.
+        if (std.mem.eql(u8, entry.name, stamp)) continue;
+        const src = std.fs.path.join(b.allocator, &.{ dir_path, entry.name }) catch @panic("OOM");
+        // `cwd_relative` rather than b.installBinFile/b.path: the cache directory
+        // is routinely an ABSOLUTE path (build-windows.ps1 builds it from the
+        // repo root, and CI extracts to a workspace path), and b.path() panics on
+        // anything that is not build-root-relative.
+        const install = b.addInstallBinFile(.{ .cwd_relative = src }, b.dupe(entry.name));
+        b.getInstallStep().dependOn(&install.step);
+        staged += 1;
+    }
+    if (staged == 0) fail(
+        "-Dcuda-prebuilt={s} contains no files besides the fingerprint.",
+        .{dir_path},
+    );
 }
 
 /// Configure + build the deps/ submodules (llama.cpp, stable-diffusion.cpp,
@@ -203,8 +355,12 @@ fn cmakeBuildStep(b: *std.Build, target: std.Build.ResolvedTarget, use_vulkan: b
         configure.addArgs(&.{ "-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl" });
     }
     configure.addArg(if (use_vulkan) "-DGGML_VULKAN=ON" else "-DGGML_VULKAN=OFF");
+    // Always explicit. Passing GGML_CUDA only when it was requested left the
+    // previous value sitting in build-deps/CMakeCache.txt, so what a build
+    // produced depended on which flags the *last* build happened to use — the
+    // kind of state that quietly turns into "why is it compiling CUDA again?".
+    configure.addArg(if (use_cuda) "-DGGML_CUDA=ON" else "-DGGML_CUDA=OFF");
     if (use_cuda) {
-        configure.addArg("-DGGML_CUDA=ON");
         if (cuda_arch) |arch| configure.addArg(b.fmt("-DCMAKE_CUDA_ARCHITECTURES={s}", .{arch}));
     }
     const compile = b.addSystemCommand(&.{ "cmake", "--build", "build-deps", "-j" });

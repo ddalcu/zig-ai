@@ -2,6 +2,9 @@
 zig-out/
 .DS_Store
 build-deps/
+# Prebuilt ggml CUDA module, reused across builds instead of recompiled.
+# ~60 MB+ of binary, and reproducible from source — see build/cuda_cache.zig.
+.cuda-cache/
 zig-ai-b4-gui
 
 # scripts/build-windows.ps1 setup artifacts

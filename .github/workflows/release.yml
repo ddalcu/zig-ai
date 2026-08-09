@@ -23,9 +23,17 @@
 # while the zig exe links everything over ggml's C ABI. The deps therefore build
 # with the native compiler (gcc on Linux, MSVC on Windows), NOT `zig cc`.
 #
-# NOTE: GitHub-hosted runners have no NVIDIA GPU, so the CUDA backend is BUILT and
-# packaged here but cannot be functionally run-tested in CI (same limitation as
-# upstream llama.cpp). Verify CUDA execution on real NVIDIA hardware.
+# The CUDA module is normally NOT compiled here — cuda-prebuild.yml builds it
+# once per fingerprint and publishes it to the `cuda-cache` prerelease, and this
+# workflow downloads the matching one. That is the difference between a ~2 hour
+# release and a ~15 minute one; compiling ~180 .cu files across 7 architectures
+# was almost the entire wall-clock of the Linux and Windows jobs. On a cache miss
+# both jobs fall back to installing the toolkit and compiling it here, so a
+# release is never blocked on the cache being warm.
+#
+# NOTE: GitHub-hosted runners have no NVIDIA GPU, so the CUDA backend is packaged
+# here but cannot be functionally run-tested in CI (same limitation as upstream
+# llama.cpp). Verify CUDA execution on real NVIDIA hardware.
 
 name: release
 
@@ -44,6 +52,12 @@ env:
   # GGML_CCACHE), so installing ccache + caching this dir is all that's needed.
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 2G
+  # MUST match cuda-prebuild.yml's CUDA_ARCH: the architecture list is part of
+  # the fingerprint, so drift means no cache hit and a full CUDA compile here.
+  CUDA_ARCH: "75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
+  CUDA_VERSION: "13.2.0"
+  # Permanent prerelease holding the prebuilt CUDA modules (see cuda-prebuild.yml).
+  CACHE_TAG: cuda-cache
 
 jobs:
   build-macos:
@@ -105,6 +119,10 @@ jobs:
 
   build-linux:
     runs-on: ubuntu-latest # x86_64
+    # Explicit because this job reads the cuda-cache prerelease's assets; the
+    # default token grant can be tightened repo- or org-wide.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -139,17 +157,42 @@ jobs:
             libdbus-1-dev libudev-dev libusb-1.0-0-dev \
             libvulkan-dev glslc glslang-tools spirv-headers ccache
 
+      - name: Fetch the prebuilt CUDA module
+        id: cuda
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The ggml CUDA backend is a runtime-loaded GGML_BACKEND_DL module that
+        # nothing links against, so it can be compiled once and reused until its
+        # fingerprint changes (build/cuda_cache.zig). cuda-prebuild.yml publishes
+        # those builds; here we just download the matching one, which turns a
+        # ~2 hour multi-architecture nvcc compile into a few seconds.
+        #
+        # A miss is not an error — the steps below fall back to compiling CUDA
+        # from source, so a release is never blocked on the cache being warm.
+        run: |
+          zig build cuda-fingerprint -Dcuda-arch="$CUDA_ARCH"
+          ASSET="cuda-linux-x86_64-$(sha256sum zig-out/bin/cuda-fingerprint.txt | cut -c1-16).tar.gz"
+          echo "Looking for $ASSET"
+          mkdir -p cuda-prebuilt
+          if gh release download "$CACHE_TAG" --pattern "$ASSET" --dir . 2>/dev/null; then
+            tar -xzf "$ASSET" -C cuda-prebuilt
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            ls -la cuda-prebuilt
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No prebuilt CUDA module for this fingerprint; compiling from source (slow). Run the cuda-prebuild workflow to populate the cache."
+          fi
+
       - name: Install CUDA Toolkit
-        # The ggml CUDA backend is built with nvcc (host compiler = gcc, which
-        # build-essential provides). It ships as a loadable ggml backend module
-        # bundled next to the binary; ggml loads it at runtime when an NVIDIA GPU
-        # is present and falls back to Vulkan/CPU otherwise. Bump the version as
-        # newer CUDA toolkits land. (Hosted runners have no GPU, so this BUILDS
-        # but cannot run-test CUDA — like upstream llama.cpp's CUDA CI.)
+        # Only on a cache miss. The toolkit is a ~4 GB install whose Actions
+        # cache entry was evicting everything else from the repo's 10 GB quota —
+        # including the ccache that was supposed to make rebuilds cheap.
+        if: steps.cuda.outputs.hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '13.2.0'
+          cuda: ${{ env.CUDA_VERSION }}
           linux-local-args: '["--toolkit"]'
 
       - name: Cache SDL3
@@ -170,22 +213,42 @@ jobs:
           cmake --build sdl3-build -j
           cmake --install sdl3-build
 
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-${{ runner.os }}-${{ github.run_id }}
           restore-keys: ccache-${{ runner.os }}-
 
       - name: Build
+        shell: bash
         # Shared-library build with dynamic ggml backends (GGML_BACKEND_DL): the
         # deps compile natively with gcc (which is also nvcc's CUDA host) into
         # .so libraries the zig exe links over their C ABI. The CPU/Vulkan/CUDA
-        # backends are separate modules ggml loads at runtime. -Dcuda builds the
-        # CUDA module; the arch list is constrained (Turing..Blackwell) to match
-        # the Windows job and keep the multi-arch CUDA compile from taking ~1h
-        # (ccache makes repeat runs far faster).
-        run: zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix -Dcuda=true -Dcuda-arch="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
+        # backends are separate modules ggml loads at runtime.
+        #
+        # -Dcuda-prebuilt reuses the module fetched above and skips the compile
+        # entirely; it verifies the fingerprint first and fails the build rather
+        # than staging a module that does not match these sources. -Dcuda=true is
+        # the fallback that compiles it here.
+        run: |
+          if [ "${{ steps.cuda.outputs.hit }}" = "true" ]; then
+            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt)
+          else
+            CUDA_ARGS=(-Dcuda=true -Dcuda-arch="$CUDA_ARCH")
+          fi
+          zig build -Doptimize=ReleaseFast -Dzigui=zigui-src -Dsdl3=sdl3-prefix "${CUDA_ARGS[@]}"
+
+      - name: Save ccache
+        # `always()`: the build that dies late still compiled thousands of
+        # objects. actions/cache only saves on success, so a late failure — as
+        # the /bigobj one was, after ~113 minutes — threw all of them away and
+        # guaranteed the next run started cold too.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
 
       - name: Package
         # Split into a small base bundle and an optional CUDA add-on. The CUDA
@@ -211,10 +274,19 @@ jobs:
           done
           cp -P sdl3-prefix/lib/libSDL3.so.0* base/
           cp /usr/lib/x86_64-linux-gnu/libvulkan.so.1* base/
-          # NVIDIA runtime -> add-on so the CUDA module loads without the toolkit.
-          for lib in libcudart libcublas libcublasLt; do
-            find "${CUDA_PATH:-/usr/local/cuda}/lib64" -name "${lib}.so*" -exec cp -P {} cuda/ \; 2>/dev/null || true
-          done
+          if [ "${{ steps.cuda.outputs.hit }}" = "true" ]; then
+            # The prebuilt bundle already pairs the module with the exact
+            # cudart/cublas it was compiled against, plus its fingerprint.
+            cp -P cuda-prebuilt/. cuda/ -r
+          else
+            # NVIDIA runtime -> add-on so the CUDA module loads without the toolkit.
+            for lib in libcudart libcublas libcublasLt; do
+              find "${CUDA_PATH:-/usr/local/cuda}/lib64" -name "${lib}.so*" -exec cp -P {} cuda/ \; 2>/dev/null || true
+            done
+          fi
+          # A CUDA add-on with no backend module in it would silently ship as a
+          # working download that does nothing.
+          ls cuda/*ggml-cuda*.so* >/dev/null
           tar -czf zig-ai-linux-x86_64.tar.gz -C base .
           tar -cJf zig-ai-linux-x86_64-cuda.tar.xz -C cuda .
           ls -la zig-ai-linux-x86_64*.tar.*
@@ -280,6 +352,9 @@ jobs:
 
   build-windows:
     runs-on: windows-latest # x86_64
+    # See build-linux: needed to read the cuda-cache prerelease's assets.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -321,16 +396,36 @@ jobs:
           cache: true
           stripdown: true
 
+      - name: Fetch the prebuilt CUDA module
+        id: cuda
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # See the identical step in build-linux. This is the step that removes
+        # the ~113 minutes of nvcc from this job.
+        run: |
+          zig build cuda-fingerprint -Dtarget=x86_64-windows-gnu -Dcuda-arch="$CUDA_ARCH"
+          ASSET="cuda-windows-x86_64-$(sha256sum zig-out/bin/cuda-fingerprint.txt | cut -c1-16).tar.gz"
+          echo "Looking for $ASSET"
+          mkdir -p cuda-prebuilt
+          if gh release download "$CACHE_TAG" --pattern "$ASSET" --dir . 2>/dev/null; then
+            tar -xzf "$ASSET" -C cuda-prebuilt
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            ls -la cuda-prebuilt
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No prebuilt CUDA module for this fingerprint; compiling from source (slow). Run the cuda-prebuild workflow to populate the cache."
+          fi
+
       - name: Install CUDA Toolkit
-        # Builds the ggml CUDA backend module (nvcc + MSVC host). Bundled next to
-        # the exe and loaded at runtime when an NVIDIA GPU is present; otherwise
-        # ggml falls back to Vulkan/CPU. Hosted runners have no GPU, so this
-        # BUILDS but cannot run-test CUDA. Heavy: multi-arch CUDA compiles are
-        # slow — bump the version as newer toolkits land.
+        # Only on a cache miss — see the Linux job for why this install is worth
+        # avoiding (a ~4 GB Actions cache entry competing with ccache for the
+        # repo's 10 GB quota).
+        if: steps.cuda.outputs.hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '13.2.0'
+          cuda: ${{ env.CUDA_VERSION }}
           # Full (local) install: the runner ships Visual Studio 18, which only
           # CUDA 13.x supports, and 13.x's network sub-packages omit the CRT
           # headers (crt/host_config.h) that nvcc/CMake need. A local install
@@ -352,8 +447,8 @@ jobs:
           # gnu import libraries fine regardless of extension).
           cp sdl3-prefix/lib/libSDL3.dll.a sdl3-prefix/lib/SDL3.lib
 
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-${{ runner.os }}-${{ github.run_id }}
@@ -365,12 +460,33 @@ jobs:
         # names it produced are visible in the log. CC/CXX are NOT set: CMake
         # auto-detects cl.exe from the MSVC environment above and nvcc for CUDA.
         run: |
-          zig build deps -Dtarget=x86_64-windows-gnu "-Dvulkan-prefix=$VULKAN_SDK" -Dcuda=true -Dcuda-arch="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
+          if [ "${{ steps.cuda.outputs.hit }}" = "true" ]; then
+            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt)
+          else
+            CUDA_ARGS=(-Dcuda=true -Dcuda-arch="$CUDA_ARCH")
+          fi
+          zig build deps -Dtarget=x86_64-windows-gnu "-Dvulkan-prefix=$VULKAN_SDK" "${CUDA_ARGS[@]}"
           ls -la build-deps/bin
+
+      - name: Save ccache
+        # `always()` — see the Linux job. This job in particular failed after
+        # ~113 minutes on the /bigobj error, which skipped the save and left the
+        # Windows ccache non-existent, so every run recompiled CUDA from zero.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
 
       - name: Build
         shell: bash
-        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix "-Dvulkan-prefix=$VULKAN_SDK" -Dcuda=true -Dcuda-arch="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
+        run: |
+          if [ "${{ steps.cuda.outputs.hit }}" = "true" ]; then
+            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt)
+          else
+            CUDA_ARGS=(-Dcuda=true -Dcuda-arch="$CUDA_ARCH")
+          fi
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dzigui=zigui-src -Dsdl3=sdl3-prefix "-Dvulkan-prefix=$VULKAN_SDK" "${CUDA_ARGS[@]}"
 
       - name: Package
         shell: bash
@@ -393,12 +509,21 @@ jobs:
               *)          cp "$f" base/ ;;
             esac
           done
-          # NVIDIA runtime redistributables -> add-on (CUDA 12.x: bin/, 13.x: bin/x64/).
-          for dir in "$CUDA_PATH/bin" "$CUDA_PATH/bin/x64"; do
-            for pat in cudart64_ cublas64_ cublasLt64_; do
-              find "$dir" -name "${pat}*.dll" -exec cp {} cuda/ \; 2>/dev/null || true
+          if [ "${{ steps.cuda.outputs.hit }}" = "true" ]; then
+            # The prebuilt bundle already pairs the module with the exact
+            # cudart/cublas it was compiled against, plus its fingerprint.
+            cp cuda-prebuilt/* cuda/
+          else
+            # NVIDIA runtime redistributables -> add-on (CUDA 12.x: bin/, 13.x: bin/x64/).
+            for dir in "$CUDA_PATH/bin" "$CUDA_PATH/bin/x64"; do
+              for pat in cudart64_ cublas64_ cublasLt64_; do
+                find "$dir" -name "${pat}*.dll" -exec cp {} cuda/ \; 2>/dev/null || true
+              done
             done
-          done
+          fi
+          # A CUDA add-on with no backend module in it would silently ship as a
+          # working download that does nothing.
+          ls cuda/ggml-cuda.dll >/dev/null
           (cd base && 7z a ../zig-ai-windows-x86_64.zip .)
           (cd cuda && 7z a -mx=9 ../zig-ai-windows-x86_64-cuda.zip .)
           ls -la zig-ai-windows-x86_64*.zip
