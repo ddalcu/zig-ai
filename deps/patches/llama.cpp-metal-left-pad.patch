@@ -1,12 +1,11 @@
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index 05d7f43..ff3f2eb 100644
+index 2dc6eb8fd..f9e866140 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -1183,9 +1183,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
-             if (ggml_get_op_params_i32(op, 8) != 0) {
+@@ -1258,8 +1258,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                  return false;
              }
--
+ 
 -            return (ggml_get_op_params_i32(op, 0) == 0) && (ggml_get_op_params_i32(op, 2) == 0) &&
 -                   (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
 +            // Original behaviour: right-side padding only (left pads must be 0).
@@ -19,12 +18,12 @@ index 05d7f43..ff3f2eb 100644
 +            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
          case GGML_OP_PAD_REFLECT_1D:
          case GGML_OP_TIMESTEP_EMBEDDING:
-         case GGML_OP_LEAKY_RELU:
+             return op->src[0]->type == GGML_TYPE_F32;
 diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
-index ff74caf..46a6d79 100644
+index e173b91c0..2ed6643b4 100644
 --- a/ggml/src/ggml-metal/ggml-metal-impl.h
 +++ b/ggml/src/ggml-metal/ggml-metal-impl.h
-@@ -1007,6 +1007,11 @@ typedef struct {
+@@ -1060,6 +1060,11 @@ typedef struct {
      uint64_t nb1;
      uint64_t nb2;
      uint64_t nb3;
@@ -37,10 +36,10 @@ index ff74caf..46a6d79 100644
  
  typedef struct {
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index e2ce56e..2b33da0 100644
+index 6d324056d..2fbf805ce 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-@@ -4053,7 +4053,12 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
+@@ -4574,7 +4574,12 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
          /*.nb0  =*/ nb0,
          /*.nb1  =*/ nb1,
          /*.nb2  =*/ nb2,
@@ -54,7 +53,7 @@ index e2ce56e..2b33da0 100644
      };
  
      auto pipeline = ggml_metal_library_get_pipeline_pad(lib, op);
-@@ -4061,6 +4066,7 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
+@@ -4582,6 +4587,7 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
      if (pipeline.c4) {
          args.ne00 = ne00/4;
          args.ne0  = ne0/4;
@@ -63,10 +62,10 @@ index e2ce56e..2b33da0 100644
  
      const int nth_max = MIN(64, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index 2bd310d..3d67d50 100644
+index 92258b737..e3f3d4a02 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
 +++ b/ggml/src/ggml-metal/ggml-metal.metal
-@@ -5378,9 +5378,14 @@ kernel void kernel_pad_impl(
+@@ -5858,9 +5858,14 @@ kernel void kernel_pad_impl(
      const int32_t k0 = tgpig.x/args.ne1;
      const int32_t i1 = tgpig.x - k0*args.ne1;
  
@@ -84,7 +83,7 @@ index 2bd310d..3d67d50 100644
  
      device const T * src0_ptr = (device const T *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
      device       T * dst_ptr  = (device       T *) (dst  +  i3*args.nb3  +  i2*args.nb2  +  i1*args.nb1);
-@@ -5391,8 +5396,9 @@ kernel void kernel_pad_impl(
+@@ -5871,8 +5876,9 @@ kernel void kernel_pad_impl(
              break;
          }
  
