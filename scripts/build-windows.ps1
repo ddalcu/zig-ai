@@ -46,6 +46,18 @@
     this machine — fastest local compile). Use an explicit list for portability,
     e.g. '75;80;86;89;90;120'.
 
+.PARAMETER RebuildCuda
+    Force a fresh CUDA compile even when the cached module in .cuda-cache still
+    matches this checkout.
+
+    By default the script reuses that cached module. `ggml-cuda.dll` is a
+    runtime-loaded GGML_BACKEND_DL plugin — nothing links against it — so it
+    stays valid until the ggml sources, the architecture list, GGML_MAX_NAME or
+    the target OS change. `zig build cuda-fingerprint` hashes exactly those, and
+    -Dcuda-prebuilt refuses to stage a module whose fingerprint disagrees. That
+    turns the ~180-file x N-architecture nvcc compile into a file copy on every
+    rebuild that didn't touch ggml.
+
 .PARAMETER CheckOnly
     Report the status of every prerequisite and exit. Installs/builds nothing.
 
@@ -72,6 +84,7 @@ param(
     [switch]$NoCuda,
     [switch]$NoCcache,
     [string]$CudaArch = 'native',
+    [switch]$RebuildCuda,
     [switch]$CheckOnly,
     [switch]$SkipBuild,
     [ValidateSet('Debug','ReleaseSafe','ReleaseFast','ReleaseSmall')]
@@ -85,7 +98,7 @@ $ErrorActionPreference = 'Stop'
 $ZIG_VERSION = '0.16.0'
 $SDL_REF     = 'release-3.4.10'
 $SDL_VER     = $SDL_REF -replace '^release-', ''
-$ZIGUI_REF   = 'v0.3.2'
+$ZIGUI_REF   = 'v0.3.4'   # must track release.yml: src/main.zig needs app.setBusyInterval (added after v0.3.2)
 $ZIGUI_REPO  = 'https://github.com/ddalcu/zigui.git'
 $TARGET      = 'x86_64-windows-gnu'
 $Vulkan      = -not $NoVulkan
@@ -511,6 +524,7 @@ $cacheFile = Join-Path $RepoRoot 'build-deps\CMakeCache.txt'
 if ($CcacheExe -and (Test-Path $cacheFile) -and -not (Select-String -Path $cacheFile -Pattern 'GGML_CCACHE_FOUND.*[\\/]ccache' -Quiet)) {
     Info 'ccache is installed but build-deps was configured without it.'
     Info 'Delete build-deps once to engage caching:  Remove-Item -Recurse -Force build-deps'
+    Info 'Safe to do: the CUDA module is cached separately in .cuda-cache and is reused, not recompiled.'
 }
 
 # NOTE: deliberately NOT setting CC/CXX to `zig cc`. The deps build natively with
@@ -522,10 +536,44 @@ if ($Cuda)   { $env:CUDA_PATH = $CudaPath }
 $zigArgs = @('build', "-Doptimize=$Optimize", "-Dtarget=$TARGET",
              "-Dzigui=$ZiguiDir", "-Dsdl3=$SdlPrefix")
 if ($Vulkan) { $zigArgs += "-Dvulkan-prefix=$VulkanSdk" } else { $zigArgs += '-Dvulkan=false' }
+
+# The CUDA module is the single most expensive thing in this build, and it is
+# also the one thing that almost never needs rebuilding. Reuse the cached copy
+# whenever its fingerprint still matches this checkout; see -RebuildCuda.
+$CudaCache = Join-Path $RepoRoot '.cuda-cache'
+$cudaCacheHit = $false
 if ($Cuda) {
     $arch = Resolve-CudaArch $CudaArch
     Info "CUDA architecture(s): $arch"
-    $zigArgs += '-Dcuda=true'; $zigArgs += "-Dcuda-arch=$arch"
+
+    $cachedModule = Join-Path $CudaCache 'ggml-cuda.dll'
+    $cachedStamp  = Join-Path $CudaCache 'cuda-fingerprint.txt'
+    if (-not $RebuildCuda -and (Test-Path $cachedModule) -and (Test-Path $cachedStamp)) {
+        # Ask build.zig for the fingerprint this checkout requires, then compare.
+        # Mismatch is not an error here — it just means "compile it".
+        $fpArgs = @('build', 'cuda-fingerprint', "-Dtarget=$TARGET", "-Dcuda-arch=$arch", "-Dzigui=$ZiguiDir")
+        Push-Location $RepoRoot
+        try { $fpCode = Invoke-Native $ZigExe $fpArgs -Quiet } finally { Pop-Location }
+        $currentStamp = Join-Path $RepoRoot 'zig-out\bin\cuda-fingerprint.txt'
+        if ($fpCode -eq 0 -and (Test-Path $currentStamp)) {
+            $want = (Get-Content $currentStamp | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() }) -join "`n"
+            $have = (Get-Content $cachedStamp  | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() }) -join "`n"
+            if ($want -eq $have) { $cudaCacheHit = $true }
+            else { Info 'cached CUDA module is stale (ggml sources or settings changed); recompiling' }
+        }
+    }
+
+    if ($cudaCacheHit) {
+        # NB: keep this string ASCII. The file has no BOM, so Windows PowerShell
+        # decodes it as ANSI and an em-dash's trailing 0x94 byte becomes U+201D,
+        # which the parser accepts as a closing double quote.
+        Ok "reusing cached CUDA module ($CudaCache) - skipping the nvcc compile"
+        $zigArgs += "-Dcuda-prebuilt=$CudaCache"
+    }
+    else {
+        Info 'compiling the CUDA backend (slow: ~180 .cu files per architecture)'
+        $zigArgs += '-Dcuda=true'; $zigArgs += "-Dcuda-arch=$arch"
+    }
 }
 
 Write-Host ("> {0} {1}" -f $ZigExe, ($zigArgs -join ' ')) -ForegroundColor DarkGray
@@ -556,7 +604,9 @@ if (Test-Path $depBin) {
 
 # CUDA runtime redistributables (cudart / cublas / cublasLt) so the machine
 # doesn't need the full CUDA Toolkit installed to run the CUDA backend.
-if ($Cuda) {
+# On a cache hit -Dcuda-prebuilt already staged these (they travel with the
+# module, so the runtime can never disagree with what it was built against).
+if ($Cuda -and -not $cudaCacheHit) {
     # CUDA 12.x keeps these in bin\; CUDA 13.x moved them to bin\x64\ — check both.
     $copied = 0
     foreach ($sub in @('bin', 'bin\x64')) {
@@ -568,6 +618,26 @@ if ($Cuda) {
         }
     }
     Ok "staged $copied CUDA runtime DLL(s)"
+
+    # Stash what we just paid for, so the next build is a copy instead of a
+    # compile. The bundle is self-contained: module + the runtime it imports +
+    # the fingerprint that says which sources produced it.
+    Section 'Cache the CUDA module'
+    $freshModule = Join-Path $RepoRoot 'build-deps\bin\ggml-cuda.dll'
+    $freshStamp  = Join-Path $RepoRoot 'zig-out\bin\cuda-fingerprint.txt'
+    if ((Test-Path $freshModule) -and (Test-Path $freshStamp)) {
+        New-Item -ItemType Directory -Force -Path $CudaCache | Out-Null
+        Copy-Item $freshModule $CudaCache -Force
+        Copy-Item $freshStamp  $CudaCache -Force
+        foreach ($pat in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            Get-ChildItem (Join-Path $binDir $pat) -ErrorAction SilentlyContinue |
+                ForEach-Object { Copy-Item $_.FullName $CudaCache -Force }
+        }
+        Ok "cached -> $CudaCache (reused automatically; -RebuildCuda to force a recompile)"
+    }
+    else {
+        Info 'no ggml-cuda.dll produced; nothing to cache'
+    }
 }
 
 Section 'Done'

@@ -1,0 +1,202 @@
+# Build the ggml CUDA backend module once and publish it, keyed by fingerprint.
+#
+# WHY THIS EXISTS
+# ---------------
+# `ggml-cuda.dll` / `libggml-cuda.so` costs ~180 .cu files x 7 architectures to
+# compile — around two hours on a hosted runner, and it dominated every single
+# release build. But the module is a GGML_BACKEND_DL plugin: nothing links
+# against it, ggml just loads it from the binary's directory at runtime. So it
+# only has to be rebuilt when the ggml sources, the architecture list,
+# GGML_MAX_NAME or the target OS change — which is what `zig build
+# cuda-fingerprint` hashes (see build/cuda_cache.zig).
+#
+# The artifact is stored as an asset on a permanent `cuda-cache` prerelease
+# rather than in the Actions cache. Actions caches are the wrong tool here on
+# three counts: they expire after 7 days of no reads, they are scoped per-ref so
+# a tag build cannot read what another tag wrote, and the repo shares a 10 GB
+# quota that the 4 GB CUDA-installer cache was already evicting things from.
+# Release assets have none of those limits.
+#
+# Runs on pushes to main that touch the ggml sources, and on demand. Releases
+# never depend on this job having run: release.yml falls back to compiling CUDA
+# itself when it finds no matching asset, so the worst case is the old behaviour.
+
+name: cuda-prebuild
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deps/llama.cpp"
+      - "CMakeLists.txt"
+      - "build.zig"
+      - "build/cuda_cache.zig"
+      - ".github/workflows/cuda-prebuild.yml"
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.16.0
+  CUDA_VERSION: "13.2.0"
+  # Turing..Blackwell. MUST match release.yml's CUDA_ARCH — the architecture
+  # list is part of the fingerprint, so if they drift the release job simply
+  # finds no matching asset and compiles CUDA itself (correct, just slow).
+  CUDA_ARCH: "75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
+  # The permanent prerelease that holds the cached modules.
+  CACHE_TAG: cuda-cache
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 5G
+
+permissions:
+  contents: write
+
+jobs:
+  prebuild:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            target: ""
+          - os: windows-latest
+            name: windows-x86_64
+            target: "-Dtarget=x86_64-windows-gnu"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply local submodule patches
+        shell: bash
+        # Kept identical to release.yml so both jobs hash the same tree. (These
+        # two patches touch ggml-metal and qwen3-tts, neither of which is part of
+        # the CUDA fingerprint, but parity is cheaper than reasoning about it.)
+        run: |
+          git -C deps/llama.cpp apply ../patches/llama.cpp-metal-left-pad.patch
+          git -C deps/qwen3-tts.cpp apply ../patches/qwen3-tts.cpp-win-portability.patch
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Compute CUDA fingerprint
+        id: fp
+        shell: bash
+        # Needs nothing but zig — no CUDA toolkit, no Vulkan SDK, no SDL3.
+        run: |
+          zig build cuda-fingerprint ${{ matrix.target }} -Dcuda-arch="$CUDA_ARCH"
+          cp zig-out/bin/cuda-fingerprint.txt .
+          echo "key=$(sha256sum cuda-fingerprint.txt | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "asset=cuda-${{ matrix.name }}-$(sha256sum cuda-fingerprint.txt | cut -c1-16).tar.gz" >> "$GITHUB_OUTPUT"
+          cat cuda-fingerprint.txt
+
+      - name: Check whether this module is already published
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$CACHE_TAG" --json assets -q '.assets[].name' 2>/dev/null \
+             | grep -qx "${{ steps.fp.outputs.asset }}"; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "Already published: ${{ steps.fp.outputs.asset }} — nothing to do."
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- everything below only runs on a miss -----------------------------
+
+      - name: Set up MSVC (cl.exe) environment
+        if: steps.check.outputs.hit != 'true' && runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install ninja + ccache (Linux)
+        if: steps.check.outputs.hit != 'true' && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build build-essential ccache
+
+      - name: Install ninja + ccache (Windows)
+        if: steps.check.outputs.hit != 'true' && runner.os == 'Windows'
+        run: choco install -y ninja ccache
+
+      - name: Install CUDA Toolkit
+        if: steps.check.outputs.hit != 'true'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          # Mirrors release.yml exactly: a full local install, which is what
+          # Windows needs (CUDA 13.x's network sub-packages omit the CRT headers
+          # nvcc requires against the runner's Visual Studio 18).
+          method: 'local'
+          linux-local-args: '["--toolkit"]'
+
+      - name: Restore ccache
+        if: steps.check.outputs.hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-cuda-${{ matrix.name }}-${{ github.run_id }}
+          restore-keys: ccache-cuda-${{ matrix.name }}-
+
+      - name: Build the CUDA module
+        if: steps.check.outputs.hit != 'true'
+        shell: bash
+        # `deps` stops after CMake, so no zigui/SDL3 checkout is needed. Vulkan
+        # is off: it is a separate loadable module and cannot affect this one,
+        # and skipping it avoids installing the whole LunarG SDK.
+        run: |
+          zig build deps ${{ matrix.target }} -Dvulkan=false -Dcuda=true -Dcuda-arch="$CUDA_ARCH"
+
+      - name: Save ccache
+        # `always()`: a build that dies late (as the /bigobj failure used to)
+        # still compiled thousands of objects. Discarding them was what made
+        # every subsequent run start from zero.
+        if: always() && steps.check.outputs.hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-cuda-${{ matrix.name }}-${{ github.run_id }}
+
+      - name: Bundle the module with its CUDA runtime
+        if: steps.check.outputs.hit != 'true'
+        shell: bash
+        # The bundle is self-contained on purpose: it carries the cudart/cublas
+        # it was built against, so a consumer never needs the toolkit installed
+        # and the imported runtime can never disagree with the module.
+        run: |
+          mkdir -p out
+          cp cuda-fingerprint.txt out/
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp build-deps/bin/ggml-cuda.dll out/
+            for dir in "$CUDA_PATH/bin" "$CUDA_PATH/bin/x64"; do
+              for pat in cudart64_ cublas64_ cublasLt64_; do
+                find "$dir" -name "${pat}*.dll" -exec cp {} out/ \; 2>/dev/null || true
+              done
+            done
+          else
+            for f in build-deps/lib/*ggml-cuda*.so* build-deps/bin/*ggml-cuda*.so*; do
+              [ -e "$f" ] && cp -P "$f" out/
+            done
+            for lib in libcudart libcublas libcublasLt; do
+              find "${CUDA_PATH:-/usr/local/cuda}/lib64" -name "${lib}.so*" -exec cp -P {} out/ \; 2>/dev/null || true
+            done
+          fi
+          ls -la out
+          tar -czf "${{ steps.fp.outputs.asset }}" -C out .
+          ls -la "${{ steps.fp.outputs.asset }}"
+
+      - name: Publish to the cuda-cache release
+        if: steps.check.outputs.hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$CACHE_TAG" >/dev/null 2>&1 || \
+            gh release create "$CACHE_TAG" \
+              --prerelease \
+              --title "Prebuilt ggml CUDA modules" \
+              --notes "Fingerprint-keyed cache of the ggml CUDA backend module, consumed by release.yml. Not a user-facing download — see the versioned releases instead."
+          gh release upload "$CACHE_TAG" "${{ steps.fp.outputs.asset }}" --clobber

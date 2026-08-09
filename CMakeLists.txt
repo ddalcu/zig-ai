@@ -80,6 +80,22 @@ set(GGML_LTO OFF CACHE BOOL "" FORCE)
 # agree on it or struct layouts diverge across the library boundary.
 add_compile_definitions(GGML_MAX_NAME=160)
 
+# MSVC: /bigobj + /utf-8 for EVERY submodule, set here at the top level.
+# llama.cpp sets both in its own CMakeLists, but add_compile_options only
+# affects that directory and below — stable-diffusion.cpp is a *sibling*
+# add_subdirectory, so it never inherited them. Since the MiniMax-H3 update its
+# src/stable-diffusion.cpp exceeds the 65,536-section COFF limit and dies with
+# "fatal error C1128: ... compile with /bigobj" — at the very END of the build,
+# after the multi-hour CUDA compile, which also skips CI's ccache save and makes
+# the next run start cold again. Restricted to C/CXX: nvcc rejects a bare
+# /bigobj (it would need -Xcompiler), and no single .cu is near the limit.
+if(MSVC)
+  add_compile_options("$<$<COMPILE_LANGUAGE:C>:/utf-8>")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
+  add_compile_options("$<$<COMPILE_LANGUAGE:C>:/bigobj>")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/bigobj>")
+endif()
+
 # ---- llama.cpp: provides ggml + llama ---------------------------------------
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

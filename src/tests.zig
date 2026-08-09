@@ -6,4 +6,6 @@ test {
     _ = @import("agent.zig");
     _ = @import("server/chat_parser.zig");
     _ = @import("launcher.zig");
+    _ = @import("manifest.zig");
+    _ = @import("vram.zig");
 }

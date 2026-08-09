@@ -385,7 +385,9 @@ pub const Backend = struct {
         defer c.llama_sampler_free(smpl);
         // Repetition penalty FIRST — without it, models (especially on an
         // off-distribution prompt) collapse into "x_x_x" loops. last_n=64, 1.1x.
-        c.llama_sampler_chain_add(smpl, c.llama_sampler_init_penalties(64, 1.1, 0.0, 0.0));
+        // n_vocab leads the parameter list again as of the b9548+ pin — the
+        // penalty sampler sizes its token histogram from it.
+        c.llama_sampler_chain_add(smpl, c.llama_sampler_init_penalties(c.llama_vocab_n_tokens(vocab), 64, 1.1, 0.0, 0.0));
         c.llama_sampler_chain_add(smpl, c.llama_sampler_init_top_k(req.params.top_k));
         c.llama_sampler_chain_add(smpl, c.llama_sampler_init_top_p(req.params.top_p, 1));
         c.llama_sampler_chain_add(smpl, c.llama_sampler_init_temp(req.params.temperature));

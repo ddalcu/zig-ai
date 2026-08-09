@@ -557,6 +557,7 @@ fn runChatSmoke(gpa: std.mem.Allocator, model_path: []const u8, prompt: []const 
 const sd = @import("backends/sd.zig");
 const tts = @import("backends/tts.zig");
 const video = @import("backends/video.zig");
+const vram = @import("vram.zig");
 const downloader = @import("backends/downloader.zig");
 const models = @import("models.zig");
 const mcp = @import("mcp.zig");
@@ -932,6 +933,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var end_image_path: ?[]const u8 = null;
     var upscaler_path: ?[]const u8 = null;
     var vparams: video.Params = .{ .steps = 8, .width = 256, .height = 256, .frames = 5, .n_threads = 10 };
+    // Whether --vcfg was given, so a per-family default doesn't override it.
+    var cfg_set = false;
     var iparams: sd.Params = .{ .n_threads = 10 };
     var out_path: []const u8 = "/tmp/zigai_out.ppm";
     var model_path: ?[]const u8 = null;
@@ -988,7 +991,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         } else if (std.mem.eql(u8, a, "--vsteps")) {
             if (arg_it.next()) |p| vparams.steps = std.fmt.parseInt(i32, p, 10) catch vparams.steps;
         } else if (std.mem.eql(u8, a, "--vcfg")) {
-            if (arg_it.next()) |p| vparams.cfg = std.fmt.parseFloat(f32, p) catch vparams.cfg;
+            if (arg_it.next()) |p| {
+                vparams.cfg = std.fmt.parseFloat(f32, p) catch vparams.cfg;
+                cfg_set = true;
+            }
         } else if (std.mem.eql(u8, a, "--vfps")) {
             if (arg_it.next()) |p| vparams.fps = std.fmt.parseInt(i32, p, 10) catch vparams.fps;
         } else if (std.mem.eql(u8, a, "--vslg")) {
@@ -1110,6 +1116,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (t5xxl_path == null and llm_path == null) {
             std.debug.print("--video-smoke requires a text encoder: --t5xxl <umt5.gguf> (Wan), --llm <gemma.gguf> --audio-vae <..> --connectors <..> (LTX), or --llm <qwen3vl.gguf> --audio-vae <..> (MiniMax-H3)\n", .{});
             return;
+        }
+        // Family detection mirrors genspec.resolveVideo: an LLM encoder with no
+        // connectors is MiniMax-H3 (LTX has connectors, Wan uses --t5xxl). The
+        // GUI/API paths apply these per-family; the smoke path builds Params
+        // straight from flags, so without this H3 smoke-tests run untuned and
+        // the ~17 GiB encoder is allocated on the GPU.
+        if (llm_path != null and connectors_path == null) {
+            // CFG-distilled: guidance MUST be 1.0. Above it sd.cpp builds the
+            // uncond branch too, whose graph feeds ggml_mul_mat a transposed
+            // operand and trips GGML_ASSERT(!ggml_is_transposed(a)). The GUI
+            // and HTTP API already pin this; the smoke path inherited the
+            // generic 6.0 default and so could never run H3.
+            if (!cfg_set) vparams.cfg = 1.0;
+            // H3 generates at 24 fps and sd.cpp overrides anything else; match
+            // it so the muxed clip isn't tagged with the generic default.
+            vparams.fps = 24;
+            vparams.flash_attn = true;
+            vparams.vae_tile = 8;
+            vparams.vram = vram.minimax_h3;
         }
         try runVideoSmoke(gpa, .{
             .diffusion = diff,
@@ -1233,7 +1258,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     g_app = &st;
     app.setBusyCheck(&busyCheck);
-    app.setBusyInterval(&busyInterval);
+    // Frame-pacing refinement that lands with a newer zigui than either local
+    // checkout has (../zigui and zigui-src are both behind src/ here). Guarded
+    // so the tree builds meanwhile; drop the guard once zigui exposes it.
+    if (comptime @hasDecl(app, "setBusyInterval")) app.setBusyInterval(&busyInterval);
     // Live light/dark switching: the loop queries this each frame; shell.body
     // keeps widgets.active synced to st.dark just before it builds the tree.
     app.setThemeProvider(&themeProvider);

@@ -34,6 +34,7 @@ extern "kernel32" fn CreatePipe(hReadPipe: *windows.HANDLE, hWritePipe: *windows
 extern "kernel32" fn SetStdHandle(nStdHandle: windows.DWORD, hHandle: windows.HANDLE) callconv(.winapi) c_int;
 extern "kernel32" fn ReadFile(hFile: windows.HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: windows.DWORD, lpNumberOfBytesRead: *windows.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 extern "kernel32" fn AttachConsole(dwProcessId: windows.DWORD) callconv(.winapi) c_int;
+extern "kernel32" fn GetStdHandle(nStdHandle: windows.DWORD) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: windows.DWORD, dwShareMode: windows.DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: windows.DWORD, dwFlagsAndAttributes: windows.DWORD, hTemplateFile: ?windows.HANDLE) callconv(.winapi) windows.HANDLE;
 
 // std.Thread.Mutex was removed in 0.16 (it needs an Io handle now). The sink's
@@ -135,11 +136,27 @@ pub fn drain(ring: *LogRing) void {
 pub fn attachParentConsole() void {
     if (!is_windows) return;
     if (AttachConsole(ATTACH_PARENT_PROCESS) == 0) return;
-    // Point the std handles at the attached console.
+    // Only fill in std handles we don't already have. When the launcher gave us
+    // a pipe or a file (`zig-ai --video-smoke ... > log 2>&1`, or any CI run),
+    // those handles are already valid, and re-pointing them at CONOUT$ writes
+    // to a console screen buffer nobody is reading — the redirect captures
+    // nothing and headless failures become undiagnosable. An interactive
+    // terminal launch has no inherited handles, so it still gets the console.
+    const need_out = !hasStdHandle(STD_OUTPUT_HANDLE);
+    const need_err = !hasStdHandle(STD_ERROR_HANDLE);
+    if (!need_out and !need_err) return;
+
     const conout = std.unicode.utf8ToUtf16LeStringLiteral("CONOUT$");
     const h = CreateFileW(conout, GENERIC_WRITE, FILE_SHARE_WRITE, null, OPEN_EXISTING, 0, null);
     if (h != windows.INVALID_HANDLE_VALUE) {
-        _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
-        _ = SetStdHandle(STD_ERROR_HANDLE, h);
+        if (need_out) _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+        if (need_err) _ = SetStdHandle(STD_ERROR_HANDLE, h);
     }
+}
+
+/// Whether the process already owns a usable handle for `id` (i.e. the parent
+/// redirected it to a pipe/file, or a console app inherited one).
+fn hasStdHandle(id: windows.DWORD) bool {
+    const h = GetStdHandle(id) orelse return false;
+    return h != windows.INVALID_HANDLE_VALUE;
 }
