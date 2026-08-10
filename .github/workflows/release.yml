@@ -233,7 +233,7 @@ jobs:
         # the fallback that compiles it here.
         run: |
           if [ "${{ steps.cuda.outputs.hit }}" = "true" ]; then
-            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt)
+            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt -Dcuda-arch="$CUDA_ARCH")
           else
             CUDA_ARGS=(-Dcuda=true -Dcuda-arch="$CUDA_ARCH")
           fi
@@ -461,7 +461,7 @@ jobs:
         # auto-detects cl.exe from the MSVC environment above and nvcc for CUDA.
         run: |
           if [ "${{ steps.cuda.outputs.hit }}" = "true" ]; then
-            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt)
+            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt -Dcuda-arch="$CUDA_ARCH")
           else
             CUDA_ARGS=(-Dcuda=true -Dcuda-arch="$CUDA_ARCH")
           fi
@@ -482,7 +482,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ steps.cuda.outputs.hit }}" = "true" ]; then
-            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt)
+            CUDA_ARGS=(-Dcuda-prebuilt=cuda-prebuilt -Dcuda-arch="$CUDA_ARCH")
           else
             CUDA_ARGS=(-Dcuda=true -Dcuda-arch="$CUDA_ARCH")
           fi
